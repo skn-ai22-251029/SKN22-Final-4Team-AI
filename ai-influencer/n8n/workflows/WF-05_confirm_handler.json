@@ -1,0 +1,175 @@
+{
+  "name": "WF-05: 컨펌 처리 (승인/수정)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-05-confirm",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "wf05-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "p1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
+            {"id": "p2", "name": "action", "value": "={{ $json.body.action }}", "type": "string"},
+            {"id": "p3", "name": "revision_note", "value": "={{ $json.body.revision_note ?? '' }}", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf05-set-parse",
+      "name": "Parse",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [
+                  {
+                    "id": "sw-cond-1",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "approved",
+                    "operator": {"type": "string", "operation": "equals"}
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": false
+            },
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [
+                  {
+                    "id": "sw-cond-2",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "revision_requested",
+                    "operator": {"type": "string", "operation": "equals"}
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf05-switch",
+      "name": "Route by Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='APPROVED', updated_at=NOW() WHERE id='{{ $json.job_id }}' RETURNING messenger_source, messenger_channel_id, messenger_user_id, script_json",
+        "options": {}
+      },
+      "id": "wf05-pg-approved",
+      "name": "Set APPROVED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 160],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n:5678/webhook/wf-07-tts-heygen",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Parse').item.json.job_id, script_text: $json.script_json ? $json.script_json.script : '', channel_id: $json.messenger_channel_id, user_id: $json.messenger_user_id }) }}",
+        "options": {}
+      },
+      "id": "wf05-http-trigger-wf07",
+      "name": "Trigger WF-07 TTS+HeyGen",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 160]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='REVISION_REQUESTED', revision_note='{{ $json.revision_note }}', revision_count=revision_count+1, updated_at=NOW() WHERE id='{{ $json.job_id }}' RETURNING messenger_source, messenger_user_id, messenger_channel_id, concept_text, character_id",
+        "options": {}
+      },
+      "id": "wf05-pg-revision",
+      "name": "Set REVISION_REQUESTED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 440],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n:5678/webhook/wf-01-input",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Parse').item.json.job_id, messenger_source: $json.messenger_source, messenger_user_id: $json.messenger_user_id, messenger_channel_id: $json.messenger_channel_id, concept_text: $json.concept_text + ' [수정 지시: ' + $('Parse').item.json.revision_note + ']', character_id: $json.character_id }) }}",
+        "options": {}
+      },
+      "id": "wf05-http-retrigger",
+      "name": "Re-trigger WF-01",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 440]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Parse", "type": "main", "index": 0}]]
+    },
+    "Parse": {
+      "main": [[{"node": "Route by Action", "type": "main", "index": 0}]]
+    },
+    "Route by Action": {
+      "main": [
+        [{"node": "Set APPROVED", "type": "main", "index": 0}],
+        [{"node": "Set REVISION_REQUESTED", "type": "main", "index": 0}]
+      ]
+    },
+    "Set APPROVED": {
+      "main": [[{"node": "Trigger WF-07 TTS+HeyGen", "type": "main", "index": 0}]]
+    },
+    "Set REVISION_REQUESTED": {
+      "main": [[{"node": "Re-trigger WF-01", "type": "main", "index": 0}]]
+    }
+  },
+  "active": true,
+  "settings": {"executionOrder": "v1"},
+  "tags": ["phase-1"]
+}

@@ -1,0 +1,105 @@
+{
+  "name": "WF-10: 일일 토픽 노트북 자동 생성",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 0 * * *" }]
+        }
+      },
+      "id": "wf10-schedule",
+      "name": "매일 자정 실행",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 환경변수에서 채널별 노트북 생성 항목 파싱\n// TOPIC_CHANNELS 형식: \"채널이름/채널ID+채널이름/채널ID+...\"\n// 예: \"노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg\"\n// 채널당 독립 노트북 1개 생성\nconst raw = $env.TOPIC_CHANNELS || '';\nif (!raw.trim()) return [{ json: { skip: true, reason: 'TOPIC_CHANNELS 미설정' } }];\n\nconst today = new Date().toISOString().slice(0, 10);\n\nconst items = [];\nfor (const ch of raw.split('+')) {\n  const slashIdx = ch.indexOf('/');\n  if (slashIdx < 0) continue;\n  const channelName = ch.slice(0, slashIdx).trim();\n  const channelId   = ch.slice(slashIdx + 1).trim();\n  if (!channelName || !channelId) continue;\n  items.push({\n    channelId: channelId,\n    channelName: channelName,\n    notebookName: `${channelName} ${today}`,\n  });\n}\n\nif (items.length === 0) return [{ json: { skip: true, reason: '파싱된 채널 없음' } }];\nreturn items.map(t => ({ json: t }));",
+        "options": {}
+      },
+      "id": "wf10-parse-topics",
+      "name": "토픽 목록 파싱",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "wf10-if-valid",
+      "name": "토픽 존재 확인",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.NOTEBOOKLM_SERVICE_URL }}/create-notebook",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: $json.notebookName, channel_id: $json.channelId, channel_name: $json.channelName }) }}",
+        "options": {
+          "timeout": 360000
+        }
+      },
+      "id": "wf10-create-notebook",
+      "name": "노트북 생성",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [840, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.item.json;\nconst channelId = $input.item.json.channel_id || '(unknown)';\n\nif (result.status === 'success') {\n  console.log(`[WF-10] ✅ 노트북 생성 완료: channel_id=${channelId} → ${result.notebook_url}`);\n} else {\n  console.error(`[WF-10] ❌ 노트북 생성 실패: channel_id=${channelId} — ${result.error}`);\n}\n\nreturn [{ json: result }];",
+        "options": {}
+      },
+      "id": "wf10-log",
+      "name": "결과 로깅",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 220]
+    }
+  ],
+  "connections": {
+    "매일 자정 실행": {
+      "main": [[{ "node": "토픽 목록 파싱", "type": "main", "index": 0 }]]
+    },
+    "토픽 목록 파싱": {
+      "main": [[{ "node": "토픽 존재 확인", "type": "main", "index": 0 }]]
+    },
+    "토픽 존재 확인": {
+      "main": [
+        [{ "node": "노트북 생성", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "노트북 생성": {
+      "main": [[{ "node": "결과 로깅", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "meta": { "templateCredsSetupCompleted": true },
+  "pinData": {}
+}

@@ -1,0 +1,115 @@
+version: "3.9"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  n8n_data:
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: ${POSTGRES_HOST}
+      DB_POSTGRESDB_PORT: ${POSTGRES_PORT}
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE}
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
+      TOPIC_CHANNELS: ${TOPIC_CHANNELS}
+      NOTEBOOKLM_SERVICE_URL: ${NOTEBOOKLM_SERVICE_URL}
+      NOTEBOOKLM_MAX_SOURCES: ${NOTEBOOKLM_MAX_SOURCES:-20}
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_SECURE_COOKIE: "false"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    ports:
+      - "5678:5678"
+    networks:
+      - internal
+
+  notebooklm-service:
+    build: ./notebooklm-service
+    restart: always
+    environment:
+      GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NOTEBOOKLM_DATA_DIR: /app/data
+      NOTEBOOKLM_SCRIPTS_DIR: /app/scripts
+      GOOGLE_EMAIL: ${GOOGLE_EMAIL}
+      GOOGLE_PASSWORD: ${GOOGLE_PASSWORD}
+    volumes:
+      - ./notebooklm-service/data:/app/data
+    networks:
+      - internal
+
+  messenger-gateway:
+    build: ./messenger-gateway
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n:
+        condition: service_started
+      notebooklm-service:
+        condition: service_started
+    environment:
+      GATEWAY_PORT: ${GATEWAY_PORT}
+      GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      N8N_WF01_WEBHOOK_URL: ${N8N_WF01_WEBHOOK_URL}
+      N8N_WF05_WEBHOOK_URL: ${N8N_WF05_WEBHOOK_URL}
+      N8N_WF06_WEBHOOK_URL: ${N8N_WF06_WEBHOOK_URL}
+    ports:
+      - "8080:8080"
+    networks:
+      - internal
+
+  discord-bot:
+    build: ./discord-bot
+    restart: always
+    depends_on:
+      - messenger-gateway
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      DISCORD_ALLOWED_USER_IDS: ${DISCORD_ALLOWED_USER_IDS}
+      DISCORD_ALLOWED_CHANNEL_IDS: ${DISCORD_ALLOWED_CHANNEL_IDS}
+      GATEWAY_URL: http://messenger-gateway:8080
+      GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
+    networks:
+      - internal
