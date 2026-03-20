@@ -1,0 +1,131 @@
+{
+  "name": "WF-04: 컨펌 요청 발송",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-04-confirm-request",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "wf04-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "a1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf04-set-parse",
+      "name": "Parse",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, status, messenger_source, messenger_user_id, messenger_channel_id, preview_url, script_json FROM jobs WHERE id='{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf04-pg-get-job",
+      "name": "Get Job",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-waiting",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "WAITING_APPROVAL",
+              "operator": {"type": "string", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf04-if-waiting",
+      "name": "Is WAITING_APPROVAL?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-confirm",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $json.id, messenger_source: $json.messenger_source, messenger_user_id: $json.messenger_user_id, messenger_channel_id: $json.messenger_channel_id, title: $json.script_json?.title ?? '제목 없음', script_summary: $json.script_json?.script_summary ?? '요약 없음', preview_url: $json.preview_url ?? '' }) }}",
+        "options": {}
+      },
+      "id": "wf04-http-confirm",
+      "name": "Send Confirm to Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "e1", "name": "error", "value": "Job is not in WAITING_APPROVAL status", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf04-error",
+      "name": "Status Error",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Parse", "type": "main", "index": 0}]]
+    },
+    "Parse": {
+      "main": [[{"node": "Get Job", "type": "main", "index": 0}]]
+    },
+    "Get Job": {
+      "main": [[{"node": "Is WAITING_APPROVAL?", "type": "main", "index": 0}]]
+    },
+    "Is WAITING_APPROVAL?": {
+      "main": [
+        [{"node": "Send Confirm to Gateway", "type": "main", "index": 0}],
+        [{"node": "Status Error", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {"executionOrder": "v1"},
+  "tags": ["phase-1"]
+}
