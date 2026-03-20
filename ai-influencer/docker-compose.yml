@@ -54,8 +54,8 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
       - ./n8n/workflows:/workflows:ro
-    command: >
-      sh -c "n8n import:workflow --separate --input=/workflows || true && n8n start"
+    entrypoint: ["tini", "--", "/bin/sh", "-c"]
+    command: "n8n import:workflow --separate --input=/workflows || true && exec n8n start"
     ports:
       - "5678:5678"
     networks:
