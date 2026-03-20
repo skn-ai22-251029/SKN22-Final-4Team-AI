@@ -1,0 +1,194 @@
+{
+  "name": "WF-08: SNS 업로드 (YouTube / Instagram / TikTok)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-08-sns-upload",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "wf08-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "b1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
+            {"id": "b2", "name": "video_url", "value": "={{ $json.body.video_url }}", "type": "string"},
+            {"id": "b3", "name": "channel_id", "value": "={{ $json.body.channel_id }}", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf08-set-parse",
+      "name": "Extract Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='PUBLISHING', updated_at=NOW() WHERE id='{{ $json.job_id }}' RETURNING concept_text, script_json",
+        "options": {}
+      },
+      "id": "wf08-pg-publishing",
+      "name": "Update to PUBLISHING",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "={{ 'Bearer ' + $env.YOUTUBE_ACCESS_TOKEN }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ snippet: { title: $('Extract Fields').item.json.job_id.substring(0, 8) + ' - AI 인플루언서 콘텐츠', description: $json.concept_text || '', tags: ['AI', '인플루언서'], categoryId: '22' }, status: { privacyStatus: 'public' } }) }}",
+        "options": {}
+      },
+      "id": "wf08-http-youtube",
+      "name": "YouTube Upload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://graph.facebook.com/v18.0/' + $env.INSTAGRAM_USER_ID + '/media' }}",
+        "sendHeaders": false,
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ media_type: 'REELS', video_url: $('Extract Fields').item.json.video_url, caption: $('Update to PUBLISHING').item.json.concept_text || '', access_token: $env.INSTAGRAM_ACCESS_TOKEN }) }}",
+        "options": {}
+      },
+      "id": "wf08-http-instagram",
+      "name": "Instagram Upload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://open.tiktokapis.com/v2/post/publish/video/init/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "={{ 'Bearer ' + $env.TIKTOK_ACCESS_TOKEN }}"},
+            {"name": "Content-Type", "value": "application/json; charset=UTF-8"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ post_info: { title: $('Update to PUBLISHING').item.json.concept_text || 'AI 인플루언서 콘텐츠', privacy_level: 'PUBLIC_TO_EVERYONE', disable_duet: false, disable_comment: false, disable_stitch: false }, source_info: { source: 'PULL_FROM_URL', video_url: $('Extract Fields').item.json.video_url } }) }}",
+        "options": {}
+      },
+      "id": "wf08-http-tiktok",
+      "name": "TikTok Upload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 440]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO platform_posts (job_id, platform, platform_post_id, published_at) VALUES ('{{ $('Extract Fields').item.json.job_id }}', 'youtube', '{{ $('YouTube Upload').item.json.id ?? '' }}', NOW()), ('{{ $('Extract Fields').item.json.job_id }}', 'instagram', '{{ $('Instagram Upload').item.json.id ?? '' }}', NOW()), ('{{ $('Extract Fields').item.json.job_id }}', 'tiktok', '{{ $('TikTok Upload').item.json.data?.publish_id ?? '' }}', NOW())",
+        "options": {}
+      },
+      "id": "wf08-pg-platform-posts",
+      "name": "Insert platform_posts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='PUBLISHED', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf08-pg-published",
+      "name": "Update to PUBLISHED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 300],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('Extract Fields').item.json.channel_id, text: '✅ SNS 업로드 완료!\\n\\n📺 YouTube: 업로드됨\\n📸 Instagram: 업로드됨\\n🎵 TikTok: 업로드됨\\n\\nJob ID: ' + $('Extract Fields').item.json.job_id.substring(0, 8) }) }}",
+        "options": {}
+      },
+      "id": "wf08-http-send-complete",
+      "name": "Send Complete Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Extract Fields", "type": "main", "index": 0}]]
+    },
+    "Extract Fields": {
+      "main": [[{"node": "Update to PUBLISHING", "type": "main", "index": 0}]]
+    },
+    "Update to PUBLISHING": {
+      "main": [
+        [{"node": "YouTube Upload", "type": "main", "index": 0}],
+        [{"node": "Instagram Upload", "type": "main", "index": 0}],
+        [{"node": "TikTok Upload", "type": "main", "index": 0}]
+      ]
+    },
+    "YouTube Upload": {
+      "main": [[{"node": "Insert platform_posts", "type": "main", "index": 0}]]
+    },
+    "Instagram Upload": {
+      "main": [[{"node": "Insert platform_posts", "type": "main", "index": 0}]]
+    },
+    "TikTok Upload": {
+      "main": [[{"node": "Insert platform_posts", "type": "main", "index": 0}]]
+    },
+    "Insert platform_posts": {
+      "main": [[{"node": "Update to PUBLISHED", "type": "main", "index": 0}]]
+    },
+    "Update to PUBLISHED": {
+      "main": [[{"node": "Send Complete Notification", "type": "main", "index": 0}]]
+    }
+  },
+  "active": true,
+  "settings": {"executionOrder": "v1"},
+  "tags": ["phase-2", "sns"]
+}

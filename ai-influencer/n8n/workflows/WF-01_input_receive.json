@@ -1,0 +1,164 @@
+{
+  "name": "WF-01: 입력 수신 및 Job 등록",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-01-input",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "wf01-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "a1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
+            {"id": "a2", "name": "messenger_source", "value": "={{ $json.body.messenger_source }}", "type": "string"},
+            {"id": "a3", "name": "messenger_user_id", "value": "={{ $json.body.messenger_user_id }}", "type": "string"},
+            {"id": "a4", "name": "messenger_channel_id", "value": "={{ $json.body.messenger_channel_id }}", "type": "string"},
+            {"id": "a5", "name": "concept_text", "value": "={{ $json.body.concept_text }}", "type": "string"},
+            {"id": "a6", "name": "ref_image_url", "value": "={{ $json.body.ref_image_url ?? '' }}", "type": "string"},
+            {"id": "a7", "name": "character_id", "value": "={{ $json.body.character_id ?? 'default-character' }}", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf01-set-meta",
+      "name": "Preserve Messenger Meta",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='SCRIPTING', updated_at=NOW() WHERE id='{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf01-pg-scripting",
+      "name": "Update to SCRIPTING",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-always-false",
+              "leftValue": false,
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf01-if-ready",
+      "name": "Is Script Service Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "b1", "name": "job_id", "value": "={{ $('Preserve Messenger Meta').item.json.job_id }}", "type": "string"},
+            {"id": "b2", "name": "messenger_source", "value": "={{ $('Preserve Messenger Meta').item.json.messenger_source }}", "type": "string"},
+            {"id": "b3", "name": "messenger_user_id", "value": "={{ $('Preserve Messenger Meta').item.json.messenger_user_id }}", "type": "string"},
+            {"id": "b4", "name": "messenger_channel_id", "value": "={{ $('Preserve Messenger Meta').item.json.messenger_channel_id }}", "type": "string"},
+            {"id": "b5", "name": "title", "value": "테스트 영상 제목", "type": "string"},
+            {"id": "b6", "name": "script_summary", "value": "Phase 2 연결 전 Mock 데이터입니다.", "type": "string"},
+            {"id": "b7", "name": "script_json", "value": "={\"title\":\"테스트 영상 제목\",\"duration_sec\":30,\"script_summary\":\"Phase 2 연결 전 Mock 데이터입니다.\",\"shots\":[],\"voice_tone\":\"기본\",\"hashtags\":[\"#테스트\"],\"cta\":\"구독해주세요!\"}", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf01-mock-script",
+      "name": "Mock Script Result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET script_json='{{ $json.script_json }}'::jsonb, status='WAITING_APPROVAL', updated_at=NOW() WHERE id='{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf01-pg-waiting",
+      "name": "Save Script + WAITING_APPROVAL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 420],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-confirm",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Mock Script Result').item.json.job_id, messenger_source: $('Mock Script Result').item.json.messenger_source, messenger_user_id: $('Mock Script Result').item.json.messenger_user_id, messenger_channel_id: $('Mock Script Result').item.json.messenger_channel_id, title: $('Mock Script Result').item.json.title, script_summary: $('Mock Script Result').item.json.script_summary, preview_url: '' }) }}",
+        "options": {}
+      },
+      "id": "wf01-http-confirm",
+      "name": "Request Confirm to Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Preserve Messenger Meta", "type": "main", "index": 0}]]
+    },
+    "Preserve Messenger Meta": {
+      "main": [[{"node": "Update to SCRIPTING", "type": "main", "index": 0}]]
+    },
+    "Update to SCRIPTING": {
+      "main": [[{"node": "Is Script Service Ready?", "type": "main", "index": 0}]]
+    },
+    "Is Script Service Ready?": {
+      "main": [
+        [],
+        [{"node": "Mock Script Result", "type": "main", "index": 0}]
+      ]
+    },
+    "Mock Script Result": {
+      "main": [[{"node": "Save Script + WAITING_APPROVAL", "type": "main", "index": 0}]]
+    },
+    "Save Script + WAITING_APPROVAL": {
+      "main": [[{"node": "Request Confirm to Gateway", "type": "main", "index": 0}]]
+    }
+  },
+  "active": true,
+  "settings": {"executionOrder": "v1"},
+  "tags": ["phase-1"]
+}

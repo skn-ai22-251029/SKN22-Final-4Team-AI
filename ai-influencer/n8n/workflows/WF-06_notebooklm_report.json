@@ -1,0 +1,204 @@
+{
+  "name": "WF-06: NotebookLM 보고서 생성",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-06-report",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "wf06-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "a1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
+            {"id": "a2", "name": "messenger_source", "value": "={{ $json.body.messenger_source }}", "type": "string"},
+            {"id": "a3", "name": "messenger_channel_id", "value": "={{ $json.body.messenger_channel_id }}", "type": "string"},
+            {"id": "a4", "name": "prompt", "value": "={{ $json.body.prompt }}", "type": "string"},
+            {"id": "a5", "name": "notebook_id", "value": "={{ $json.body.notebook_id ?? '' }}", "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf06-set-meta",
+      "name": "Extract Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='GENERATING', updated_at=NOW() WHERE id='{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf06-pg-generating",
+      "name": "Update to GENERATING",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://notebooklm-service:8090/generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Extract Fields').item.json.job_id, prompt: $('Extract Fields').item.json.prompt, notebook_id: $('Extract Fields').item.json.notebook_id }) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "wf06-http-generate",
+      "name": "Call NotebookLM Service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-success",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "success",
+              "operator": {"type": "string", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf06-if-success",
+      "name": "IF Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='PUBLISHED', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf06-pg-published",
+      "name": "Update to PUBLISHED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 180],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-report",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: $('Extract Fields').item.json.messenger_source, messenger_channel_id: $('Extract Fields').item.json.messenger_channel_id, job_id: $('Extract Fields').item.json.job_id, report_content: $('Call NotebookLM Service').item.json.report_content, file_content_b64: $('Call NotebookLM Service').item.json.file_content_b64, filename: $('Call NotebookLM Service').item.json.filename, include_video_button: true }) }}",
+        "options": {}
+      },
+      "id": "wf06-http-send-report",
+      "name": "Send Report to Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 180]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='FAILED', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf06-pg-failed",
+      "name": "Update to FAILED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 420],
+      "credentials": {
+        "postgres": {"id": "1", "name": "pg-credentials"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: $('Extract Fields').item.json.messenger_source, messenger_channel_id: $('Extract Fields').item.json.messenger_channel_id, text: '❌ 보고서 생성에 실패했습니다.\\nJob ID: ' + $('Extract Fields').item.json.job_id.substring(0, 8) + '\\n오류: ' + ($('Call NotebookLM Service').item.json.error ?? 'Unknown error') }) }}",
+        "options": {}
+      },
+      "id": "wf06-http-send-error",
+      "name": "Send Error to Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Extract Fields", "type": "main", "index": 0}]]
+    },
+    "Extract Fields": {
+      "main": [[{"node": "Update to GENERATING", "type": "main", "index": 0}]]
+    },
+    "Update to GENERATING": {
+      "main": [[{"node": "Call NotebookLM Service", "type": "main", "index": 0}]]
+    },
+    "Call NotebookLM Service": {
+      "main": [[{"node": "IF Success", "type": "main", "index": 0}]]
+    },
+    "IF Success": {
+      "main": [
+        [{"node": "Update to PUBLISHED", "type": "main", "index": 0}],
+        [{"node": "Update to FAILED", "type": "main", "index": 0}]
+      ]
+    },
+    "Update to PUBLISHED": {
+      "main": [[{"node": "Send Report to Gateway", "type": "main", "index": 0}]]
+    },
+    "Update to FAILED": {
+      "main": [[{"node": "Send Error to Gateway", "type": "main", "index": 0}]]
+    }
+  },
+  "active": true,
+  "settings": {"executionOrder": "v1"},
+  "tags": ["phase-1", "notebooklm"]
+}

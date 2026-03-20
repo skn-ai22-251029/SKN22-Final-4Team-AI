@@ -1,0 +1,290 @@
+{
+  "id": "2e44237a-c844-4f1b-925b-e8f19e0fd346",
+  "revision": 0,
+  "last_node_id": 10,
+  "last_link_id": 13,
+  "nodes": [
+    {
+      "id": 5,
+      "type": "DownloadAndLoadFlorence2Model",
+      "pos": [
+        943.4462269176134,
+        303.4454600941051
+      ],
+      "size": [
+        332.9986328125,
+        130
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "PEFTLORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "florence2_model",
+          "type": "FL2MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-florence2",
+        "ver": "1.0.8",
+        "Node name for S&R": "DownloadAndLoadFlorence2Model"
+      },
+      "widgets_values": [
+        "microsoft/Florence-2-large",
+        "fp16",
+        "sdpa",
+        false
+      ]
+    },
+    {
+      "id": 6,
+      "type": "Florence2Run",
+      "pos": [
+        1334.5502498951307,
+        338.0858992320669
+      ],
+      "size": [
+        400,
+        364
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 11
+        },
+        {
+          "name": "florence2_model",
+          "type": "FL2MODEL",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "caption",
+          "type": "STRING",
+          "links": [
+            12
+          ]
+        },
+        {
+          "name": "data",
+          "type": "JSON",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-florence2",
+        "ver": "1.0.8",
+        "Node name for S&R": "Florence2Run"
+      },
+      "widgets_values": [
+        "",
+        "more_detailed_caption",
+        true,
+        false,
+        1024,
+        3,
+        true,
+        "",
+        936463281454459,
+        "randomize"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "LoadImage",
+      "pos": [
+        955.294257697599,
+        501.1084473761066
+      ],
+      "size": [
+        282.798828125,
+        314.00000000000006
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            11
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.16.4",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "SeedVR2_upscaled_00005_.png",
+        "image"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "StringConcatenate",
+      "pos": [
+        1342.0318081095868,
+        766.379304151009
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "string_b",
+          "type": "STRING",
+          "widget": {
+            "name": "string_b"
+          },
+          "link": 12
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.16.4",
+        "Node name for S&R": "StringConcatenate"
+      },
+      "widgets_values": [
+        "hari, ",
+        "",
+        ""
+      ]
+    },
+    {
+      "id": 7,
+      "type": "SaveText|pysssss",
+      "pos": [
+        1806.233987810169,
+        547.6685226222643
+      ],
+      "size": [
+        270,
+        130
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-custom-scripts",
+        "ver": "1.2.5",
+        "Node name for S&R": "SaveText|pysssss"
+      },
+      "widgets_values": [
+        "input",
+        "file.txt",
+        "append",
+        true
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      5,
+      0,
+      6,
+      1,
+      "FL2MODEL"
+    ],
+    [
+      11,
+      9,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      12,
+      6,
+      2,
+      10,
+      0,
+      "STRING"
+    ],
+    [
+      13,
+      10,
+      0,
+      7,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.6830134553650707,
+      "offset": [
+        -505.9253280320417,
+        -78.81795060916454
+      ]
+    },
+    "frontendVersion": "1.41.16"
+  },
+  "version": 0.4
+}
