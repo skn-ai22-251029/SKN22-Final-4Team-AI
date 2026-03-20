@@ -2,6 +2,7 @@
 
 Discord 기반 AI 인플루언서 자동화 파이프라인.
 
+테스트 편의를 위해 https://github.com/DJAeun/SKN22-Final-4Team-AI/tree/develop 클론
 ---
 
 ## 아키텍처 개요
@@ -364,8 +365,8 @@ docker-compose --version
 
 ```bash
 # 저장소 전체 클론
-git clone https://github.com/<org>/SKN22-Final-4Team-WEB.git
-cd SKN22-Final-4Team-WEB/ai-influencer
+git clone https://github.com/<org>/SKN22-Final-4Team-AI.git
+cd SKN22-Final-4Team-AI/ai-influencer
 ```
 
 ---
@@ -502,7 +503,7 @@ docker-compose exec postgres psql -U aiuser -d ai_influencer -c "SELECT COUNT(*)
 코드/워크플로 변경 시:
 
 ```bash
-cd ~/SKN22-Final-4Team-WEB/ai-influencer
+cd ~/SKN22-Final-4Team-AI/ai-influencer
 git pull
 
 # 코드 변경 (messenger-gateway, discord-bot, notebooklm-service) → 재빌드 필요
