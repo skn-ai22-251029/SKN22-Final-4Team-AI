@@ -688,6 +688,14 @@ python register_command.py \
 
 ## 테스트 시나리오
 
+### 수집 대상 채널
+1. https://www.youtube.com/@nomadcoders
+2. https://www.youtube.com/@jocoding
+3. https://www.youtube.com/@Fireship
+4. https://www.youtube.com/@t3dotgg
+5. https://www.youtube.com/@matthew_berman
+6. https://www.youtube.com/@TwoMinutePapers
+
 ### 콘텐츠 생성 (/create)
 
 1. Discord에서 `/create concept:20대 여성을 위한 재테크 팁` 실행
