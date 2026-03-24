@@ -396,7 +396,7 @@ nano .env   # 또는 vi .env
 | `N8N_RUNNERS_TASK_TIMEOUT` | n8n task runner 실행 제한(초) | `1200` |
 | `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
-| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `1.5` |
+| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
@@ -746,6 +746,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"topics"
 | WF-09에서 특정 채널만 보이는 것처럼 보임 | `채널 목록 파싱` 로그의 `valid/invalid` 개수 확인. malformed 항목(예: `TwoM>`)은 `skip=true`로 노출되며 해당 항목은 탐색 대상에서 제외됨 |
 | WF-09가 첫 채널만 보고 종료됨 | WF-09 코드 노드 실행 모드 확인: `채널 목록 파싱=runOnceForAllItems`, `RSS 조회 + 새 영상 필터링=runOnceForEachItem`, `결과 로깅=runOnceForEachItem` |
 | WF-09 RSS 일시 오류(404/500) 후 0건 판정 | WF-09 최신 워크플로 재임포트 + n8n 재시작, 로그에서 `attempt` 재시도 후 `mode=xml-string/parsed-object` 성공 로그 확인 |
+| WF-09 새 영상 기준 시간 변경 | `.env`의 `WF09_LOOKBACK_HOURS` 값을 수정(기본 24). 적용 후 `docker-compose up -d --force-recreate n8n` 실행 |
 | WF-09 `Task execution timed out after 300 seconds` | `.env`에 `N8N_RUNNERS_TASK_TIMEOUT=1200` 설정 + `docker-compose up -d --force-recreate n8n` 적용. WF-09는 긴 단일 실행 대신 다음 스케줄 재시도 전략 사용 |
 | WF-09 `A 'json' property isn't an object` | `RSS 조회 + 새 영상 필터링` 노드가 `runOnceForEachItem`이면 **반드시 단일 `{ json: {...} }` 반환**해야 함. 최신 워크플로 재임포트 후 재실행 |
 | WF-09 HTTP Body "Field required" | n8n HTTP Request 노드 `specifyBody: "json"` + `jsonBody: JSON.stringify(...)` 방식 사용 확인 |
