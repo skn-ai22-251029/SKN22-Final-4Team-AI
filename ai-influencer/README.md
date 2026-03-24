@@ -217,7 +217,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
       ▼
 [채널 목록 파싱] TOPIC_CHANNELS 환경변수
   형식: 채널이름/채널ID+채널이름/채널ID+...
-  → [{channelId, topic(=채널이름)}, ...] 목록 생성
+  → [{channelId, channelName}, ...] 목록 생성
       │
       ▼
 [IF: 채널 존재 여부 확인]
@@ -227,14 +227,14 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
                 https://www.youtube.com/feeds/videos.xml?channel_id={channelId}
                       │
                       ▼
-              [새 영상 필터링] 최근 1.5시간(90분) 이내 업로드만 추출
+              [새 영상 필터링] 최근 N시간(`WF09_LOOKBACK_HOURS`) 이내 업로드만 추출
                       │
                       ▼
               [IF: 새 영상 존재 여부]
                 ├─[없음]──→ 종료 (해당 채널)
                 │
                 └─[있음]──→ [notebooklm-service /check-and-add-source 호출]
-                              { source_url, source_title, topic(=채널이름) }
+                              { source_url, source_title, channel_name }
                                     │
                                     ▼
                             [결과 로깅]
@@ -396,6 +396,7 @@ nano .env   # 또는 vi .env
 | `N8N_RUNNERS_TASK_TIMEOUT` | n8n task runner 실행 제한(초) | `1200` |
 | `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
+| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `1.5` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
@@ -746,6 +747,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"topics"
 | WF-09가 첫 채널만 보고 종료됨 | WF-09 코드 노드 실행 모드 확인: `채널 목록 파싱=runOnceForAllItems`, `RSS 조회 + 새 영상 필터링=runOnceForEachItem`, `결과 로깅=runOnceForEachItem` |
 | WF-09 RSS 일시 오류(404/500) 후 0건 판정 | WF-09 최신 워크플로 재임포트 + n8n 재시작, 로그에서 `attempt` 재시도 후 `mode=xml-string/parsed-object` 성공 로그 확인 |
 | WF-09 `Task execution timed out after 300 seconds` | `.env`에 `N8N_RUNNERS_TASK_TIMEOUT=1200` 설정 + `docker-compose up -d --force-recreate n8n` 적용. WF-09는 긴 단일 실행 대신 다음 스케줄 재시도 전략 사용 |
+| WF-09 `A 'json' property isn't an object` | `RSS 조회 + 새 영상 필터링` 노드가 `runOnceForEachItem`이면 **반드시 단일 `{ json: {...} }` 반환**해야 함. 최신 워크플로 재임포트 후 재실행 |
 | WF-09 HTTP Body "Field required" | n8n HTTP Request 노드 `specifyBody: "json"` + `jsonBody: JSON.stringify(...)` 방식 사용 확인 |
 | notebooklm-service 연결 실패 | `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 형식(`=` 사용) 및 same network 확인 |
 | Gateway DB 연결 실패 | postgres healthcheck 통과 여부 및 환경변수 확인 |
