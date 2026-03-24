@@ -393,7 +393,7 @@ nano .env   # 또는 vi .env
 | `DISCORD_BOT_TOKEN` | Discord Bot 토큰 | |
 | `DISCORD_ALLOWED_USER_IDS` | 허용 유저 ID (쉼표 구분) | `12345,67890` |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | 허용 채널 ID (쉼표 구분) | `11111,22222` |
-| `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8000` |
+| `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
@@ -741,8 +741,9 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"topics"
 | n8n `http://IP:5678` 접속 불가 | EC2 보안그룹 인바운드 5678 포트 오픈 확인 |
 | 봇이 모든 채널에서 응답 | `.env`에 `DISCORD_ALLOWED_CHANNEL_IDS` 추가 후 `docker-compose up -d --build discord-bot` |
 | WF-09 "채널 있는 경우만" false | `TOPIC_CHANNELS`가 n8n 컨테이너에 주입됐는지 docker-compose.yml 확인 |
+| WF-09 RSS 일시 오류(404/500) 후 0건 판정 | WF-09 최신 워크플로 재임포트 + n8n 재시작, 로그에서 `attempt` 재시도 후 `mode=xml-string/parsed-object` 성공 로그 확인 |
 | WF-09 HTTP Body "Field required" | n8n HTTP Request 노드 `specifyBody: "json"` + `jsonBody: JSON.stringify(...)` 방식 사용 확인 |
-| notebooklm-service 연결 실패 | `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8000` 형식 및 same network 확인 |
+| notebooklm-service 연결 실패 | `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 형식(`=` 사용) 및 same network 확인 |
 | Gateway DB 연결 실패 | postgres healthcheck 통과 여부 및 환경변수 확인 |
 
 ---
