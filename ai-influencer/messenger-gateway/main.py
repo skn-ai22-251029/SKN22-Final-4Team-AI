@@ -2,7 +2,7 @@ import asyncio
 import logging
 import base64
 from contextlib import asynccontextmanager
-from typing import Annotated, Optional
+from typing import Annotated, Awaitable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -144,6 +144,18 @@ def _parse_topic_channels(raw: str) -> list[dict]:
         seen.add(cid)
         channels.append({"id": cid, "name": name})
     return channels
+
+
+def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> None:
+    task = asyncio.create_task(coro)
+
+    def _done_callback(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except Exception:
+            logger.exception("[%s] background task failed job_id=%s", task_name, job_id)
+
+    task.add_done_callback(_done_callback)
 
 
 @asynccontextmanager
@@ -354,6 +366,19 @@ async def _handle_report_message_bg(body: ReportMessageRequest) -> None:
 
 async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
     """채널 선택 후 → 기존 보고서 목록 조회 or WF-06."""
+    logger.info(
+        "[channel-select:bg] start job_id=%s channel_id=%s",
+        body.job_id,
+        body.channel_id,
+    )
+    try:
+        await _discord_adapter.send_text_message(
+            body.messenger_channel_id,
+            "🔎 채널을 확인했습니다. 기존 보고서 목록을 조회 중입니다... (최대 1분)",
+        )
+    except Exception as e:
+        logger.warning("[channel-select:bg] start notice failed job_id=%s: %s", body.job_id, e)
+
     reports: list[str] = []
     try:
         resp = await _http_client.post(
@@ -369,6 +394,19 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
             data = resp.json()
             if data.get("status") == "success":
                 reports = data.get("reports", [])
+            else:
+                logger.warning(
+                    "[channel-select:bg] list-reports status!=success job_id=%s error=%s",
+                    body.job_id,
+                    data.get("error"),
+                )
+        else:
+            logger.warning(
+                "[channel-select:bg] list-reports non-200 job_id=%s status=%s body=%s",
+                body.job_id,
+                resp.status_code,
+                (resp.text or "")[:300],
+            )
     except Exception as e:
         logger.warning("[report-message] list-reports 조회 실패 (WF-06 fallback): %s", e)
 
@@ -380,14 +418,29 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
                 reports=reports,
                 selected_channel_id=body.channel_id,
             )
+            logger.info("[channel-select:bg] reports listed job_id=%s count=%d", body.job_id, len(reports))
             return
         except Exception as e:
             logger.error("[report-message] send_report_list failed job_id=%s: %s", body.job_id, e)
+
+    try:
+        await _discord_adapter.send_text_message(
+            body.messenger_channel_id,
+            "📄 기존 보고서가 없거나 조회에 실패해 새 보고서 생성을 시작합니다... (최대 5~10분)",
+        )
+    except Exception as e:
+        logger.warning("[channel-select:bg] fallback notice failed job_id=%s: %s", body.job_id, e)
 
     await _call_wf06(body)
 
 
 async def _call_wf06(body: ReportMessageRequest) -> None:
+    logger.info(
+        "[report-wf06] trigger job_id=%s channel_id=%s messenger_channel=%s",
+        body.job_id,
+        body.channel_id,
+        body.messenger_channel_id,
+    )
     try:
         await n8n_service.call_wf06_report(
             job_id=body.job_id,
@@ -402,6 +455,13 @@ async def _call_wf06(body: ReportMessageRequest) -> None:
     except Exception as e:
         logger.error("[discord] call_wf06_report failed job_id=%s: %s", body.job_id, e)
         await job_service.update_job(body.job_id, error_message=str(e))
+        try:
+            await _discord_adapter.send_text_message(
+                body.messenger_channel_id,
+                f"❌ 보고서 생성 요청 전송 실패(job `{body.job_id[:8]}`): {str(e)[:180]}",
+            )
+        except Exception:
+            logger.warning("[report-wf06] failed to notify channel for wf06 error job_id=%s", body.job_id)
 
 
 @app.post("/internal/channel-select")
@@ -421,7 +481,7 @@ async def channel_select(_: AuthDep, body: ChannelSelectRequest) -> dict:
         channel_id=body.channel_id,
         character_id=job.get("character_id", "default-character"),
     )
-    asyncio.create_task(_handle_channel_selected_bg(report_body))
+    _launch_bg_task(_handle_channel_selected_bg(report_body), task_name="channel-select", job_id=body.job_id)
     logger.info("[channel-select] job_id=%s channel_id=%s", body.job_id, body.channel_id)
     return {"job_id": body.job_id, "status": "accepted"}
 
@@ -439,7 +499,7 @@ async def report_select(_: AuthDep, body: ReportSelectRequest) -> dict:
         raise HTTPException(status_code=400, detail="report_index is required for action=select")
 
     # 즉시 반환 후 background에서 처리 (get-report는 최대 300s 소요)
-    asyncio.create_task(_handle_report_select_bg(body, job))
+    _launch_bg_task(_handle_report_select_bg(body, job), task_name="report-select", job_id=body.job_id)
     return {"job_id": body.job_id, "status": "accepted"}
 
 
