@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 import httpx
@@ -58,10 +58,33 @@ def get_gateway_client() -> httpx.AsyncClient:
     return _gateway_client
 
 
-async def gateway_call(path: str, payload: dict) -> None:
+def _error_detail_from_response(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            detail = data.get("detail")
+            if isinstance(detail, str) and detail.strip():
+                return detail
+    except Exception:
+        pass
+    body = resp.text.strip()
+    return body or f"HTTP {resp.status_code}"
+
+
+async def gateway_call(path: str, payload: dict) -> dict[str, Any]:
     try:
         resp = await get_gateway_client().post(path, json=payload)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(_error_detail_from_response(resp))
+        if not resp.content:
+            return {}
+        try:
+            parsed = resp.json()
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
     except Exception as e:
         logger.error("[discord] gateway_call %s failed: %s", path, e)
         raise
@@ -224,7 +247,7 @@ async def report_command(
 
 
 @bot.tree.command(name="tts", description="기존 job_id로 WF-11(TTS) 생성을 시작합니다")
-async def tts_command(interaction: discord.Interaction, job_id: str) -> None:
+async def tts_command(interaction: discord.Interaction, job_id: Optional[str] = None) -> None:
     user_id = str(interaction.user.id)
 
     if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
@@ -237,17 +260,25 @@ async def tts_command(interaction: discord.Interaction, job_id: str) -> None:
 
     await interaction.response.defer(ephemeral=True)
     normalized_job_id = (job_id or "").strip()
-    if not normalized_job_id:
-        await interaction.followup.send("job_id를 입력해주세요.", ephemeral=True)
-        return
 
     try:
-        await gateway_call(
+        result = await gateway_call(
             "/internal/tts-generate",
-            {"job_id": normalized_job_id},
+            {
+                "job_id": normalized_job_id,
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+            },
         )
+        resolved_job_id = result.get("job_id", normalized_job_id)
+        picked_latest = not normalized_job_id
         await interaction.followup.send(
-            f"🔊 WF-11(TTS) 시작 요청 완료: `{normalized_job_id[:8]}`",
+            (
+                "🔊 WF-11(TTS) 시작 요청 완료 "
+                f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
+                if picked_latest
+                else f"🔊 WF-11(TTS) 시작 요청 완료: `{resolved_job_id[:8]}`"
+            ),
             ephemeral=True,
         )
     except Exception as e:
@@ -255,7 +286,7 @@ async def tts_command(interaction: discord.Interaction, job_id: str) -> None:
 
 
 @bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
-async def heygen_command(interaction: discord.Interaction, job_id: str) -> None:
+async def heygen_command(interaction: discord.Interaction, job_id: Optional[str] = None) -> None:
     user_id = str(interaction.user.id)
 
     if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
@@ -268,21 +299,82 @@ async def heygen_command(interaction: discord.Interaction, job_id: str) -> None:
 
     await interaction.response.defer(ephemeral=True)
     normalized_job_id = (job_id or "").strip()
-    if not normalized_job_id:
-        await interaction.followup.send("job_id를 입력해주세요.", ephemeral=True)
-        return
 
     try:
-        await gateway_call(
+        result = await gateway_call(
             "/internal/heygen-generate",
-            {"job_id": normalized_job_id},
+            {
+                "job_id": normalized_job_id,
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+            },
         )
+        resolved_job_id = result.get("job_id", normalized_job_id)
+        picked_latest = not normalized_job_id
         await interaction.followup.send(
-            f"🎬 WF-12(HeyGen) 시작 요청 완료: `{normalized_job_id[:8]}`",
+            (
+                "🎬 WF-12(HeyGen) 시작 요청 완료 "
+                f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
+                if picked_latest
+                else f"🎬 WF-12(HeyGen) 시작 요청 완료: `{resolved_job_id[:8]}`"
+            ),
             ephemeral=True,
         )
     except Exception as e:
         await interaction.followup.send(f"❌ /heygen 실패: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="jobs", description="최근 job 목록을 조회합니다")
+async def jobs_command(interaction: discord.Interaction, purpose: str = "all") -> None:
+    user_id = str(interaction.user.id)
+
+    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+        return
+
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+        return
+
+    normalized_purpose = (purpose or "all").strip().lower()
+    if normalized_purpose not in ("all", "tts", "heygen"):
+        await interaction.response.send_message(
+            "purpose는 all / tts / heygen 중 하나여야 합니다.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await gateway_call(
+            "/internal/jobs",
+            {
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+                "purpose": normalized_purpose,
+                "limit": 5,
+            },
+        )
+        jobs = result.get("jobs", [])
+        if not jobs:
+            await interaction.followup.send("최근 job이 없습니다.", ephemeral=True)
+            return
+
+        lines = []
+        for item in jobs:
+            jid = item.get("job_id_short", "")
+            status = item.get("status", "")
+            has_script = "Y" if item.get("has_script_text") else "N"
+            has_audio = "Y" if item.get("has_audio_url") else "N"
+            lines.append(f"`{jid}` status={status} script={has_script} audio={has_audio}")
+
+        guide = "사용: `/tts` 또는 `/heygen`에 위 8자리 job_id를 넣거나, job_id 없이 실행"
+        await interaction.followup.send(
+            f"최근 job 목록(purpose={normalized_purpose}):\n" + "\n".join(lines) + f"\n\n{guide}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ /jobs 실패: {e}", ephemeral=True)
 
 
 @bot.event

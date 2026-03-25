@@ -713,8 +713,9 @@ python register_command.py \
 | `POST` | `/internal/report-select` | discord-bot | 보고서 선택 또는 새로 생성 |
 | `POST` | `/internal/send-report` | n8n WF-06 | 보고서 텍스트 전송 |
 | `POST` | `/internal/report-to-video` | discord-bot | 보고서 → 영상 제작 요청 |
-| `POST` | `/internal/tts-generate` | discord-bot | `/tts job_id` 수동 WF-11 실행 |
-| `POST` | `/internal/heygen-generate` | discord-bot | `/heygen job_id` 수동 WF-12 실행 |
+| `POST` | `/internal/tts-generate` | discord-bot | `/tts [job_id]` 수동 WF-11 실행 (미입력 시 최근 job 자동 선택) |
+| `POST` | `/internal/heygen-generate` | discord-bot | `/heygen [job_id]` 수동 WF-12 실행 (미입력 시 최근 job 자동 선택) |
+| `POST` | `/internal/jobs` | discord-bot | `/jobs [purpose]` 최근 job 목록 조회 (`all/tts/heygen`) |
 | `GET`  | `/health` | 모니터링 | 헬스체크 |
 
 ---
@@ -748,10 +749,14 @@ python register_command.py \
 
 ### 수동 TTS / HeyGen 실행
 
-1. Discord에서 `/tts job_id:<기존 job_id>` 실행  
+1. Discord에서 `/jobs purpose:tts` 또는 `/jobs purpose:heygen` 실행  
+   → 최근 job 목록(8자리 short id, 상태, script/audio 보유 여부) 확인
+2. Discord에서 `/tts job_id:<8자리 또는 전체 job_id>` 실행  
    → 해당 job의 `script_text`로 WF-11(TTS) 수동 실행
-2. Discord에서 `/heygen job_id:<기존 job_id>` 실행  
+3. Discord에서 `/heygen job_id:<8자리 또는 전체 job_id>` 실행  
    → 해당 job의 `audio_url`로 WF-12(HeyGen) 수동 실행
+4. `job_id`를 생략하고 `/tts` 또는 `/heygen`만 실행하면  
+   → 현재 채널/사용자의 최근 적합 job을 자동 선택해 실행
 
 사전조건:
 - `/tts`: job에 `script_json.script_text`(또는 `script`)가 있어야 함

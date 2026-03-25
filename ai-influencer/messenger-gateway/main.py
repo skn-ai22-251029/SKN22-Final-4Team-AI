@@ -13,6 +13,7 @@ from models.job import (
     ChannelSelectRequest,
     ConfirmActionRequest,
     IncomingMessageRequest,
+    ListJobsRequest,
     ManualGenerateRequest,
     ReportMessageRequest,
     ReportSelectRequest,
@@ -36,6 +37,91 @@ logger = logging.getLogger(__name__)
 # 싱글턴 어댑터 및 httpx 클라이언트
 _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
+
+
+def _normalize_manual_job_id(job_id: str) -> str:
+    return (job_id or "").strip()
+
+
+def _format_job_summary(job: dict) -> str:
+    job_id = job.get("id", "")
+    status = job.get("status", "")
+    return f"{job_id[:8]}  status={status}"
+
+
+def _to_iso8601(value: object) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()  # type: ignore[attr-defined]
+    return str(value)
+
+
+async def _resolve_manual_job(
+    body: ManualGenerateRequest,
+    *,
+    require_script: bool = False,
+    require_audio: bool = False,
+) -> dict:
+    user_id = (body.messenger_user_id or "").strip()
+    channel_id = (body.messenger_channel_id or "").strip()
+    normalized_job_id = _normalize_manual_job_id(body.job_id)
+    if not user_id or not channel_id:
+        if not normalized_job_id:
+            raise HTTPException(
+                status_code=400,
+                detail="job_id is required when messenger_user_id/channel_id are missing",
+            )
+        exact = await job_service.get_job(normalized_job_id)
+        if exact is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return exact
+
+    if not normalized_job_id:
+        latest = await job_service.get_latest_job(
+            user_id,
+            channel_id,
+            require_script=require_script,
+            require_audio=require_audio,
+        )
+        if latest is None:
+            requirement = "script_text" if require_script else "audio_url" if require_audio else "조건"
+            raise HTTPException(
+                status_code=404,
+                detail=f"No recent jobs found for this user/channel with required {requirement}",
+            )
+        resolved_job = await job_service.get_job(latest["id"])
+        if resolved_job is None:
+            raise HTTPException(status_code=404, detail="Resolved latest job no longer exists")
+        return resolved_job
+
+    exact = await job_service.get_job(normalized_job_id)
+    if exact is not None:
+        if exact.get("messenger_user_id") != user_id or exact.get("messenger_channel_id") != channel_id:
+            raise HTTPException(status_code=403, detail="Job belongs to a different user/channel")
+        return exact
+
+    matches = await job_service.find_jobs_by_prefix(
+        normalized_job_id,
+        user_id,
+        channel_id,
+        require_script=require_script,
+        require_audio=require_audio,
+    )
+    if len(matches) == 1:
+        resolved_job = await job_service.get_job(matches[0]["id"])
+        if resolved_job is None:
+            raise HTTPException(status_code=404, detail="Resolved job no longer exists")
+        return resolved_job
+
+    if len(matches) > 1:
+        items = ", ".join(_format_job_summary(m) for m in matches[:5])
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ambiguous job_id prefix. Matches: {items}",
+        )
+
+    raise HTTPException(status_code=404, detail="Job not found for this user/channel")
 
 
 def _parse_topic_channels(raw: str) -> list[dict]:
@@ -711,62 +797,93 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
 
 @app.post("/internal/tts-generate")
 async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
-    """수동 /tts 명령 처리 — 기존 job의 script_text로 WF-11 실행."""
-    job = await job_service.get_job(body.job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+    """수동 /tts 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-11 실행."""
+    job = await _resolve_manual_job(body, require_script=True)
+    resolved_job_id = job["id"]
 
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
     script_json = job.get("script_json") or {}
     script_text = script_json.get("script_text") or script_json.get("script", "")
     if not script_text:
-        raise HTTPException(status_code=400, detail="No script_text found in job")
+        raise HTTPException(status_code=400, detail="No script_text found in resolved job")
 
-    await job_service.transition_status(body.job_id, "APPROVED")
+    await job_service.transition_status(resolved_job_id, "APPROVED")
     try:
         await n8n_service.call_wf11_tts_generate(
-            body.job_id,
+            resolved_job_id,
             script_text,
             channel_id,
             user_id,
             auto_trigger_wf12=False,
         )
     except Exception as e:
-        logger.error("call_wf11 (manual /tts) failed job_id=%s: %s", body.job_id, e)
+        logger.error("call_wf11 (manual /tts) failed job_id=%s: %s", resolved_job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {"job_id": body.job_id, "status": "triggered", "workflow": "WF-11"}
+    return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-11"}
 
 
 @app.post("/internal/heygen-generate")
 async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
-    """수동 /heygen 명령 처리 — 기존 job의 audio_url로 WF-12 실행."""
-    job = await job_service.get_job(body.job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+    """수동 /heygen 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-12 실행."""
+    job = await _resolve_manual_job(body, require_audio=True)
+    resolved_job_id = job["id"]
 
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
     audio_url = job.get("audio_url", "")
     if not audio_url:
-        raise HTTPException(status_code=400, detail="No audio_url found in job")
+        raise HTTPException(status_code=400, detail="No audio_url found in resolved job")
 
     audio_file_path = audio_url if isinstance(audio_url, str) and audio_url.startswith("/") else ""
     approved_audio_url = "" if audio_file_path else audio_url
     try:
         await n8n_service.call_wf12_heygen_generate(
-            job_id=body.job_id,
+            job_id=resolved_job_id,
             channel_id=channel_id,
             user_id=user_id,
             audio_file_path=audio_file_path,
             audio_url=approved_audio_url,
         )
     except Exception as e:
-        logger.error("call_wf12 (manual /heygen) failed job_id=%s: %s", body.job_id, e)
+        logger.error("call_wf12 (manual /heygen) failed job_id=%s: %s", resolved_job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {"job_id": body.job_id, "status": "triggered", "workflow": "WF-12"}
+    return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-12"}
+
+
+@app.post("/internal/jobs")
+async def list_jobs(_: AuthDep, body: ListJobsRequest) -> dict:
+    """Discord 수동 명령 보조용 최근 job 목록을 반환한다."""
+    purpose = (body.purpose or "all").strip().lower()
+    if purpose not in ("all", "tts", "heygen"):
+        raise HTTPException(status_code=400, detail="purpose must be one of: all, tts, heygen")
+
+    require_script = purpose == "tts"
+    require_audio = purpose == "heygen"
+    rows = await job_service.list_recent_jobs(
+        body.messenger_user_id,
+        body.messenger_channel_id,
+        limit=body.limit,
+        require_script=require_script,
+        require_audio=require_audio,
+    )
+
+    jobs = [
+        {
+            "job_id": row["id"],
+            "job_id_short": row["id"][:8],
+            "status": row.get("status", ""),
+            "created_at": _to_iso8601(row.get("created_at")),
+            "updated_at": _to_iso8601(row.get("updated_at")),
+            "has_script_text": bool((row.get("script_text") or "").strip()),
+            "has_audio_url": bool((row.get("audio_url") or "").strip()),
+        }
+        for row in rows
+    ]
+
+    return {"purpose": purpose, "count": len(jobs), "jobs": jobs}
 
 
 @app.get("/health")

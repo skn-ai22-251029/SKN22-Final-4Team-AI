@@ -109,7 +109,16 @@ class ReportToVideoRequest(BaseModel):
 
 
 class ManualGenerateRequest(BaseModel):
-    job_id: str
+    job_id: str = ""
+    messenger_user_id: str = ""
+    messenger_channel_id: str = ""
+
+
+class ListJobsRequest(BaseModel):
+    messenger_user_id: str
+    messenger_channel_id: str
+    limit: int = 5
+    purpose: str = "all"  # "all" | "tts" | "heygen"
 
 
 class ReportSelectRequest(BaseModel):
