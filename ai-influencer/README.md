@@ -124,7 +124,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 [Webhook 수신] ← gateway /internal/report-to-video 또는 /report 요청
       │
       ▼
-[요청 파싱] job_id, prompt, notebook_id, topic
+[요청 파싱] job_id, prompt, notebook_id, channel_id
       │
       ▼
 [DB 업데이트] status=GENERATING
@@ -276,18 +276,17 @@ Discord 사용자: /report
 [discord-bot] → [gateway /internal/report-message]
                         │
                         ▼
-               [notebooklm-service /all-channels 조회]
-               → library.json의 모든 채널명 반환
+               [TOPIC_CHANNELS 기반 채널 목록 생성]
                         │
                         ▼
                [Discord 채널 선택 버튼 전송]
-               [채널A] [채널B] [채널C] ...
+                [채널A] [채널B] [채널C] ...
                         │
       사용자가 채널 버튼 클릭
                         │
                         ▼
 [discord-bot] → [gateway /internal/channel-select]
-                 { job_id, channel_name }
+                 { job_id, channel_id }
                         │
                         ▼
                [notebooklm-service /list-reports 조회]
@@ -401,6 +400,7 @@ nano .env   # 또는 vi .env
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
 | `OPENAI_API_KEY` | OpenAI API 키 | |
+| `OPENAI_CUA_API_KEY` | CUA 자동화 전용 OpenAI 키 (권장) | |
 
 **`TOPIC_CHANNELS` 형식:**
 ```
@@ -724,8 +724,8 @@ python register_command.py \
 docker-compose logs -f notebooklm-service
 
 # WF-10 수동 실행
-# → library.json에 채널별 노트북 생성 확인
-cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"topics"' -A 50
+# → library.json에 channels[channel_id].notebook_url 생성 확인
+cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channels"' -A 80
 ```
 
 ---
@@ -751,6 +751,9 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"topics"
 | WF-09 `A 'json' property isn't an object` | `RSS 조회 + 새 영상 필터링` 노드가 `runOnceForEachItem`이면 **반드시 단일 `{ json: {...} }` 반환**해야 함. 최신 워크플로 재임포트 후 재실행 |
 | WF-09 HTTP Body "Field required" | n8n HTTP Request 노드 `specifyBody: "json"` + `jsonBody: JSON.stringify(...)` 방식 사용 확인 |
 | notebooklm-service 연결 실패 | `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 형식(`=` 사용) 및 same network 확인 |
+| `/report` 채널 버튼에 삭제된 채널이 계속 보임 | 버튼 소스는 `TOPIC_CHANNELS` 기준. `.env` 수정 후 `docker-compose up -d --force-recreate messenger-gateway` 적용 |
+| `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
+| CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | `OPENAI_CUA_API_KEY` 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |
 | Gateway DB 연결 실패 | postgres healthcheck 통과 여부 및 환경변수 확인 |
 
 ---

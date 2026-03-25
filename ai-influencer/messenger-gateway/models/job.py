@@ -96,6 +96,7 @@ class ReportSelectRequest(BaseModel):
     job_id: str
     action: str           # "select" | "new"
     report_index: Optional[int] = None   # action="select" 시 필수
+    channel_id: str = ""
 
 
 class ChannelSelectRequest(BaseModel):

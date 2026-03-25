@@ -118,6 +118,7 @@ async def call_wf06_report(
     messenger_channel_id: str,
     prompt: str,
     notebook_id: str,
+    channel_id: str,
     character_id: str,
 ) -> None:
     payload = {
@@ -127,6 +128,7 @@ async def call_wf06_report(
         "messenger_channel_id": messenger_channel_id,
         "prompt": prompt,
         "notebook_id": notebook_id,
+        "channel_id": channel_id,
         "character_id": character_id,
     }
     client = get_http_client()

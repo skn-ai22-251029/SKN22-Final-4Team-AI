@@ -35,6 +35,28 @@ _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
 
 
+def _parse_topic_channels(raw: str) -> list[dict]:
+    """TOPIC_CHANNELS(채널명/채널ID+...)를 버튼용 채널 목록으로 파싱."""
+    channels: list[dict] = []
+    seen: set[str] = set()
+    for chunk in (raw or "").split("+"):
+        part = chunk.strip()
+        if not part:
+            continue
+        slash_idx = part.find("/")
+        if slash_idx < 0:
+            continue
+        name = part[:slash_idx].strip()
+        cid = part[slash_idx + 1 :].strip()
+        if not name or not cid:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        channels.append({"id": cid, "name": name})
+    return channels
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http_client, _discord_adapter
@@ -216,20 +238,11 @@ async def report_message(_: AuthDep, body: ReportMessageRequest) -> dict:
 
 
 async def _get_all_channels() -> list[dict]:
-    """notebooklm-service에서 등록된 모든 채널 목록을 조회한다."""
-    try:
-        resp = await _http_client.get(
-            f"{settings.notebooklm_service_url}/all-channels",
-            headers={"X-Internal-Secret": settings.gateway_internal_secret},
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") == "success":
-                return data.get("channels", [])
-    except Exception as e:
-        logger.warning("[report-message] all-channels 조회 실패: %s", e)
-    return []
+    """채널 버튼 목록은 TOPIC_CHANNELS만 사용한다."""
+    channels = _parse_topic_channels(settings.topic_channels)
+    if not channels:
+        logger.warning("[report-message] TOPIC_CHANNELS 파싱 결과가 비어 있음")
+    return channels
 
 
 async def _handle_report_message_bg(body: ReportMessageRequest) -> None:
@@ -276,6 +289,7 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
                 channel_id=body.messenger_channel_id,
                 job_id=body.job_id,
                 reports=reports,
+                selected_channel_id=body.channel_id,
             )
             return
         except Exception as e:
@@ -293,6 +307,7 @@ async def _call_wf06(body: ReportMessageRequest) -> None:
             messenger_channel_id=body.messenger_channel_id,
             prompt=body.prompt,
             notebook_id=body.notebook_id,
+            channel_id=body.channel_id,
             character_id=body.character_id,
         )
     except Exception as e:
@@ -354,6 +369,7 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
                 f"{settings.notebooklm_service_url}/get-report",
                 json={
                     "job_id": body.job_id,
+                    "channel_id": body.channel_id or None,
                     "report_index": body.report_index,
                 },
                 headers={"X-Internal-Secret": settings.gateway_internal_secret},
@@ -409,6 +425,7 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             messenger_channel_id=channel_id,
             prompt=job.get("concept_text", ""),
             notebook_id="",
+            channel_id=body.channel_id,
             character_id=job.get("character_id", "default-character"),
         )
         await _call_wf06(report_msg)

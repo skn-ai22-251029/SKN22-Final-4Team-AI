@@ -68,6 +68,7 @@ services:
     restart: always
     environment:
       GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
+      OPENAI_CUA_API_KEY: ${OPENAI_CUA_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       NOTEBOOKLM_DATA_DIR: /app/data
       NOTEBOOKLM_SCRIPTS_DIR: /app/scripts
@@ -100,6 +101,7 @@ services:
       N8N_WF01_WEBHOOK_URL: ${N8N_WF01_WEBHOOK_URL}
       N8N_WF05_WEBHOOK_URL: ${N8N_WF05_WEBHOOK_URL}
       N8N_WF06_WEBHOOK_URL: ${N8N_WF06_WEBHOOK_URL}
+      TOPIC_CHANNELS: ${TOPIC_CHANNELS}
     ports:
       - "8080:8080"
     networks:

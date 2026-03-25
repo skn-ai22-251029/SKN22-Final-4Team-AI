@@ -10,6 +10,7 @@ Modes:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from generate_report_cua import (
     BROWSER_PROFILE_DIR,
     _ensure_logged_in,
+    _assert_allowed_url,
     _run_cua_loop,
 )
 from openai import OpenAI
@@ -35,6 +37,13 @@ logger = logging.getLogger("manage_sources_cua")
 DATA_DIR = Path(__file__).parent.parent / "data"
 SOURCES_LOG_PATH = DATA_DIR / "sources_log.json"
 NOTEBOOKLM_HOME = "https://notebooklm.google.com"
+
+
+def _build_openai_client() -> OpenAI:
+    api_key = os.environ.get("OPENAI_CUA_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+    return OpenAI(api_key=api_key)
 
 
 # ─────────────────────────────────────────
@@ -147,6 +156,7 @@ def add_source_cua(page, client, notebook_url: str, source_url: str, source_titl
     clean_url = urlunparse(parsed._replace(query="", fragment=""))
 
     page.goto(clean_url, wait_until="domcontentloaded", timeout=90000)
+    _assert_allowed_url(page.url, "ADD_SRC_NAVIGATE")
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -201,6 +211,7 @@ def add_source_cua(page, client, notebook_url: str, source_url: str, source_titl
 def delete_source_cua(page, client, notebook_url: str, source_url: str, source_title: str) -> bool:
     """CUA로 특정 소스(제목/URL로 식별)를 삭제."""
     page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
+    _assert_allowed_url(page.url, "DEL_SRC_NAVIGATE")
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -232,6 +243,7 @@ def delete_source_cua(page, client, notebook_url: str, source_url: str, source_t
 def list_sources_from_page(page, notebook_url: str) -> list[str]:
     """DOM에서 소스 패널 제목 목록 파싱 (GPT 불필요)."""
     page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
+    _assert_allowed_url(page.url, "LIST_SRC_NAVIGATE")
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -264,6 +276,7 @@ def list_sources_from_page(page, notebook_url: str) -> list[str]:
 def find_notebook_url_by_name_cua(page, client, channel_name: str) -> str:
     """NotebookLM 홈에서 channel_name으로 노트북을 찾아 URL 반환. 실패 시 '' 반환."""
     page.goto(NOTEBOOKLM_HOME, wait_until="domcontentloaded", timeout=90000)
+    _assert_allowed_url(page.url, "FIND_NB_NAVIGATE")
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -318,7 +331,7 @@ def main():
         parser.error("--notebook-url is required for this mode")
 
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    client = OpenAI()
+    client = _build_openai_client()
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(

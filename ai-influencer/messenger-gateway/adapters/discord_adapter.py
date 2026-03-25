@@ -186,6 +186,7 @@ class DiscordAdapter(MessengerAdapter):
         channel_id: str,
         job_id: str,
         reports: list[str],
+        selected_channel_id: str,
     ) -> None:
         """기존 보고서 선택 버튼 + '새로 생성' 버튼을 Discord로 전송한다.
         Discord 제한: 5버튼/행 × 5행 = 최대 25개. 보고서는 최대 24개."""
@@ -195,13 +196,13 @@ class DiscordAdapter(MessengerAdapter):
                 "type": 2,
                 "label": f"{i + 1}. {title[:60]}",
                 "style": 2,  # Secondary
-                "custom_id": f"select_report:{job_id}:{i}",
+                "custom_id": f"select_report:{job_id}:{selected_channel_id}:{i}",
             })
         all_buttons.append({
             "type": 2,
             "label": "🆕 새로 생성",
             "style": 1,  # Primary
-            "custom_id": f"new_report:{job_id}",
+            "custom_id": f"new_report:{job_id}:{selected_channel_id}",
         })
 
         # 5개씩 ActionRow로 묶음
