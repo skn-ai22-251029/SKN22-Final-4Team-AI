@@ -409,6 +409,7 @@ nano .env   # 또는 vi .env
 | `DISCORD_BOT_TOKEN` | Discord Bot 토큰 | |
 | `DISCORD_ALLOWED_USER_IDS` | 허용 유저 ID (쉼표 구분) | `12345,67890` |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | 허용 채널 ID (쉼표 구분) | `11111,22222` |
+| `DISCORD_GUILD_ID` | (선택) 슬래시 명령 즉시 반영용 Guild ID | `123456789012345678` |
 | `N8N_RUNNERS_TASK_TIMEOUT` | n8n task runner 실행 제한(초) | `1200` |
 | `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
@@ -761,6 +762,9 @@ python register_command.py \
 사전조건:
 - `/tts`: job에 `script_json.script_text`(또는 `script`)가 있어야 함
 - `/heygen`: job에 `audio_url`이 있어야 함
+
+> Discord에서 옵션이 여전히 `필수`로 보이면, 봇 재배포 후 슬래시 명령 재동기화가 필요합니다.  
+> `DISCORD_GUILD_ID`를 설정하면 길드 단위로 즉시 동기화됩니다.
 
 ### 자동 수집 확인
 

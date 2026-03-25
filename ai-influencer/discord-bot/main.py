@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     discord_bot_token: str
     discord_allowed_user_ids: str = ""
     discord_allowed_channel_ids: str = ""
+    discord_guild_id: str = ""
     gateway_url: str = "http://messenger-gateway:8080"
     gateway_internal_secret: str
 
@@ -38,6 +39,11 @@ ALLOWED_USER_IDS: set[str] = {
 ALLOWED_CHANNEL_IDS: set[str] = {
     cid.strip() for cid in config.discord_allowed_channel_ids.split(",") if cid.strip()
 }
+SYNC_GUILD_IDS: list[int] = [
+    int(gid.strip())
+    for gid in config.discord_guild_id.split(",")
+    if gid.strip().isdigit()
+]
 
 
 # ─────────────────────────────────────────
@@ -109,8 +115,25 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready() -> None:
-    await bot.tree.sync()
-    logger.info("[discord] bot online: %s / slash commands synced", bot.user)
+    synced_global_count = 0
+    try:
+        if SYNC_GUILD_IDS:
+            for guild_id in SYNC_GUILD_IDS:
+                guild = discord.Object(id=guild_id)
+                bot.tree.copy_global_to(guild=guild)
+                synced_guild = await bot.tree.sync(guild=guild)
+                logger.info("[discord] guild sync done guild_id=%s commands=%d", guild_id, len(synced_guild))
+
+        synced_global = await bot.tree.sync()
+        synced_global_count = len(synced_global)
+    except Exception as e:
+        logger.error("[discord] slash command sync failed: %s", e)
+
+    logger.info(
+        "[discord] bot online: %s / slash commands synced(global=%d)",
+        bot.user,
+        synced_global_count,
+    )
 
 
 @bot.event
@@ -247,7 +270,7 @@ async def report_command(
 
 
 @bot.tree.command(name="tts", description="기존 job_id로 WF-11(TTS) 생성을 시작합니다")
-async def tts_command(interaction: discord.Interaction, job_id: Optional[str] = None) -> None:
+async def tts_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)
 
     if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
@@ -286,7 +309,7 @@ async def tts_command(interaction: discord.Interaction, job_id: Optional[str] = 
 
 
 @bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
-async def heygen_command(interaction: discord.Interaction, job_id: Optional[str] = None) -> None:
+async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)
 
     if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
