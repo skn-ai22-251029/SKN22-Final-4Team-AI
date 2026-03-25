@@ -223,6 +223,68 @@ async def report_command(
         await interaction.followup.send("보고서 요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
 
+@bot.tree.command(name="tts", description="기존 job_id로 WF-11(TTS) 생성을 시작합니다")
+async def tts_command(interaction: discord.Interaction, job_id: str) -> None:
+    user_id = str(interaction.user.id)
+
+    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+        return
+
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    normalized_job_id = (job_id or "").strip()
+    if not normalized_job_id:
+        await interaction.followup.send("job_id를 입력해주세요.", ephemeral=True)
+        return
+
+    try:
+        await gateway_call(
+            "/internal/tts-generate",
+            {"job_id": normalized_job_id},
+        )
+        await interaction.followup.send(
+            f"🔊 WF-11(TTS) 시작 요청 완료: `{normalized_job_id[:8]}`",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ /tts 실패: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
+async def heygen_command(interaction: discord.Interaction, job_id: str) -> None:
+    user_id = str(interaction.user.id)
+
+    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+        return
+
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    normalized_job_id = (job_id or "").strip()
+    if not normalized_job_id:
+        await interaction.followup.send("job_id를 입력해주세요.", ephemeral=True)
+        return
+
+    try:
+        await gateway_call(
+            "/internal/heygen-generate",
+            {"job_id": normalized_job_id},
+        )
+        await interaction.followup.send(
+            f"🎬 WF-12(HeyGen) 시작 요청 완료: `{normalized_job_id[:8]}`",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ /heygen 실패: {e}", ephemeral=True)
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction) -> None:
     # 버튼 클릭(컴포넌트 인터랙션)만 처리

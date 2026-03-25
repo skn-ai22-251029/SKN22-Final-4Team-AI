@@ -13,6 +13,7 @@ from models.job import (
     ChannelSelectRequest,
     ConfirmActionRequest,
     IncomingMessageRequest,
+    ManualGenerateRequest,
     ReportMessageRequest,
     ReportSelectRequest,
     ReportToVideoRequest,
@@ -706,6 +707,66 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
 
     logger.info("[discord] report_to_video triggered job_id=%s", body.job_id)
     return {"job_id": body.job_id, "status": "triggered"}
+
+
+@app.post("/internal/tts-generate")
+async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
+    """수동 /tts 명령 처리 — 기존 job의 script_text로 WF-11 실행."""
+    job = await job_service.get_job(body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    channel_id = job["messenger_channel_id"]
+    user_id = job["messenger_user_id"]
+    script_json = job.get("script_json") or {}
+    script_text = script_json.get("script_text") or script_json.get("script", "")
+    if not script_text:
+        raise HTTPException(status_code=400, detail="No script_text found in job")
+
+    await job_service.transition_status(body.job_id, "APPROVED")
+    try:
+        await n8n_service.call_wf11_tts_generate(
+            body.job_id,
+            script_text,
+            channel_id,
+            user_id,
+            auto_trigger_wf12=False,
+        )
+    except Exception as e:
+        logger.error("call_wf11 (manual /tts) failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"job_id": body.job_id, "status": "triggered", "workflow": "WF-11"}
+
+
+@app.post("/internal/heygen-generate")
+async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
+    """수동 /heygen 명령 처리 — 기존 job의 audio_url로 WF-12 실행."""
+    job = await job_service.get_job(body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    channel_id = job["messenger_channel_id"]
+    user_id = job["messenger_user_id"]
+    audio_url = job.get("audio_url", "")
+    if not audio_url:
+        raise HTTPException(status_code=400, detail="No audio_url found in job")
+
+    audio_file_path = audio_url if isinstance(audio_url, str) and audio_url.startswith("/") else ""
+    approved_audio_url = "" if audio_file_path else audio_url
+    try:
+        await n8n_service.call_wf12_heygen_generate(
+            job_id=body.job_id,
+            channel_id=channel_id,
+            user_id=user_id,
+            audio_file_path=audio_file_path,
+            audio_url=approved_audio_url,
+        )
+    except Exception as e:
+        logger.error("call_wf12 (manual /heygen) failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"job_id": body.job_id, "status": "triggered", "workflow": "WF-12"}
 
 
 @app.get("/health")

@@ -108,6 +108,10 @@ class ReportToVideoRequest(BaseModel):
     job_id: str
 
 
+class ManualGenerateRequest(BaseModel):
+    job_id: str
+
+
 class ReportSelectRequest(BaseModel):
     job_id: str
     action: str           # "select" | "new"
