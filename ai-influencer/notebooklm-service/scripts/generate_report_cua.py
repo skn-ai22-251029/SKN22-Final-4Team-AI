@@ -41,6 +41,11 @@ Rules:
 - Coordinates must be within 1280x800 viewport.
 """
 
+ALLOWED_CUA_HOSTS = {
+    "notebooklm.google.com",
+    "accounts.google.com",
+}
+
 # NotebookLM 보고서 컨테이너 후보 셀렉터 (우선순위 순)
 _REPORT_SELECTORS = [
     "ms-content-chunk",
@@ -94,6 +99,23 @@ def _ensure_logged_in(page: Page) -> None:
         logger.error("[login] 자동 로그인 실패: %s", e)
         logger.error("[login] 현재 URL: %s", page.url)
         raise RuntimeError(f"Google 자동 로그인 실패: {e}")
+
+
+def _assert_allowed_url(current_url: str, phase: str) -> None:
+    """CUA가 허용된 도메인에서만 동작하도록 강제."""
+    from urllib.parse import urlparse
+
+    host = (urlparse(current_url).hostname or "").lower()
+    if host and host not in ALLOWED_CUA_HOSTS:
+        raise RuntimeError(f"[CUA][{phase}] 허용되지 않은 도메인 접근 차단: {host}")
+
+
+def _build_openai_client() -> OpenAI:
+    """CUA는 전용 키 우선 사용. 없으면 일반 키를 fallback."""
+    api_key = os.environ.get("OPENAI_CUA_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+    return OpenAI(api_key=api_key)
 
 
 def _extract_studio_report(page) -> str:
@@ -232,6 +254,7 @@ def _run_cua_loop(
     HISTORY_WINDOW = 3
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for step in range(max_steps):
+        _assert_allowed_url(page.url, phase)
         screenshot_b64 = base64.b64encode(page.screenshot()).decode()
         logger.info("[CUA][%s] 스텝 %d/%d — gpt-5.4 Vision 호출", phase, step + 1, max_steps)
 
@@ -327,7 +350,7 @@ def list_reports(page, notebook_url: str) -> list[str]:
 def get_existing_report(page, notebook_url: str, report_index: int, output_path: str) -> str:
     """GPT-5.4 CUA로 기존 보고서 타일을 클릭해서 내용을 추출하고 파일로 저장한다."""
     logger.info("[get_existing_report] index=%d url=%s", report_index, notebook_url)
-    client = OpenAI()
+    client = _build_openai_client()
 
     page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
     try:
@@ -388,7 +411,7 @@ def get_existing_report(page, notebook_url: str, report_index: int, output_path:
 
 def generate_report(prompt: str, notebook_url: str, output_path: str, headless: bool = True) -> str:
     logger.info("[CUA] 시작 prompt=%r url=%s headless=%s", prompt, notebook_url, headless)
-    client = OpenAI()
+    client = _build_openai_client()
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Phase 1: 입력 필드 포커스까지만 — 프롬프트 텍스트 노출 없음
@@ -431,6 +454,7 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
         logger.info("[CUA] 노트북 URL 이동 중...")
         page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(3)
+        _assert_allowed_url(page.url, "NAVIGATE")
         logger.info("[CUA] 페이지 로드 완료: %s / url=%s", page.title(), page.url)
 
         _ensure_logged_in(page)

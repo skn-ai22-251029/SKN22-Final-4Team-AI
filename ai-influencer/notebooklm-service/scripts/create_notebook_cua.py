@@ -15,6 +15,7 @@ Output JSON:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import date
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from generate_report_cua import (
     BROWSER_PROFILE_DIR,
     DATA_DIR,
+    _assert_allowed_url,
     _ensure_logged_in,
     _run_cua_loop,
 )
@@ -113,6 +115,7 @@ def create_notebook(page, client, notebook_name: str) -> str:
     """CUA로 NotebookLM 홈에서 새 노트북을 생성하고 URL을 반환."""
     logger.info("[create_notebook] 홈 이동: %s", NOTEBOOKLM_HOME)
     page.goto(NOTEBOOKLM_HOME, wait_until="domcontentloaded", timeout=90000)
+    _assert_allowed_url(page.url, "CREATE_NB_NAVIGATE")
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -147,6 +150,13 @@ def create_notebook(page, client, notebook_name: str) -> str:
     return notebook_url
 
 
+def _build_openai_client() -> OpenAI:
+    api_key = os.environ.get("OPENAI_CUA_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+    return OpenAI(api_key=api_key)
+
+
 # ─────────────────────────────────────────
 # 진입점
 # ─────────────────────────────────────────
@@ -161,7 +171,7 @@ def main():
     args = parser.parse_args()
 
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    client = OpenAI()
+    client = _build_openai_client()
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(

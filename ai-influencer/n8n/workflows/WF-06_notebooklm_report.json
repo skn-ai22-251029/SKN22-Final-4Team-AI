@@ -22,7 +22,8 @@
             {"id": "a2", "name": "messenger_source", "value": "={{ $json.body.messenger_source }}", "type": "string"},
             {"id": "a3", "name": "messenger_channel_id", "value": "={{ $json.body.messenger_channel_id }}", "type": "string"},
             {"id": "a4", "name": "prompt", "value": "={{ $json.body.prompt }}", "type": "string"},
-            {"id": "a5", "name": "notebook_id", "value": "={{ $json.body.notebook_id ?? '' }}", "type": "string"}
+            {"id": "a5", "name": "notebook_id", "value": "={{ $json.body.notebook_id ?? '' }}", "type": "string"},
+            {"id": "a6", "name": "channel_id", "value": "={{ $json.body.channel_id ?? '' }}", "type": "string"}
           ]
         },
         "options": {}
@@ -61,7 +62,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ job_id: $('Extract Fields').item.json.job_id, prompt: $('Extract Fields').item.json.prompt, notebook_id: $('Extract Fields').item.json.notebook_id }) }}",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Extract Fields').item.json.job_id, prompt: $('Extract Fields').item.json.prompt, notebook_id: $('Extract Fields').item.json.notebook_id, channel_id: $('Extract Fields').item.json.channel_id }) }}",
         "options": {
           "timeout": 600000
         }

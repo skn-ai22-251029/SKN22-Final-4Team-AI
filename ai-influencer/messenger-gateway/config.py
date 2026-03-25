@@ -16,10 +16,12 @@ class Settings(BaseSettings):
     n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/wf-01-input"
     n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/wf-05-confirm"
     n8n_wf06_webhook_url: str = "http://n8n:5678/webhook/wf-06-report"
-    n8n_wf07_webhook_url: str = "http://n8n:5678/webhook/wf-07-tts-heygen"
+    n8n_wf11_webhook_url: str = "http://n8n:5678/webhook/wf-11-tts-generate"
+    n8n_wf12_webhook_url: str = "http://n8n:5678/webhook/wf-12-heygen-generate"
     n8n_wf08_webhook_url: str = "http://n8n:5678/webhook/wf-08-sns-upload"
 
     notebooklm_service_url: str = "http://notebooklm-service:8090"
+    topic_channels: str = ""
 
     class Config:
         env_file = ".env"

@@ -12,15 +12,33 @@
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 300]
+      "position": [
+        240,
+        300
+      ]
     },
     {
       "parameters": {
         "assignments": {
           "assignments": [
-            {"id": "p1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
-            {"id": "p2", "name": "action", "value": "={{ $json.body.action }}", "type": "string"},
-            {"id": "p3", "name": "revision_note", "value": "={{ $json.body.revision_note ?? '' }}", "type": "string"}
+            {
+              "id": "p1",
+              "name": "job_id",
+              "value": "={{ $json.body.job_id }}",
+              "type": "string"
+            },
+            {
+              "id": "p2",
+              "name": "action",
+              "value": "={{ $json.body.action }}",
+              "type": "string"
+            },
+            {
+              "id": "p3",
+              "name": "revision_note",
+              "value": "={{ $json.body.revision_note ?? '' }}",
+              "type": "string"
+            }
           ]
         },
         "options": {}
@@ -29,7 +47,10 @@
       "name": "Parse",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [460, 300]
+      "position": [
+        460,
+        300
+      ]
     },
     {
       "parameters": {
@@ -38,13 +59,21 @@
           "values": [
             {
               "conditions": {
-                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
                 "conditions": [
                   {
                     "id": "sw-cond-1",
                     "leftValue": "={{ $json.action }}",
                     "rightValue": "approved",
-                    "operator": {"type": "string", "operation": "equals"}
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
                   }
                 ],
                 "combinator": "and"
@@ -53,13 +82,21 @@
             },
             {
               "conditions": {
-                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
                 "conditions": [
                   {
                     "id": "sw-cond-2",
                     "leftValue": "={{ $json.action }}",
                     "rightValue": "revision_requested",
-                    "operator": {"type": "string", "operation": "equals"}
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
                   }
                 ],
                 "combinator": "and"
@@ -74,7 +111,10 @@
       "name": "Route by Action",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.2,
-      "position": [680, 300]
+      "position": [
+        680,
+        300
+      ]
     },
     {
       "parameters": {
@@ -86,31 +126,43 @@
       "name": "Set APPROVED",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [900, 160],
+      "position": [
+        900,
+        160
+      ],
       "credentials": {
-        "postgres": {"id": "1", "name": "pg-credentials"}
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
       }
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "http://n8n:5678/webhook/wf-07-tts-heygen",
+        "url": "http://n8n:5678/webhook/wf-11-tts-generate",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ job_id: $('Parse').item.json.job_id, script_text: $json.script_json ? $json.script_json.script : '', channel_id: $json.messenger_channel_id, user_id: $json.messenger_user_id }) }}",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('Parse').item.json.job_id, script_text: $json.script_json ? ($json.script_json.script_text || $json.script_json.script || '') : '', channel_id: $json.messenger_channel_id, user_id: $json.messenger_user_id, auto_trigger_wf12: false }) }}",
         "options": {}
       },
       "id": "wf05-http-trigger-wf07",
-      "name": "Trigger WF-07 TTS+HeyGen",
+      "name": "Trigger WF-11 TTS",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1120, 160]
+      "position": [
+        1120,
+        160
+      ]
     },
     {
       "parameters": {
@@ -122,9 +174,15 @@
       "name": "Set REVISION_REQUESTED",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [900, 440],
+      "position": [
+        900,
+        440
+      ],
       "credentials": {
-        "postgres": {"id": "1", "name": "pg-credentials"}
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
       }
     },
     {
@@ -134,7 +192,10 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            {"name": "X-Internal-Secret", "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"}
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
           ]
         },
         "sendBody": true,
@@ -146,30 +207,81 @@
       "name": "Re-trigger WF-01",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1120, 440]
+      "position": [
+        1120,
+        440
+      ]
     }
   ],
   "connections": {
     "Webhook": {
-      "main": [[{"node": "Parse", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Parse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Parse": {
-      "main": [[{"node": "Route by Action", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Route by Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Route by Action": {
       "main": [
-        [{"node": "Set APPROVED", "type": "main", "index": 0}],
-        [{"node": "Set REVISION_REQUESTED", "type": "main", "index": 0}]
+        [
+          {
+            "node": "Set APPROVED",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set REVISION_REQUESTED",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Set APPROVED": {
-      "main": [[{"node": "Trigger WF-07 TTS+HeyGen", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Trigger WF-11 TTS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Set REVISION_REQUESTED": {
-      "main": [[{"node": "Re-trigger WF-01", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Re-trigger WF-01",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": true,
-  "settings": {"executionOrder": "v1"},
-  "tags": ["phase-1"]
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "phase-1"
+  ]
 }

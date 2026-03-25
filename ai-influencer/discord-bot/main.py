@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 import httpx
@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     discord_bot_token: str
     discord_allowed_user_ids: str = ""
     discord_allowed_channel_ids: str = ""
+    discord_guild_id: str = ""
     gateway_url: str = "http://messenger-gateway:8080"
     gateway_internal_secret: str
 
@@ -38,6 +39,11 @@ ALLOWED_USER_IDS: set[str] = {
 ALLOWED_CHANNEL_IDS: set[str] = {
     cid.strip() for cid in config.discord_allowed_channel_ids.split(",") if cid.strip()
 }
+SYNC_GUILD_IDS: list[int] = [
+    int(gid.strip())
+    for gid in config.discord_guild_id.split(",")
+    if gid.strip().isdigit()
+]
 
 
 # ─────────────────────────────────────────
@@ -58,10 +64,33 @@ def get_gateway_client() -> httpx.AsyncClient:
     return _gateway_client
 
 
-async def gateway_call(path: str, payload: dict) -> None:
+def _error_detail_from_response(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            detail = data.get("detail")
+            if isinstance(detail, str) and detail.strip():
+                return detail
+    except Exception:
+        pass
+    body = resp.text.strip()
+    return body or f"HTTP {resp.status_code}"
+
+
+async def gateway_call(path: str, payload: dict) -> dict[str, Any]:
     try:
         resp = await get_gateway_client().post(path, json=payload)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(_error_detail_from_response(resp))
+        if not resp.content:
+            return {}
+        try:
+            parsed = resp.json()
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
     except Exception as e:
         logger.error("[discord] gateway_call %s failed: %s", path, e)
         raise
@@ -86,8 +115,25 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready() -> None:
-    await bot.tree.sync()
-    logger.info("[discord] bot online: %s / slash commands synced", bot.user)
+    synced_global_count = 0
+    try:
+        if SYNC_GUILD_IDS:
+            for guild_id in SYNC_GUILD_IDS:
+                guild = discord.Object(id=guild_id)
+                bot.tree.copy_global_to(guild=guild)
+                synced_guild = await bot.tree.sync(guild=guild)
+                logger.info("[discord] guild sync done guild_id=%s commands=%d", guild_id, len(synced_guild))
+
+        synced_global = await bot.tree.sync()
+        synced_global_count = len(synced_global)
+    except Exception as e:
+        logger.error("[discord] slash command sync failed: %s", e)
+
+    logger.info(
+        "[discord] bot online: %s / slash commands synced(global=%d)",
+        bot.user,
+        synced_global_count,
+    )
 
 
 @bot.event
@@ -179,7 +225,7 @@ _REPORT_SYSTEM_PROMPT = (
 @bot.tree.command(name="report", description="NotebookLM 보고서를 생성합니다")
 async def report_command(
     interaction: discord.Interaction,
-    prompt: str,
+    prompt: Optional[str] = None,
 ) -> None:
     user_id = str(interaction.user.id)
 
@@ -194,6 +240,8 @@ async def report_command(
     await interaction.response.defer()
 
     job_id = str(uuid.uuid4())
+    cleaned_prompt = (prompt or "").strip()
+    merged_prompt = _REPORT_SYSTEM_PROMPT + cleaned_prompt
     try:
         await gateway_call(
             "/internal/report-message",
@@ -202,17 +250,154 @@ async def report_command(
                 "messenger_source": "discord",
                 "messenger_user_id": user_id,
                 "messenger_channel_id": str(interaction.channel_id),
-                "prompt": _REPORT_SYSTEM_PROMPT + prompt,
+                "prompt": merged_prompt,
                 "notebook_id": "",
                 "channel_id": "",
                 "character_id": "default-character",
             },
         )
-        await interaction.followup.send(
-            f"📊 요청 접수! 채널을 선택하면 보고서를 가져옵니다. ⏳\nJob ID: `{job_id[:8]}`"
-        )
+        if cleaned_prompt:
+            await interaction.followup.send(
+                f"📊 요청 접수! 채널을 선택하면 보고서를 가져옵니다. ⏳\nJob ID: `{job_id[:8]}`"
+            )
+        else:
+            await interaction.followup.send(
+                f"📊 요청 접수! (프롬프트 공백 허용: 기본 템플릿으로 진행)\n"
+                f"채널을 선택하면 보고서를 가져옵니다. ⏳\nJob ID: `{job_id[:8]}`"
+            )
     except Exception:
         await interaction.followup.send("보고서 요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+
+
+@bot.tree.command(name="tts", description="기존 job_id로 WF-11(TTS) 생성을 시작합니다")
+async def tts_command(interaction: discord.Interaction, job_id: str = "") -> None:
+    user_id = str(interaction.user.id)
+
+    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+        return
+
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    normalized_job_id = (job_id or "").strip()
+
+    try:
+        result = await gateway_call(
+            "/internal/tts-generate",
+            {
+                "job_id": normalized_job_id,
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+            },
+        )
+        resolved_job_id = result.get("job_id", normalized_job_id)
+        picked_latest = not normalized_job_id
+        await interaction.followup.send(
+            (
+                "🔊 WF-11(TTS) 시작 요청 완료 "
+                f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
+                if picked_latest
+                else f"🔊 WF-11(TTS) 시작 요청 완료: `{resolved_job_id[:8]}`"
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ /tts 실패: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
+async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> None:
+    user_id = str(interaction.user.id)
+
+    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+        return
+
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    normalized_job_id = (job_id or "").strip()
+
+    try:
+        result = await gateway_call(
+            "/internal/heygen-generate",
+            {
+                "job_id": normalized_job_id,
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+            },
+        )
+        resolved_job_id = result.get("job_id", normalized_job_id)
+        picked_latest = not normalized_job_id
+        await interaction.followup.send(
+            (
+                "🎬 WF-12(HeyGen) 시작 요청 완료 "
+                f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
+                if picked_latest
+                else f"🎬 WF-12(HeyGen) 시작 요청 완료: `{resolved_job_id[:8]}`"
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ /heygen 실패: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="jobs", description="최근 job 목록을 조회합니다")
+async def jobs_command(interaction: discord.Interaction, purpose: str = "all") -> None:
+    user_id = str(interaction.user.id)
+
+    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+        return
+
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+        return
+
+    normalized_purpose = (purpose or "all").strip().lower()
+    if normalized_purpose not in ("all", "tts", "heygen"):
+        await interaction.response.send_message(
+            "purpose는 all / tts / heygen 중 하나여야 합니다.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await gateway_call(
+            "/internal/jobs",
+            {
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+                "purpose": normalized_purpose,
+                "limit": 5,
+            },
+        )
+        jobs = result.get("jobs", [])
+        if not jobs:
+            await interaction.followup.send("최근 job이 없습니다.", ephemeral=True)
+            return
+
+        lines = []
+        for item in jobs:
+            jid = item.get("job_id_short", "")
+            status = item.get("status", "")
+            has_script = "Y" if item.get("has_script_text") else "N"
+            has_audio = "Y" if item.get("has_audio_url") else "N"
+            lines.append(f"`{jid}` status={status} script={has_script} audio={has_audio}")
+
+        guide = "사용: `/tts` 또는 `/heygen`에 위 8자리 job_id를 넣거나, job_id 없이 실행"
+        await interaction.followup.send(
+            f"최근 job 목록(purpose={normalized_purpose}):\n" + "\n".join(lines) + f"\n\n{guide}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ /jobs 실패: {e}", ephemeral=True)
 
 
 @bot.event
@@ -229,7 +414,10 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     parts = custom_id.split(":")
     action = parts[0]
     # video_reject_step: video_reject_step:{job_id}:{step}
-    # select_report:     select_report:{job_id}:{index}
+    # tts_approve:       tts_approve:{job_id}
+    # tts_reject:        tts_reject:{job_id}
+    # select_report:     select_report:{job_id}:{channel_id}:{index}
+    # new_report:        new_report:{job_id}:{channel_id}
     # select_channel:    select_channel:{job_id}:{channel_id}
     step = None
     report_index = None
@@ -237,9 +425,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     if action == "video_reject_step" and len(parts) >= 3:
         job_id = parts[1]
         step = parts[2]
-    elif action == "select_report" and len(parts) >= 3:
+    elif action == "select_report" and len(parts) >= 4:
         job_id = parts[1]
-        report_index = int(parts[2])
+        channel_id_value = parts[2]
+        report_index = int(parts[3])
+    elif action == "new_report" and len(parts) >= 3:
+        job_id = parts[1]
+        channel_id_value = parts[2]
     elif action == "select_channel" and len(parts) >= 3:
         job_id = parts[1]
         channel_id_value = ":".join(parts[2:])
@@ -299,6 +491,26 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
+    elif action == "tts_approve":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {"job_id": job_id, "action": "approve"},
+            )
+            await interaction.followup.send("✅ TTS 승인됨. WF-12(HeyGen) 실행 중...", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_reject":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {"job_id": job_id, "action": "reject"},
+            )
+            await interaction.followup.send("❌ TTS 반려 처리되었습니다.", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
     elif action == "report_to_video":
         try:
             await gateway_call(
@@ -312,8 +524,14 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         try:
             await gateway_call(
                 "/internal/report-select",
-                {"job_id": job_id, "action": "select", "report_index": report_index},
+                {
+                    "job_id": job_id,
+                    "action": "select",
+                    "report_index": report_index,
+                    "channel_id": channel_id_value or "",
+                },
             )
+            await interaction.followup.send("📄 선택한 보고서를 가져오는 중입니다...", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
@@ -321,8 +539,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         try:
             await gateway_call(
                 "/internal/report-select",
-                {"job_id": job_id, "action": "new"},
+                {"job_id": job_id, "action": "new", "channel_id": channel_id_value or ""},
             )
+            await interaction.followup.send("🆕 새 보고서 생성을 시작합니다...", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
@@ -332,6 +551,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 "/internal/channel-select",
                 {"job_id": job_id, "channel_id": channel_id_value},
             )
+            await interaction.followup.send("📺 채널 선택 완료. 보고서 목록을 조회합니다...", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 

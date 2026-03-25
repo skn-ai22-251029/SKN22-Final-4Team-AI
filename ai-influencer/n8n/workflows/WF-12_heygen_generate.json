@@ -1,0 +1,328 @@
+{
+  "name": "WF-12: HeyGen 영상 생성",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-12-heygen-generate",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "wf12-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "job_id",
+              "value": "={{ $json.body.job_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "channel_id",
+              "value": "={{ $json.body.channel_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "user_id",
+              "value": "={{ $json.body.user_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "audio_file_path",
+              "value": "={{ $json.body.audio_file_path ?? '' }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "audio_url",
+              "value": "={{ $json.body.audio_url ?? '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf12-set-parse",
+      "name": "Extract Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='GENERATING', updated_at=NOW() WHERE id='{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf12-pg-generating",
+      "name": "Update to GENERATING",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\n\nconst jobId = $('Extract Fields').item.json.job_id;\nconst channelId = $('Extract Fields').item.json.channel_id;\nconst userId = $('Extract Fields').item.json.user_id;\nconst audioFilePath = ($('Extract Fields').item.json.audio_file_path || '').trim();\nconst audioUrl = ($('Extract Fields').item.json.audio_url || '').trim();\n\ntry {\n  let audioBytes = null;\n\n  if (audioFilePath && fs.existsSync(audioFilePath)) {\n    audioBytes = fs.readFileSync(audioFilePath);\n  } else if (audioUrl) {\n    const audioResp = await fetch(audioUrl);\n    if (!audioResp.ok) {\n      throw new Error(`audio fetch failed: ${audioResp.status} ${await audioResp.text()}`);\n    }\n    audioBytes = Buffer.from(await audioResp.arrayBuffer());\n  } else {\n    throw new Error('audio_file_path/audio_url 모두 비어 있음');\n  }\n\n  const formData = new FormData();\n  const audioBlob = new Blob([audioBytes], { type: 'audio/wav' });\n  formData.append('file', audioBlob, 'audio.wav');\n\n  const uploadResp = await fetch('https://upload.heygen.com/v1/asset', {\n    method: 'POST',\n    headers: { 'X-Api-Key': $env.HEYGEN_API_KEY },\n    body: formData,\n  });\n\n  if (!uploadResp.ok) {\n    throw new Error(`HeyGen upload failed: ${uploadResp.status} ${await uploadResp.text()}`);\n  }\n\n  const uploadData = await uploadResp.json();\n  const assetId = uploadData.data?.id || uploadData.asset_id;\n  if (!assetId) {\n    throw new Error(`HeyGen upload returned no asset_id: ${JSON.stringify(uploadData)}`);\n  }\n\n  const videoBody = {\n    video_inputs: [{\n      character: {\n        type: 'avatar',\n        avatar_id: $env.HEYGEN_AVATAR_ID,\n        avatar_style: 'normal',\n      },\n      voice: {\n        type: 'audio',\n        audio_asset_id: assetId,\n      },\n    }],\n    dimension: { width: 1280, height: 720 },\n  };\n\n  const videoResp = await fetch('https://api.heygen.com/v2/video/generate', {\n    method: 'POST',\n    headers: {\n      'X-Api-Key': $env.HEYGEN_API_KEY,\n      'Content-Type': 'application/json',\n    },\n    body: JSON.stringify(videoBody),\n  });\n\n  if (!videoResp.ok) {\n    throw new Error(`HeyGen create video failed: ${videoResp.status} ${await videoResp.text()}`);\n  }\n\n  const videoData = await videoResp.json();\n  const videoId = videoData.data?.video_id;\n  if (!videoId) {\n    throw new Error(`HeyGen create video returned no video_id: ${JSON.stringify(videoData)}`);\n  }\n\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n  const maxRetries = 40;\n  const intervalMs = 15000;\n  let videoUrl = '';\n  let status = 'processing';\n\n  for (let i = 0; i < maxRetries; i++) {\n    await sleep(intervalMs);\n    const pollResp = await fetch(`https://api.heygen.com/v1/video_status.get?video_id=${videoId}`, {\n      headers: { 'X-Api-Key': $env.HEYGEN_API_KEY },\n    });\n\n    if (!pollResp.ok) {\n      status = 'poll_error';\n      break;\n    }\n\n    const pollData = await pollResp.json();\n    status = pollData.data?.status || 'processing';\n    if (status === 'completed') {\n      videoUrl = pollData.data?.video_url || '';\n      break;\n    }\n    if (status === 'failed') {\n      break;\n    }\n  }\n\n  return {\n    json: {\n      ok: status === 'completed' && !!videoUrl,\n      completed: status === 'completed' && !!videoUrl,\n      status,\n      video_url: videoUrl,\n      video_id: videoId,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n} catch (e) {\n  const message = e && e.message ? e.message : String(e);\n  return {\n    json: {\n      ok: false,\n      completed: false,\n      status: 'failed',\n      error: message,\n      video_url: '',\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}",
+        "options": {},
+        "mode": "runOnceForEachItem"
+      },
+      "id": "wf12-code-generate",
+      "name": "HeyGen Create + Poll",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-completed",
+              "leftValue": "={{ $json.ok && $json.completed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf12-if-completed",
+      "name": "IF Completed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='WAITING_VIDEO_APPROVAL', video_url='{{ $('HeyGen Create + Poll').item.json.video_url }}', updated_at=NOW() WHERE id='{{ $('HeyGen Create + Poll').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf12-pg-waiting",
+      "name": "Set WAITING_VIDEO_APPROVAL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-video-preview",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('HeyGen Create + Poll').item.json.job_id, video_url: $('HeyGen Create + Poll').item.json.video_url, channel_id: $('HeyGen Create + Poll').item.json.channel_id, user_id: $('HeyGen Create + Poll').item.json.user_id }) }}",
+        "options": {}
+      },
+      "id": "wf12-http-preview",
+      "name": "Send Video Preview",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='FAILED', error_message='WF-12 HeyGen 실패: {{ $('HeyGen Create + Poll').item.json.error || $('HeyGen Create + Poll').item.json.status }}', updated_at=NOW() WHERE id='{{ $('HeyGen Create + Poll').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf12-pg-failed",
+      "name": "Set FAILED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('HeyGen Create + Poll').item.json.channel_id, text: '❌ 영상 생성에 실패했습니다.\\nJob ID: ' + $('HeyGen Create + Poll').item.json.job_id.substring(0,8) + '\\n상태: ' + ($('HeyGen Create + Poll').item.json.error || $('HeyGen Create + Poll').item.json.status) }) }}",
+        "options": {}
+      },
+      "id": "wf12-http-error",
+      "name": "Send Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Fields": {
+      "main": [
+        [
+          {
+            "node": "Update to GENERATING",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update to GENERATING": {
+      "main": [
+        [
+          {
+            "node": "HeyGen Create + Poll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HeyGen Create + Poll": {
+      "main": [
+        [
+          {
+            "node": "IF Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Completed": {
+      "main": [
+        [
+          {
+            "node": "Set WAITING_VIDEO_APPROVAL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set FAILED",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set WAITING_VIDEO_APPROVAL": {
+      "main": [
+        [
+          {
+            "node": "Send Video Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set FAILED": {
+      "main": [
+        [
+          {
+            "node": "Send Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "phase-2",
+    "heygen",
+    "wf-12"
+  ]
+}

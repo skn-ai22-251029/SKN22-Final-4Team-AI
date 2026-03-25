@@ -186,6 +186,7 @@ class DiscordAdapter(MessengerAdapter):
         channel_id: str,
         job_id: str,
         reports: list[str],
+        selected_channel_id: str,
     ) -> None:
         """기존 보고서 선택 버튼 + '새로 생성' 버튼을 Discord로 전송한다.
         Discord 제한: 5버튼/행 × 5행 = 최대 25개. 보고서는 최대 24개."""
@@ -195,13 +196,13 @@ class DiscordAdapter(MessengerAdapter):
                 "type": 2,
                 "label": f"{i + 1}. {title[:60]}",
                 "style": 2,  # Secondary
-                "custom_id": f"select_report:{job_id}:{i}",
+                "custom_id": f"select_report:{job_id}:{selected_channel_id}:{i}",
             })
         all_buttons.append({
             "type": 2,
             "label": "🆕 새로 생성",
             "style": 1,  # Primary
-            "custom_id": f"new_report:{job_id}",
+            "custom_id": f"new_report:{job_id}:{selected_channel_id}",
         })
 
         # 5개씩 ActionRow로 묶음
@@ -291,3 +292,51 @@ class DiscordAdapter(MessengerAdapter):
         )
         resp.raise_for_status()
         logger.info("[discord] send_file_message channel=%s filename=%s", channel_id, filename)
+
+    async def send_tts_audio_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        caption: str,
+        audio_bytes: bytes,
+        filename: str,
+        include_wf12_button: bool = True,
+    ) -> tuple[str, str]:
+        components = []
+        if include_wf12_button:
+            components = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "label": "✅ 승인 (WF-12 진행)",
+                            "style": 3,
+                            "custom_id": f"tts_approve:{job_id}",
+                        },
+                        {
+                            "type": 2,
+                            "label": "❌ 반려",
+                            "style": 4,
+                            "custom_id": f"tts_reject:{job_id}",
+                        },
+                    ],
+                }
+            ]
+
+        payload_json = json.dumps({"content": caption, "components": components})
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {self._token}"},
+            files={"files[0]": (filename, audio_bytes, "audio/wav")},
+            data={"payload_json": payload_json},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        attachment_url = ""
+        attachments = data.get("attachments") or []
+        if attachments and isinstance(attachments[0], dict):
+            attachment_url = str(attachments[0].get("url") or "")
+        logger.info("[discord] send_tts_audio_message job=%s message_id=%s", job_id, message_id)
+        return message_id, attachment_url

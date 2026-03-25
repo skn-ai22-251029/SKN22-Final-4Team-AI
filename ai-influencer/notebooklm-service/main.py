@@ -47,6 +47,27 @@ _executor = ThreadPoolExecutor(max_workers=2)
 app = FastAPI(title="NotebookLM Service")
 
 
+def _cua_subprocess_env() -> dict:
+    """CUA subprocess에 최소 권한 env만 전달한다."""
+    env = {}
+    for key in (
+        "PATH",
+        "HOME",
+        "PYTHONPATH",
+        "DISPLAY",
+        "OPENAI_CUA_API_KEY",
+        "OPENAI_API_KEY",      # fallback only
+        "GOOGLE_EMAIL",
+        "GOOGLE_PASSWORD",
+        "NOTEBOOKLM_DATA_DIR",
+        "NOTEBOOKLM_SCRIPTS_DIR",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
 # ─────────────────────────────────────────
 # 모델
 # ─────────────────────────────────────────
@@ -55,6 +76,7 @@ class GenerateRequest(BaseModel):
     job_id: str
     prompt: str
     notebook_id: Optional[str] = None
+    channel_id: Optional[str] = None
     notebook_url: Optional[str] = None
 
 
@@ -187,6 +209,7 @@ def _run_generate_report(
             capture_output=True,
             text=True,
             timeout=540,
+            env=_cua_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         logger.error("[notebooklm] subprocess timeout job_id=%s", job_id)
@@ -248,7 +271,7 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
     logger.info("[notebooklm] list_reports subprocess: %s", cmd)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=_cua_subprocess_env())
     except subprocess.TimeoutExpired:
         return ListReportsResponse(status="error", error="list-reports timeout (120s)")
     except Exception as e:
@@ -291,7 +314,7 @@ def _run_get_report(
     logger.info("[notebooklm] get_report subprocess job_id=%s: %s", job_id, cmd)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=360)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=360, env=_cua_subprocess_env())
     except subprocess.TimeoutExpired:
         return GenerateResponse(status="error", error="get-report timeout (360s)")
     except Exception as e:
@@ -332,7 +355,9 @@ async def generate(
     """NotebookLM 보고서 생성. 실패 시에도 HTTP 200 + status="error" 반환."""
     verify_secret(x_internal_secret)
 
-    notebook_url = body.notebook_url
+    notebook_url = body.notebook_url or (
+        _get_notebook_url(body.channel_id) if body.channel_id else None
+    )
     if not notebook_url:
         logger.error("[notebooklm] no notebook_url resolved job_id=%s", body.job_id)
         return GenerateResponse(
@@ -441,7 +466,7 @@ def _get_notebook_url_via_cua(channel_name: str, channel_id: str) -> Optional[st
     ]
     logger.info("[cua-fallback] FIND_NB 시작: channel_name=%r", channel_name)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=_cua_subprocess_env())
     except subprocess.TimeoutExpired:
         logger.error("[cua-fallback] FIND_NB timeout (180s)")
         return None
@@ -515,7 +540,7 @@ def _run_check_and_add_source(
     ]
     logger.info("[add-source] subprocess 시작: %s", source_url)
     try:
-        result = subprocess.run(add_cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(add_cmd, capture_output=True, text=True, timeout=300, env=_cua_subprocess_env())
     except subprocess.TimeoutExpired:
         return AddSourceResponse(status="error", error="add-source timeout (300s)")
     except Exception as e:
@@ -540,7 +565,7 @@ def _run_check_and_add_source(
         "--headless",
     ]
     try:
-        cr = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=600)
+        cr = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=600, env=_cua_subprocess_env())
         for line in (cr.stdout or "").strip().splitlines():
             logger.info("[script] %s", line)
         # 삭제 개수 파싱
@@ -573,7 +598,7 @@ def _run_create_notebook(name: str, channel_id: str, channel_name: str) -> Creat
     logger.info("[create-notebook] subprocess 시작: name=%r channel_id=%r", name, channel_id)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=_cua_subprocess_env())
     except subprocess.TimeoutExpired:
         return CreateNotebookResponse(status="error", error="create-notebook timeout (300s)")
     except Exception as e:

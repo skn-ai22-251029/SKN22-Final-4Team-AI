@@ -1,0 +1,444 @@
+{
+  "name": "WF-11: TTS 생성 + Discord 공유",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wf-11-tts-generate",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "wf11-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "job_id",
+              "value": "={{ $json.body.job_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "script_text",
+              "value": "={{ $json.body.script_text }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "channel_id",
+              "value": "={{ $json.body.channel_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "user_id",
+              "value": "={{ $json.body.user_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "auto_trigger_wf12",
+              "value": "={{ $json.body.auto_trigger_wf12 ?? false }}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "wf11-set-parse",
+      "name": "Extract Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='GENERATING', updated_at=NOW() WHERE id='{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf11-pg-generating",
+      "name": "Update to GENERATING",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\n\nconst jobId = $('Extract Fields').item.json.job_id;\nconst scriptText = $('Extract Fields').item.json.script_text;\nconst channelId = $('Extract Fields').item.json.channel_id;\nconst userId = $('Extract Fields').item.json.user_id;\nconst autoTrigger = !!$('Extract Fields').item.json.auto_trigger_wf12;\n\nif (!scriptText || !scriptText.trim()) {\n  return {\n    json: {\n      ok: false,\n      error: 'script_text is required',\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}\n\ntry {\n  const ttsBody = {\n    text: scriptText,\n    text_lang: $env.TTS_TEXT_LANG || 'ko',\n    media_type: 'wav',\n    streaming_mode: false,\n  };\n\n  const hasRefAudio = !!($env.TTS_REF_AUDIO_PATH || '').trim();\n  const hasRefText = !!($env.TTS_PROMPT_TEXT || '').trim();\n\n  // 음색 클론을 쓸 때만 ref 오디오/텍스트를 함께 전달한다.\n  if (hasRefAudio || hasRefText) {\n    if (!(hasRefAudio && hasRefText)) {\n      throw new Error('TTS_REF_AUDIO_PATH와 TTS_PROMPT_TEXT는 함께 설정해야 합니다.');\n    }\n    ttsBody.ref_audio_path = $env.TTS_REF_AUDIO_PATH;\n    ttsBody.prompt_text = $env.TTS_PROMPT_TEXT;\n    ttsBody.prompt_lang = $env.TTS_PROMPT_LANG || 'ko';\n  }\n\n  const ttsResp = await fetch(`${$env.TTS_API_URL}/tts`, {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify(ttsBody),\n  });\n\n  if (!ttsResp.ok) {\n    throw new Error(`TTS API failed: ${ttsResp.status} ${await ttsResp.text()}`);\n  }\n\n  const audioBuffer = await ttsResp.arrayBuffer();\n  const audioBytes = Buffer.from(audioBuffer);\n  const audioB64 = audioBytes.toString('base64');\n\n  const now = new Date();\n  const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;\n  const filename = `tts_${jobId.substring(0, 8)}_${ts}.wav`;\n\n  const dir = '/home/node/.n8n/audio';\n  fs.mkdirSync(dir, { recursive: true });\n  const filePath = path.join(dir, filename);\n  fs.writeFileSync(filePath, audioBytes);\n\n  return {\n    json: {\n      ok: true,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n      script_text: scriptText,\n      audio_file_path: filePath,\n      filename,\n      audio_content_b64: audioB64,\n      auto_trigger_wf12: autoTrigger,\n    },\n  };\n} catch (e) {\n  const message = e && e.message ? e.message : String(e);\n  return {\n    json: {\n      ok: false,\n      error: message,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}",
+        "options": {},
+        "mode": "runOnceForEachItem"
+      },
+      "id": "wf11-code-tts",
+      "name": "RunPod TTS + Save WAV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf11-if-ok",
+      "name": "IF TTS Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-audio",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, job_id: $('RunPod TTS + Save WAV').item.json.job_id, audio_content_b64: $('RunPod TTS + Save WAV').item.json.audio_content_b64, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, filename: $('RunPod TTS + Save WAV').item.json.filename, caption: '🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행됩니다.', include_wf12_button: true }) }}",
+        "options": {}
+      },
+      "id": "wf11-http-send-audio",
+      "name": "Send TTS Audio to Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='APPROVED', audio_url='{{ $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }}', updated_at=NOW() WHERE id='{{ $('RunPod TTS + Save WAV').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf11-pg-save-audio",
+      "name": "Save audio_url",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1560,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-auto",
+              "leftValue": "={{ $('RunPod TTS + Save WAV').item.json.auto_trigger_wf12 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf11-if-auto",
+      "name": "IF Auto Trigger WF-12",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1780,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n:5678/webhook/wf-12-heygen-generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, audio_url: $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }) }}",
+        "options": {}
+      },
+      "id": "wf11-http-trigger-wf12",
+      "name": "Trigger WF-12",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, text: '🔊 TTS 완료. 오디오 확인 후 버튼으로 WF-12 진행 여부를 선택하세요.' }) }}",
+        "options": {}
+      },
+      "id": "wf11-http-send-wait",
+      "name": "Notify Wait Approval",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='FAILED', error_message='WF-11 TTS 실패: {{ $('RunPod TTS + Save WAV').item.json.error }}', updated_at=NOW() WHERE id='{{ $('RunPod TTS + Save WAV').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "wf11-pg-failed",
+      "name": "Set FAILED",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "pg-credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, text: '❌ TTS 생성에 실패했습니다.\\nJob ID: ' + $('RunPod TTS + Save WAV').item.json.job_id.substring(0,8) + '\\n오류: ' + $('RunPod TTS + Save WAV').item.json.error }) }}",
+        "options": {}
+      },
+      "id": "wf11-http-error",
+      "name": "Send Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        440
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Fields": {
+      "main": [
+        [
+          {
+            "node": "Update to GENERATING",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update to GENERATING": {
+      "main": [
+        [
+          {
+            "node": "RunPod TTS + Save WAV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RunPod TTS + Save WAV": {
+      "main": [
+        [
+          {
+            "node": "IF TTS Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF TTS Success": {
+      "main": [
+        [
+          {
+            "node": "Send TTS Audio to Gateway",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set FAILED",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send TTS Audio to Gateway": {
+      "main": [
+        [
+          {
+            "node": "Save audio_url",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save audio_url": {
+      "main": [
+        [
+          {
+            "node": "IF Auto Trigger WF-12",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Auto Trigger WF-12": {
+      "main": [
+        [
+          {
+            "node": "Trigger WF-12",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Wait Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set FAILED": {
+      "main": [
+        [
+          {
+            "node": "Send Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "phase-2",
+    "tts",
+    "wf-11"
+  ]
+}

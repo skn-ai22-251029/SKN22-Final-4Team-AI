@@ -82,6 +82,22 @@ class SendVideoPreviewRequest(BaseModel):
     user_id: str
 
 
+class SendAudioRequest(BaseModel):
+    messenger_source: MessengerSource
+    messenger_channel_id: str
+    job_id: str
+    audio_content_b64: str
+    audio_file_path: str = ""
+    filename: str
+    caption: str = ""
+    include_wf12_button: bool = True
+
+
+class TtsActionRequest(BaseModel):
+    job_id: str
+    action: str  # "approve" | "reject"
+
+
 class VideoActionRequest(BaseModel):
     job_id: str
     action: str  # "approved" | "reject_select" | "reject_step"
@@ -92,10 +108,24 @@ class ReportToVideoRequest(BaseModel):
     job_id: str
 
 
+class ManualGenerateRequest(BaseModel):
+    job_id: str = ""
+    messenger_user_id: str = ""
+    messenger_channel_id: str = ""
+
+
+class ListJobsRequest(BaseModel):
+    messenger_user_id: str
+    messenger_channel_id: str
+    limit: int = 5
+    purpose: str = "all"  # "all" | "tts" | "heygen"
+
+
 class ReportSelectRequest(BaseModel):
     job_id: str
     action: str           # "select" | "new"
     report_index: Optional[int] = None   # action="select" 시 필수
+    channel_id: str = ""
 
 
 class ChannelSelectRequest(BaseModel):
