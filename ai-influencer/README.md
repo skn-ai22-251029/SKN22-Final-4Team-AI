@@ -48,9 +48,9 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 [WF-10: 매일 노트북 생성]           │                          │
                                [WF-05: 승인/수정]         [보고서 목록 조회]
                                     │ 승인                      │
-                               [WF-07: TTS+영상 생성]    [WF-06: 보고서 생성]
+                               [WF-11: TTS 생성]    [WF-06: 보고서 생성]
                                     │                          │
-                               [WF-08: SNS 업로드]        [영상 제작 요청]
+                               [WF-12: HeyGen 생성]        [영상 제작 요청]
 ```
 
 ---
@@ -107,7 +107,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
       ▼
 [요청 파싱] job_id, action (approved / revision_requested)
       │
-      ├─[approved]──────────────────────────────────────────→ [WF-07 Webhook 호출]
+      ├─[approved]──────────────────────────────────────────→ [WF-11 Webhook 호출]
       │                                                         영상 제작 파이프라인 시작
       │
       └─[revision_requested]──→ [DB 업데이트] revision_note 저장
@@ -141,40 +141,57 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 ---
 
-### WF-07: TTS + HeyGen 영상 생성
+### WF-11: TTS 생성 + Discord 공유
 
 ```
-[Webhook 수신] ← WF-05 승인 후 호출
+[Webhook 수신] ← WF-05 승인 / report_to_video / 재생성
       │
       ▼
-[요청 파싱] job_id, script
+[요청 파싱] job_id, script_text, auto_trigger_wf12
       │
       ▼
 [DB 업데이트] status=GENERATING
       │
       ▼
-[TTS 생성] 스크립트 → 음성 파일
+[TTS 생성 + WAV 저장] /home/node/.n8n/audio
       │
       ▼
-[HeyGen 영상 생성 요청] video_id 발급
+[gateway /internal/send-audio 호출]
+→ Discord에 WAV + [✅ 승인(WF-12)] [❌ 반려] 버튼 전송
       │
       ▼
-[DB 저장] video_id 저장
+[DB 업데이트] status=APPROVED, audio_url 저장
+      │
+      ├─[auto_trigger_wf12=true]─→ [WF-12 호출]
+      └─[기본]──────────────────→ Discord에서 승인 대기
+```
+
+---
+
+### WF-12: HeyGen 영상 생성
+
+```
+[Webhook 수신] ← Discord TTS 승인 또는 자동 트리거
       │
       ▼
-[폴링 루프] HeyGen 상태 주기적 조회
+[요청 파싱] job_id, channel_id, user_id, audio_file_path|audio_url
       │
-      ├─[completed]──→ [DB 업데이트] status=WAITING_VIDEO_APPROVAL
+      ▼
+[DB 업데이트] status=GENERATING
+      │
+      ▼
+[HeyGen 업로드 + 영상 생성 + 폴링]
+      │
+      ├─[completed]──→ [DB 업데이트] status=WAITING_VIDEO_APPROVAL, video_url 저장
       │                      │
       │                      ▼
       │               [gateway /internal/send-video-preview 호출]
-      │               → Discord에 영상 미리보기 + [✅ 승인] [❌ 재작업] 버튼 전송
+      │               → Discord에 영상 미리보기 + [✅ 승인] [❌ 반려] 버튼
       │
       └─[failed]────→ [DB 업데이트] status=FAILED
                              │
                              ▼
                       [gateway /internal/send-text 호출]
-                      → Discord에 오류 메시지 전송
 ```
 
 ---
@@ -397,10 +414,18 @@ nano .env   # 또는 vi .env
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
 | `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
+| `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/wf-11-tts-generate` |
+| `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/wf-12-heygen-generate` |
+| `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
+| `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
+| `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
 | `OPENAI_API_KEY` | OpenAI API 키 | |
 | `OPENAI_CUA_API_KEY` | CUA 자동화 전용 OpenAI 키 (권장) | |
+
+기본 경로: WF-11은 앞선 워크플로에서 전달된 `script_text`를 그대로 TTS 입력으로 사용합니다.  
+음색 클론이 필요할 때만 `TTS_REF_AUDIO_PATH` + `TTS_PROMPT_TEXT`를 **둘 다** 설정하세요.
 
 **`TOPIC_CHANNELS` 형식:**
 ```
@@ -464,7 +489,8 @@ docker-compose logs -f notebooklm-service
    | `WF-04_confirm_request.json` | 컨펌 재요청 | Webhook |
    | `WF-05_confirm_handler.json` | 승인/수정 처리 | Webhook |
    | `WF-06_notebooklm_report.json` | 보고서 생성 | Webhook |
-   | `WF-07_tts_heygen.json` | TTS + HeyGen 영상 생성 | Webhook |
+   | `WF-11_tts_generate.json` | TTS 생성 + Discord 공유 | Webhook |
+   | `WF-12_heygen_generate.json` | HeyGen 영상 생성 | Webhook |
    | `WF-08_sns_upload.json` | SNS 업로드 | Webhook |
    | `WF-09-youtube-source.json` | YouTube 소스 자동 수집 | 매시간 Schedule |
    | `WF-10-daily-notebook.json` | 일일 노트북 생성 | 매일 자정 Schedule |
@@ -679,7 +705,9 @@ python register_command.py \
 | `POST` | `/internal/confirm-action` | discord-bot | 승인/수정 버튼 클릭 처리 |
 | `POST` | `/internal/send-text` | n8n WF-05/08 | 일반 텍스트 전송 |
 | `POST` | `/internal/video-action` | discord-bot | 영상 승인/재작업 버튼 처리 |
-| `POST` | `/internal/send-video-preview` | n8n WF-07 | 영상 미리보기 전송 |
+| `POST` | `/internal/send-video-preview` | n8n WF-12 | 영상 미리보기 전송 |
+| `POST` | `/internal/send-audio` | n8n WF-11 | TTS WAV + 승인/반려 버튼 전송 |
+| `POST` | `/internal/tts-action` | discord-bot | TTS 승인/반려 처리 (WF-12 트리거) |
 | `POST` | `/internal/report-message` | discord-bot | /report 요청 → 채널 선택 버튼 |
 | `POST` | `/internal/channel-select` | discord-bot | 채널 버튼 클릭 → 보고서 목록 |
 | `POST` | `/internal/report-select` | discord-bot | 보고서 선택 또는 새로 생성 |
@@ -704,9 +732,9 @@ python register_command.py \
 1. Discord에서 `/create concept:20대 여성을 위한 재테크 팁` 실행
    → "✅ 요청이 접수되었습니다!" 메시지 확인
 2. WF-01 자동 실행 → 스크립트 + `[✅ 승인하기] [✏️ 수정 지시]` 버튼 수신
-3. **✅ 승인하기** → WF-07 실행 → TTS + HeyGen 영상 생성
-4. 영상 완료 → `[✅ 승인] [❌ 재작업]` 버튼 수신
-5. 영상 승인 → WF-08 실행 → SNS 업로드 완료 알림
+3. **✅ 승인하기** → WF-11 실행 → WF-11 TTS 생성
+4. TTS 완료 → `[✅ 승인 (WF-12 진행)] [❌ 반려]` 버튼 수신
+5. TTS 승인 → WF-12 실행 → 영상 미리보기 수신 후 승인 시 WF-08 실행
 
 ### 보고서 조회 (/report)
 
@@ -714,7 +742,7 @@ python register_command.py \
    → 채널 선택 버튼 표시 (TOPIC_CHANNELS에 등록된 채널 수만큼)
 2. 채널 버튼 클릭 → 해당 채널의 보고서 목록 표시
 3. 보고서 선택 또는 [새로 생성] → 보고서 텍스트 수신
-4. `[🎬 영상 제작]` 버튼 클릭 → WF-06/07 실행
+4. `[🎬 영상 제작]` 버튼 클릭 → WF-06/WF-11 실행
 
 ### 자동 수집 확인
 
@@ -753,6 +781,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | notebooklm-service 연결 실패 | `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 형식(`=` 사용) 및 same network 확인 |
 | `/report` 채널 버튼에 삭제된 채널이 계속 보임 | 버튼 소스는 `TOPIC_CHANNELS` 기준. `.env` 수정 후 `docker-compose up -d --force-recreate messenger-gateway` 적용 |
 | `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
+| TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
 | CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | `OPENAI_CUA_API_KEY` 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |
 | Gateway DB 연결 실패 | postgres healthcheck 통과 여부 및 환경변수 확인 |
 
@@ -764,5 +793,5 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 |-------|------|------|
 | **Phase 1** | Discord 메신저 파이프라인 | ✅ 완료 |
 | **Phase 2** | NotebookLM 연동 — 채널별 소스 수집 + 보고서 생성 | ✅ 완료 |
-| **Phase 3** | TTS + HeyGen 영상 자동 생성 | ✅ 완료 |
+| **Phase 3** | WF-11/12 분리(TTS + HeyGen) | ✅ 완료 |
 | **Phase 4** | SNS 자동 업로드 (YouTube, Instagram, TikTok) | ✅ 완료 |

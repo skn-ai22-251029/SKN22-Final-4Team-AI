@@ -292,3 +292,51 @@ class DiscordAdapter(MessengerAdapter):
         )
         resp.raise_for_status()
         logger.info("[discord] send_file_message channel=%s filename=%s", channel_id, filename)
+
+    async def send_tts_audio_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        caption: str,
+        audio_bytes: bytes,
+        filename: str,
+        include_wf12_button: bool = True,
+    ) -> tuple[str, str]:
+        components = []
+        if include_wf12_button:
+            components = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "label": "✅ 승인 (WF-12 진행)",
+                            "style": 3,
+                            "custom_id": f"tts_approve:{job_id}",
+                        },
+                        {
+                            "type": 2,
+                            "label": "❌ 반려",
+                            "style": 4,
+                            "custom_id": f"tts_reject:{job_id}",
+                        },
+                    ],
+                }
+            ]
+
+        payload_json = json.dumps({"content": caption, "components": components})
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {self._token}"},
+            files={"files[0]": (filename, audio_bytes, "audio/wav")},
+            data={"payload_json": payload_json},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        attachment_url = ""
+        attachments = data.get("attachments") or []
+        if attachments and isinstance(attachments[0], dict):
+            attachment_url = str(attachments[0].get("url") or "")
+        logger.info("[discord] send_tts_audio_message job=%s message_id=%s", job_id, message_id)
+        return message_id, attachment_url

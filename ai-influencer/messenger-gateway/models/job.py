@@ -82,6 +82,22 @@ class SendVideoPreviewRequest(BaseModel):
     user_id: str
 
 
+class SendAudioRequest(BaseModel):
+    messenger_source: MessengerSource
+    messenger_channel_id: str
+    job_id: str
+    audio_content_b64: str
+    audio_file_path: str = ""
+    filename: str
+    caption: str = ""
+    include_wf12_button: bool = True
+
+
+class TtsActionRequest(BaseModel):
+    job_id: str
+    action: str  # "approve" | "reject"
+
+
 class VideoActionRequest(BaseModel):
     job_id: str
     action: str  # "approved" | "reject_select" | "reject_step"

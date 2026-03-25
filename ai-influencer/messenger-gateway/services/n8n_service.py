@@ -81,20 +81,40 @@ async def call_wf05_confirm(
     logger.info("call_wf05_confirm job_id=%s action=%s", job_id, action)
 
 
-async def call_wf07_tts_heygen(
+async def call_wf11_tts_generate(
     job_id: str,
     script_text: str,
     channel_id: str,
     user_id: str,
+    auto_trigger_wf12: bool = False,
 ) -> None:
     payload = {
         "job_id": job_id,
         "script_text": script_text,
         "channel_id": channel_id,
         "user_id": user_id,
+        "auto_trigger_wf12": auto_trigger_wf12,
     }
-    await _post_with_retry(settings.n8n_wf07_webhook_url, payload)
-    logger.info("call_wf07_tts_heygen job_id=%s", job_id)
+    await _post_with_retry(settings.n8n_wf11_webhook_url, payload)
+    logger.info("call_wf11_tts_generate job_id=%s", job_id)
+
+
+async def call_wf12_heygen_generate(
+    job_id: str,
+    channel_id: str,
+    user_id: str,
+    audio_file_path: str = "",
+    audio_url: str = "",
+) -> None:
+    payload = {
+        "job_id": job_id,
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "audio_file_path": audio_file_path,
+        "audio_url": audio_url,
+    }
+    await _post_with_retry(settings.n8n_wf12_webhook_url, payload)
+    logger.info("call_wf12_heygen_generate job_id=%s", job_id)
 
 
 async def call_wf08_sns_upload(

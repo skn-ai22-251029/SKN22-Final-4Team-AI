@@ -237,6 +237,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     parts = custom_id.split(":")
     action = parts[0]
     # video_reject_step: video_reject_step:{job_id}:{step}
+    # tts_approve:       tts_approve:{job_id}
+    # tts_reject:        tts_reject:{job_id}
     # select_report:     select_report:{job_id}:{channel_id}:{index}
     # new_report:        new_report:{job_id}:{channel_id}
     # select_channel:    select_channel:{job_id}:{channel_id}
@@ -309,6 +311,26 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 "/internal/video-action",
                 {"job_id": job_id, "action": "reject_step", "step": step},
             )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_approve":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {"job_id": job_id, "action": "approve"},
+            )
+            await interaction.followup.send("✅ TTS 승인됨. WF-12(HeyGen) 실행 중...", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_reject":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {"job_id": job_id, "action": "reject"},
+            )
+            await interaction.followup.send("❌ TTS 반려 처리되었습니다.", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 

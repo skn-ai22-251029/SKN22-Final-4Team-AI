@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Optional, Union
 
@@ -80,7 +81,12 @@ async def update_job(job_id: str, **kwargs: Any) -> dict[str, Any]:
     set_clauses = []
     values = []
     for i, (key, value) in enumerate(kwargs.items(), start=1):
-        set_clauses.append(f"{key} = ${i}")
+        if key == "script_json":
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
+            set_clauses.append(f"{key} = ${i}::jsonb")
+        else:
+            set_clauses.append(f"{key} = ${i}")
         values.append(value)
 
     values.append(job_id)
