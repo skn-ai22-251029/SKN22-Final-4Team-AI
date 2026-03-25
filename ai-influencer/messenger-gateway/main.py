@@ -798,6 +798,12 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
 @app.post("/internal/tts-generate")
 async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     """수동 /tts 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-11 실행."""
+    logger.info(
+        "[manual /tts] request job_id=%s user=%s channel=%s",
+        (body.job_id or "").strip(),
+        (body.messenger_user_id or "").strip(),
+        (body.messenger_channel_id or "").strip(),
+    )
     job = await _resolve_manual_job(body, require_script=True)
     resolved_job_id = job["id"]
 
@@ -821,12 +827,19 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
         logger.error("call_wf11 (manual /tts) failed job_id=%s: %s", resolved_job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
+    logger.info("[manual /tts] triggered job_id=%s", resolved_job_id)
     return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-11"}
 
 
 @app.post("/internal/heygen-generate")
 async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     """수동 /heygen 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-12 실행."""
+    logger.info(
+        "[manual /heygen] request job_id=%s user=%s channel=%s",
+        (body.job_id or "").strip(),
+        (body.messenger_user_id or "").strip(),
+        (body.messenger_channel_id or "").strip(),
+    )
     job = await _resolve_manual_job(body, require_audio=True)
     resolved_job_id = job["id"]
 
@@ -850,6 +863,7 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
         logger.error("call_wf12 (manual /heygen) failed job_id=%s: %s", resolved_job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
+    logger.info("[manual /heygen] triggered job_id=%s", resolved_job_id)
     return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-12"}
 
 
