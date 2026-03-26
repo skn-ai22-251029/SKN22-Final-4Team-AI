@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -457,6 +458,7 @@ def _run_list_cua_loop(
     min_steps_before_done: int = 4,
     min_scrolls_for_empty: int = 3,
     min_elapsed_sec_for_empty: float = 8.0,
+    max_model_errors: int = 4,
 ) -> tuple[list[str], dict]:
     """list 전용 CUA 루프: collect/scroll/done 기반으로 보고서 제목을 누적 수집."""
     HISTORY_WINDOW = 4
@@ -474,6 +476,7 @@ def _run_list_cua_loop(
         "steps": 0,
         "parse_errors": 0,
         "invalid_actions": 0,
+        "model_errors": 0,
         "done": False,
         "elapsed_sec": 0.0,
         "scroll_count": 0,
@@ -515,12 +518,30 @@ def _run_list_cua_loop(
             ],
         })
 
-        response = client.chat.completions.create(
-            model="gpt-5.4",
-            messages=msgs,
-            max_completion_tokens=400,
-            temperature=0,
-        )
+        try:
+            response = client.chat.completions.create(
+                model="gpt-5.4",
+                messages=msgs,
+                max_completion_tokens=400,
+                temperature=0,
+            )
+        except Exception as e:
+            meta["model_errors"] = int(meta["model_errors"]) + 1
+            no_new_rounds += 1
+            logger.warning(
+                "[CUA][LIST] 모델 호출 실패 (%d/%d): %s",
+                meta["model_errors"],
+                max_model_errors,
+                e,
+            )
+            _execute_list_action(page, {"action": "wait", "ms": 1500}, panel_anchor)
+            if int(meta["model_errors"]) >= max_model_errors:
+                _execute_list_action(page, {"action": "scroll", "delta_y": 640}, panel_anchor)
+                scroll_count += 1
+            if int(meta["model_errors"]) >= (max_model_errors + 2):
+                meta["termination_reason"] = "model_errors_exceeded"
+                break
+            continue
 
         raw = (response.choices[0].message.content or "").strip()
         logger.info("[CUA][LIST] 모델 응답: %s", raw[:300])
@@ -626,7 +647,7 @@ def _run_list_cua_loop(
         meta["termination_reason"] = "done"
 
     logger.info(
-        "[CUA][LIST] 종료 요약 reason=%s steps=%s elapsed=%.2fs titles=%d scroll=%d collect=%d premature_done=%d empty_ok=%s",
+        "[CUA][LIST] 종료 요약 reason=%s steps=%s elapsed=%.2fs titles=%d scroll=%d collect=%d premature_done=%d model_errors=%d empty_ok=%s",
         meta.get("termination_reason"),
         meta.get("steps"),
         meta.get("elapsed_sec"),
@@ -634,6 +655,7 @@ def _run_list_cua_loop(
         scroll_count,
         collect_attempts,
         premature_done_count,
+        meta.get("model_errors"),
         meta.get("empty_result_accepted"),
     )
     return collected, meta
@@ -788,11 +810,12 @@ def list_reports(page, notebook_url: str) -> list[str]:
         return cua_titles
 
     logger.warning(
-        "[list_reports] CUA 목록이 비어 fallback parser 사용 (steps=%s done=%s parse_errors=%s invalid_actions=%s err=%s)",
+        "[list_reports] CUA 목록이 비어 fallback parser 사용 (steps=%s done=%s parse_errors=%s invalid_actions=%s model_errors=%s err=%s)",
         cua_meta.get("steps"),
         cua_meta.get("done"),
         cua_meta.get("parse_errors"),
         cua_meta.get("invalid_actions"),
+        cua_meta.get("model_errors"),
         cua_loop_error[:120],
     )
     try:
@@ -811,6 +834,8 @@ def list_reports(page, notebook_url: str) -> list[str]:
             raise RuntimeError("CUA list loop failed: repeated JSON parse errors")
         if int(cua_meta.get("invalid_actions") or 0) >= list_max_no_new_rounds:
             raise RuntimeError("CUA list loop failed: repeated invalid actions")
+        if int(cua_meta.get("model_errors") or 0) >= 4:
+            raise RuntimeError("CUA list loop failed: repeated model call errors")
         if not bool(cua_meta.get("done")) and int(cua_meta.get("steps") or 0) >= list_max_steps:
             raise RuntimeError("CUA list loop reached step limit without stable result")
         raise RuntimeError(
@@ -1055,4 +1080,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error("[CUA][FATAL] %s", e)
+        traceback.print_exc()
+        raise

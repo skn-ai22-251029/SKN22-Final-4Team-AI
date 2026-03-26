@@ -285,12 +285,17 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
     if result.returncode != 0:
         raw_err = (result.stderr or result.stdout or "").strip()
         concise_err = ""
+        error_tail = ""
         if raw_err:
             lines = [line.strip() for line in raw_err.splitlines() if line.strip()]
             # traceback 전체 대신 마지막 핵심 라인(예외 타입/메시지)을 우선 노출
             concise_err = lines[-1] if lines else raw_err
+            if lines:
+                error_tail = " | ".join(lines[-3:])
         if not concise_err:
             concise_err = f"list-reports subprocess failed (code={result.returncode})"
+        if error_tail:
+            concise_err = f"{concise_err} (tail: {error_tail})"
         return ListReportsResponse(status="error", error=concise_err[:300])
 
     try:
