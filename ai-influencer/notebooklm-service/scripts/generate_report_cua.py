@@ -22,6 +22,12 @@ logger = logging.getLogger("generate_report_cua")
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 BROWSER_PROFILE_DIR = DATA_DIR / "browser_state" / "browser_profile"
+CHROMIUM_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
+DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
 
 SYSTEM_PROMPT = """You are a browser automation assistant controlling a Chromium browser via Playwright.
 Given a screenshot of the current browser state and a task, output a JSON action to perform.
@@ -144,6 +150,44 @@ def _build_openai_client() -> OpenAI:
     if not api_key:
         raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
     return OpenAI(api_key=api_key)
+
+
+def _is_profile_lock_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    tokens = (
+        "processsingleton",
+        "user data directory is already in use",
+        "profile appears to be in use",
+        "another browser is using",
+        "singletonlock",
+        "lock file",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _launch_context_with_retry(playwright, headless: bool, phase: str, max_attempts: int = 12):
+    """브라우저 프로필 잠금 충돌 시 재시도하며 context를 연다."""
+    BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return playwright.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_PROFILE_DIR),
+                headless=headless,
+                args=CHROMIUM_LAUNCH_ARGS,
+                viewport=DEFAULT_VIEWPORT,
+            )
+        except Exception as e:
+            last_error = e
+            if not _is_profile_lock_error(e):
+                raise
+            wait_sec = min(10, 1 + attempt)
+            logger.warning(
+                "[%s] 브라우저 프로필 잠금 감지 (%d/%d): %s → %ds 후 재시도",
+                phase, attempt, max_attempts, e, wait_sec
+            )
+            time.sleep(wait_sec)
+    raise RuntimeError(f"[{phase}] 브라우저 프로필 잠금 해제 대기 실패: {last_error}")
 
 
 def _parse_action_json(raw: str) -> dict:
@@ -939,16 +983,7 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
 
     with sync_playwright() as p:
         logger.info("[CUA] Chromium 시작")
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            viewport={"width": 1280, "height": 800},
-        )
+        context = _launch_context_with_retry(p, headless=headless, phase="GENERATE")
         page = context.new_page()
         logger.info("[CUA] 노트북 URL 이동 중...")
         page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
@@ -1051,12 +1086,7 @@ def main():
 
     elif args.mode == "list":
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_PROFILE_DIR),
-                headless=args.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                viewport={"width": 1280, "height": 800},
-            )
+            context = _launch_context_with_retry(p, headless=args.headless, phase="LIST")
             page = context.new_page()
             titles = list_reports(page, args.notebook_url)
             context.close()
@@ -1067,12 +1097,7 @@ def main():
 
     elif args.mode == "get":
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_PROFILE_DIR),
-                headless=args.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                viewport={"width": 1280, "height": 800},
-            )
+            context = _launch_context_with_retry(p, headless=args.headless, phase="GET")
             page = context.new_page()
             result = get_existing_report(page, args.notebook_url, args.report_index, args.output)
             context.close()

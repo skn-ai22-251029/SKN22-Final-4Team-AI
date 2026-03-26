@@ -21,6 +21,7 @@ from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).parent))
 from generate_report_cua import (
     BROWSER_PROFILE_DIR,
+    _launch_context_with_retry,
     _ensure_logged_in,
     _assert_allowed_url,
     _run_cua_loop,
@@ -334,16 +335,7 @@ def main():
     client = _build_openai_client()
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=args.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            viewport={"width": 1280, "height": 800},
-        )
+        context = _launch_context_with_retry(p, headless=args.headless, phase=f"MANAGE-{args.mode.upper()}")
         page = context.new_page()
 
         if args.mode == "find":
