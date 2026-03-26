@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -28,6 +29,7 @@ CHROMIUM_LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
 ]
 DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
+_BROWSER_INSTALL_ATTEMPTED = False
 
 SYSTEM_PROMPT = """You are a browser automation assistant controlling a Chromium browser via Playwright.
 Given a screenshot of the current browser state and a task, output a JSON action to perform.
@@ -165,6 +167,39 @@ def _is_profile_lock_error(error: Exception) -> bool:
     return any(token in msg for token in tokens)
 
 
+def _is_browser_missing_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    tokens = (
+        "please run the following command to install new browsers",
+        "playwright install",
+        "executable doesn't exist",
+        "browser has not been found",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _ensure_chromium_installed(phase: str) -> None:
+    """런타임에서 Chromium이 누락된 경우 1회 자가 복구."""
+    global _BROWSER_INSTALL_ATTEMPTED
+    if _BROWSER_INSTALL_ATTEMPTED:
+        return
+    _BROWSER_INSTALL_ATTEMPTED = True
+    logger.warning("[%s] Chromium 누락 감지 — playwright install chromium 시도", phase)
+    result = subprocess.run(
+        ["python3", "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        raise RuntimeError(
+            f"[{phase}] playwright install chromium 실패: {(stderr or stdout or f'code={result.returncode}')[:400]}"
+        )
+    logger.info("[%s] playwright install chromium 완료", phase)
+
+
 def _launch_context_with_retry(playwright, headless: bool, phase: str, max_attempts: int = 12):
     """브라우저 프로필 잠금 충돌 시 재시도하며 context를 연다."""
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -179,6 +214,9 @@ def _launch_context_with_retry(playwright, headless: bool, phase: str, max_attem
             )
         except Exception as e:
             last_error = e
+            if _is_browser_missing_error(e):
+                _ensure_chromium_installed(phase)
+                continue
             if not _is_profile_lock_error(e):
                 raise
             wait_sec = min(10, 1 + attempt)

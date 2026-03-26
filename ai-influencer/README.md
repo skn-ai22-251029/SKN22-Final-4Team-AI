@@ -907,6 +907,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
 | `/report` 채널 선택 후 목록이 안 뜨고 멈춘 것처럼 보임 | gateway 로그 `[channel-select:bg]`에서 list-reports 응답 여부 확인. 최신 버전은 최대 180초 대기 후 실패 시 `다시 조회/새로 생성` 버튼을 노출 |
 | `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST] 종료 요약`(`elapsed/scroll/collect/premature_done/termination_reason`)을 먼저 확인. 조기 `done`은 무시되고 최소 탐색 게이트(시간/스크롤/스텝) 미충족이면 빈목록 성공으로 처리하지 않으며, 이 경우 `다시 조회` 버튼으로 재시도 |
+| `/report`에서 `Looks like Playwright ... install` 또는 브라우저 실행 Traceback | `notebooklm-service` 이미지를 최신으로 재빌드해 Chromium 포함 여부를 반영: `docker-compose build --no-cache notebooklm-service && docker-compose up -d notebooklm-service` |
 | WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |
 | 자동 보고서가 예상 채널이 아닌 곳에 옴 | auto-report는 `DISCORD_ALLOWED_CHANNEL_IDS`의 첫 번째 채널만 사용함. 순서 변경 후 gateway 재기동 필요 |
 | TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
