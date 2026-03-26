@@ -332,6 +332,56 @@ def execute_action(page, action: dict) -> bool:
     return False
 
 
+def _execute_list_action(page, action: dict, panel_anchor: dict | None = None) -> bool:
+    """list 모드 액션 실행. scroll은 Studio 패널 중심 좌표로 보정."""
+    t = action.get("action")
+    if t == "scroll":
+        anchor_x = 1080
+        anchor_y = 450
+        if panel_anchor:
+            anchor_x = int(panel_anchor.get("x", anchor_x))
+            anchor_y = int(panel_anchor.get("y", anchor_y))
+        delta = int(action.get("delta_y", 550))
+        page.mouse.move(anchor_x, anchor_y)
+        page.mouse.wheel(0, delta)
+        time.sleep(0.45)
+        return False
+
+    return execute_action(page, action)
+
+
+def _get_studio_panel_anchor(page) -> dict:
+    """Studio 패널 중심점 추정. 실패 시 우측 패널 기본값 반환."""
+    fallback = {"x": 1080, "y": 450}
+    js = """
+    () => {
+      const candidates = [
+        "[aria-label*='Studio']",
+        "[aria-label*='스튜디오']",
+        "[class*='studio']",
+        "[class*='Studio']",
+        "[data-testid*='studio']",
+      ];
+      for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 100 && r.height > 120) {
+          return {x: Math.round(r.left + r.width * 0.5), y: Math.round(r.top + r.height * 0.6)};
+        }
+      }
+      return null;
+    }
+    """
+    try:
+        pos = page.evaluate(js)
+        if isinstance(pos, dict) and "x" in pos and "y" in pos:
+            return {"x": int(pos["x"]), "y": int(pos["y"])}
+    except Exception as e:
+        logger.warning("[CUA][LIST] panel anchor 탐지 실패: %s", e)
+    return fallback
+
+
 def _run_cua_loop(
     page,
     client,
@@ -403,6 +453,9 @@ def _run_list_cua_loop(
     task: str,
     max_steps: int,
     max_no_new_rounds: int = 2,
+    min_steps_before_done: int = 4,
+    min_scrolls_for_empty: int = 3,
+    min_elapsed_sec_for_empty: float = 8.0,
 ) -> tuple[list[str], dict]:
     """list 전용 CUA 루프: collect/scroll/done 기반으로 보고서 제목을 누적 수집."""
     HISTORY_WINDOW = 4
@@ -410,11 +463,23 @@ def _run_list_cua_loop(
     collected: list[str] = []
     seen = set()
     no_new_rounds = 0
+    scroll_count = 0
+    collect_attempts = 0
+    empty_collect_rounds = 0
+    premature_done_count = 0
+    start_ts = time.monotonic()
+    panel_anchor = _get_studio_panel_anchor(page)
     meta = {
         "steps": 0,
         "parse_errors": 0,
         "invalid_actions": 0,
         "done": False,
+        "elapsed_sec": 0.0,
+        "scroll_count": 0,
+        "collect_attempts": 0,
+        "premature_done_count": 0,
+        "termination_reason": "max_steps",
+        "empty_result_accepted": False,
     }
 
     for step in range(max_steps):
@@ -482,6 +547,7 @@ def _run_list_cua_loop(
         logger.info("[CUA][LIST] 액션: %s", action)
 
         if at == "collect":
+            collect_attempts += 1
             before = len(collected)
             titles = _sanitize_collected_titles(action.get("titles", []))
             for t in titles:
@@ -490,21 +556,85 @@ def _run_list_cua_loop(
                     collected.append(t)
             added = len(collected) - before
             logger.info("[CUA][LIST] collect 추가=%d 총=%d", added, len(collected))
-            no_new_rounds = no_new_rounds + 1 if added == 0 else 0
+            if added == 0:
+                empty_collect_rounds += 1
+                no_new_rounds += 1
+            else:
+                empty_collect_rounds = 0
+                no_new_rounds = 0
         elif at == "done":
-            logger.info("[CUA][LIST] done 수신 — 루프 종료")
-            meta["done"] = True
-            break
+            elapsed_sec = time.monotonic() - start_ts
+            can_accept_done = (
+                len(collected) > 0
+                or (
+                    step + 1 >= min_steps_before_done
+                    and scroll_count >= min_scrolls_for_empty
+                    and elapsed_sec >= min_elapsed_sec_for_empty
+                    and collect_attempts >= min_steps_before_done // 2
+                )
+            )
+            if can_accept_done:
+                logger.info("[CUA][LIST] done 수신 — 루프 종료 (accepted)")
+                meta["done"] = True
+                meta["termination_reason"] = "done"
+                meta["empty_result_accepted"] = len(collected) == 0
+                break
+            premature_done_count += 1
+            no_new_rounds += 1
+            logger.warning(
+                "[CUA][LIST] premature done 무시 (step=%d collected=%d scroll=%d elapsed=%.2fs)",
+                step + 1, len(collected), scroll_count, elapsed_sec,
+            )
+            _execute_list_action(page, {"action": "scroll", "delta_y": 620}, panel_anchor)
+            scroll_count += 1
         else:
             # scroll/wait/click만 execute_action에 위임
-            execute_action(page, action)
+            _execute_list_action(page, action, panel_anchor)
             if at == "scroll":
                 no_new_rounds += 1
+                scroll_count += 1
 
+        elapsed_sec = time.monotonic() - start_ts
+        can_accept_empty = (
+            step + 1 >= min_steps_before_done
+            and scroll_count >= min_scrolls_for_empty
+            and elapsed_sec >= min_elapsed_sec_for_empty
+            and collect_attempts >= min_steps_before_done // 2
+        )
         if no_new_rounds >= max_no_new_rounds:
-            logger.info("[CUA][LIST] 신규 제목 없음 연속 %d회 — 종료", no_new_rounds)
-            break
+            if collected:
+                logger.info("[CUA][LIST] 신규 제목 없음 연속 %d회 — 종료(제목 확보)", no_new_rounds)
+                meta["termination_reason"] = "stagnation_with_titles"
+                break
+            if can_accept_empty:
+                logger.info("[CUA][LIST] 신규 제목 없음 연속 %d회 — 종료(빈목록 승인)", no_new_rounds)
+                meta["termination_reason"] = "stagnation_empty_accepted"
+                meta["empty_result_accepted"] = True
+                break
+            logger.info("[CUA][LIST] 탐색 부족 상태로 no_new 도달 — 탐색 연장")
+            no_new_rounds = max_no_new_rounds - 1
+            _execute_list_action(page, {"action": "scroll", "delta_y": 680}, panel_anchor)
+            scroll_count += 1
 
+    meta["elapsed_sec"] = round(time.monotonic() - start_ts, 2)
+    meta["scroll_count"] = scroll_count
+    meta["collect_attempts"] = collect_attempts
+    meta["premature_done_count"] = premature_done_count
+    meta["empty_collect_rounds"] = empty_collect_rounds
+    if meta.get("termination_reason") == "max_steps" and meta.get("done"):
+        meta["termination_reason"] = "done"
+
+    logger.info(
+        "[CUA][LIST] 종료 요약 reason=%s steps=%s elapsed=%.2fs titles=%d scroll=%d collect=%d premature_done=%d empty_ok=%s",
+        meta.get("termination_reason"),
+        meta.get("steps"),
+        meta.get("elapsed_sec"),
+        len(collected),
+        scroll_count,
+        collect_attempts,
+        premature_done_count,
+        meta.get("empty_result_accepted"),
+    )
     return collected, meta
 
 
@@ -616,8 +746,11 @@ def list_reports(page, notebook_url: str) -> list[str]:
         "- Only list existing saved report titles."
     )
 
-    list_max_steps = 12
-    list_max_no_new_rounds = 3
+    list_max_steps = 16
+    list_max_no_new_rounds = 4
+    list_min_steps_before_done = 5
+    list_min_scrolls_for_empty = 4
+    list_min_elapsed_sec_for_empty = 12.0
 
     cua_titles: list[str] = []
     cua_meta = {
@@ -634,6 +767,9 @@ def list_reports(page, notebook_url: str) -> list[str]:
             task=task,
             max_steps=list_max_steps,
             max_no_new_rounds=list_max_no_new_rounds,
+            min_steps_before_done=list_min_steps_before_done,
+            min_scrolls_for_empty=list_min_scrolls_for_empty,
+            min_elapsed_sec_for_empty=list_min_elapsed_sec_for_empty,
         )
     except Exception as e:
         cua_loop_error = str(e)
@@ -667,13 +803,18 @@ def list_reports(page, notebook_url: str) -> list[str]:
             return fallback_titles
         if cua_loop_error:
             raise RuntimeError(f"CUA list loop failed: {cua_loop_error}")
+        if bool(cua_meta.get("empty_result_accepted")):
+            logger.info("[list_reports] CUA 빈목록 승인 조건 충족 — 빈 배열 반환")
+            return []
         if int(cua_meta.get("parse_errors") or 0) >= list_max_no_new_rounds:
             raise RuntimeError("CUA list loop failed: repeated JSON parse errors")
         if int(cua_meta.get("invalid_actions") or 0) >= list_max_no_new_rounds:
             raise RuntimeError("CUA list loop failed: repeated invalid actions")
         if not bool(cua_meta.get("done")) and int(cua_meta.get("steps") or 0) >= list_max_steps:
             raise RuntimeError("CUA list loop reached step limit without stable result")
-        return fallback_titles
+        raise RuntimeError(
+            "CUA list loop did not gather titles and empty-result acceptance criteria were not met"
+        )
     except Exception as e:
         logger.exception("[list_reports] fallback parser 실패: %s", e)
         raise

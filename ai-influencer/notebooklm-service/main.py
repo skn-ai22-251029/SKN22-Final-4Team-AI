@@ -271,9 +271,9 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
     logger.info("[notebooklm] list_reports subprocess: %s", cmd)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=_cua_subprocess_env())
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=_cua_subprocess_env())
     except subprocess.TimeoutExpired:
-        return ListReportsResponse(status="error", error="list-reports timeout (120s)")
+        return ListReportsResponse(status="error", error="list-reports timeout (180s)")
     except Exception as e:
         return ListReportsResponse(status="error", error=str(e))
 
