@@ -41,6 +41,32 @@ Rules:
 - Coordinates must be within 1280x800 viewport.
 """
 
+LIST_SYSTEM_PROMPT = """You are a browser automation assistant for listing saved report titles in NotebookLM Studio.
+Given a screenshot and task context, output ONLY one JSON object in one of these formats:
+
+1) Collect visible titles:
+{"action":"collect","titles":["title1","title2",...]}
+
+2) Click:
+{"action":"click","x":<int>,"y":<int>,"reason":"<why>"}
+
+3) Scroll:
+{"action":"scroll","x":<int>,"y":<int>,"delta_y":<int>}
+
+4) Wait:
+{"action":"wait","ms":<milliseconds>}
+
+5) Done:
+{"action":"done"}
+
+Rules:
+- `titles` must contain only titles actually visible in the screenshot.
+- Do not fabricate titles.
+- Do not click a report tile in list mode; only navigate/open Studio panel if needed.
+- Prefer `collect` when titles are visible, `scroll` when more titles may exist.
+- Output only JSON and nothing else.
+"""
+
 ALLOWED_CUA_HOSTS = {
     "notebooklm.google.com",
     "accounts.google.com",
@@ -116,6 +142,70 @@ def _build_openai_client() -> OpenAI:
     if not api_key:
         raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
     return OpenAI(api_key=api_key)
+
+
+def _parse_action_json(raw: str) -> dict:
+    """모델 응답에서 JSON action 파싱."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    if not text.startswith("{"):
+        first = text.find("{")
+        last = text.rfind("}")
+        if first >= 0 and last > first:
+            text = text[first:last + 1]
+
+    action = json.loads(text)
+    if not isinstance(action, dict):
+        raise json.JSONDecodeError("action must be an object", text, 0)
+    return action
+
+
+def _normalize_report_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", (title or "").strip())
+    title = title.strip("-•|")
+    return title
+
+
+def _sanitize_collected_titles(raw_titles) -> list[str]:
+    """collect 액션에서 받은 후보 제목을 정규화/필터링."""
+    if not isinstance(raw_titles, list):
+        return []
+
+    noise = {
+        "스튜디오",
+        "Studio",
+        "보고서",
+        "직접 만들기",
+        "소스",
+        "채팅",
+        "공유",
+        "설정",
+        "더보기",
+    }
+    time_only = re.compile(
+        r"^(?:\d+\s*(?:초|분|시간|일|주|개월|달|년)\s*전|\d+\s*(?:sec|min|hour|day|week|month|year)s?\s*ago)$",
+        re.IGNORECASE,
+    )
+
+    cleaned: list[str] = []
+    for v in raw_titles:
+        if not isinstance(v, str):
+            continue
+        t = _normalize_report_title(v)
+        if not t or len(t) < 2 or len(t) > 160:
+            continue
+        if t in noise:
+            continue
+        if time_only.search(t):
+            continue
+        cleaned.append(t)
+
+    return cleaned
 
 
 def _extract_studio_report(page) -> str:
@@ -288,11 +378,7 @@ def _run_cua_loop(
         logger.info("[CUA][%s] 모델 응답: %s", phase, raw[:200])
 
         try:
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            action = json.loads(raw.strip())
+            action = _parse_action_json(raw)
         except json.JSONDecodeError as e:
             logger.error("[CUA][%s] JSON 파싱 실패: %s — %s", phase, e, raw)
             msgs.append({"role": "assistant", "content": raw})
@@ -309,6 +395,117 @@ def _run_cua_loop(
             return True
 
     return False
+
+
+def _run_list_cua_loop(
+    page,
+    client,
+    task: str,
+    max_steps: int,
+    max_no_new_rounds: int = 2,
+) -> tuple[list[str], dict]:
+    """list 전용 CUA 루프: collect/scroll/done 기반으로 보고서 제목을 누적 수집."""
+    HISTORY_WINDOW = 4
+    msgs = [{"role": "system", "content": LIST_SYSTEM_PROMPT}]
+    collected: list[str] = []
+    seen = set()
+    no_new_rounds = 0
+    meta = {
+        "steps": 0,
+        "parse_errors": 0,
+        "invalid_actions": 0,
+        "done": False,
+    }
+
+    for step in range(max_steps):
+        meta["steps"] = step + 1
+        _assert_allowed_url(page.url, "LIST")
+        screenshot_b64 = base64.b64encode(page.screenshot()).decode()
+        logger.info("[CUA][LIST] 스텝 %d/%d — collect=%d no_new=%d", step + 1, max_steps, len(collected), no_new_rounds)
+
+        history = msgs[1:]
+        if len(history) > HISTORY_WINDOW * 2:
+            history = history[-(HISTORY_WINDOW * 2):]
+        msgs = [msgs[0]] + history
+
+        instruction = (
+            f"{task}\n\n"
+            f"Current progress: already collected {len(collected)} unique titles.\n"
+            "If visible titles exist, prefer collect.\n"
+            "When no more new titles are discoverable, return done."
+        )
+
+        msgs.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        })
+
+        response = client.chat.completions.create(
+            model="gpt-5.4",
+            messages=msgs,
+            max_completion_tokens=400,
+            temperature=0,
+        )
+
+        raw = (response.choices[0].message.content or "").strip()
+        logger.info("[CUA][LIST] 모델 응답: %s", raw[:300])
+
+        try:
+            action = _parse_action_json(raw)
+        except json.JSONDecodeError as e:
+            logger.error("[CUA][LIST] JSON 파싱 실패: %s — %s", e, raw)
+            meta["parse_errors"] = int(meta["parse_errors"]) + 1
+            msgs.append({"role": "assistant", "content": raw})
+            no_new_rounds += 1
+            if no_new_rounds >= max_no_new_rounds + 2:
+                logger.warning("[CUA][LIST] 연속 JSON 파싱 실패로 중단")
+                break
+            continue
+
+        at = action.get("action")
+        if at not in {"collect", "scroll", "wait", "done", "click"}:
+            logger.warning("[CUA][LIST] 허용되지 않은 액션: %s", action)
+            meta["invalid_actions"] = int(meta["invalid_actions"]) + 1
+            action = {"action": "wait", "ms": 1200}
+            at = "wait"
+
+        msgs.append({"role": "assistant", "content": raw})
+        logger.info("[CUA][LIST] 액션: %s", action)
+
+        if at == "collect":
+            before = len(collected)
+            titles = _sanitize_collected_titles(action.get("titles", []))
+            for t in titles:
+                if t not in seen:
+                    seen.add(t)
+                    collected.append(t)
+            added = len(collected) - before
+            logger.info("[CUA][LIST] collect 추가=%d 총=%d", added, len(collected))
+            no_new_rounds = no_new_rounds + 1 if added == 0 else 0
+        elif at == "done":
+            logger.info("[CUA][LIST] done 수신 — 루프 종료")
+            meta["done"] = True
+            break
+        else:
+            # scroll/wait/click만 execute_action에 위임
+            execute_action(page, action)
+            if at == "scroll":
+                no_new_rounds += 1
+
+        if no_new_rounds >= max_no_new_rounds:
+            logger.info("[CUA][LIST] 신규 제목 없음 연속 %d회 — 종료", no_new_rounds)
+            break
+
+    return collected, meta
 
 
 def _parse_report_titles(body_text: str) -> list[str]:
@@ -405,9 +602,81 @@ def list_reports(page, notebook_url: str) -> list[str]:
     _ensure_logged_in(page)
     time.sleep(2)
 
-    titles = _parse_report_titles(page.inner_text("body"))
-    logger.info("[list_reports] 보고서 %d개 발견: %s", len(titles), titles)
-    return titles
+    client = _build_openai_client()
+    task = (
+        "Task: In NotebookLM Studio, collect titles of saved reports already listed in the Studio panel.\n"
+        "Steps:\n"
+        "1. If Studio panel is not visible, open the Studio tab on the right.\n"
+        "2. Read visible saved report/document cards and return them with collect.\n"
+        "3. Scroll inside the Studio panel to discover more titles when needed.\n"
+        "4. Return done when no additional new titles are discoverable.\n"
+        "Important:\n"
+        "- Never click '보고서' generation tile for creating a new report.\n"
+        "- Never open a report tile in list mode.\n"
+        "- Only list existing saved report titles."
+    )
+
+    list_max_steps = 12
+    list_max_no_new_rounds = 3
+
+    cua_titles: list[str] = []
+    cua_meta = {
+        "steps": 0,
+        "parse_errors": 0,
+        "invalid_actions": 0,
+        "done": False,
+    }
+    cua_loop_error = ""
+    try:
+        cua_titles, cua_meta = _run_list_cua_loop(
+            page,
+            client,
+            task=task,
+            max_steps=list_max_steps,
+            max_no_new_rounds=list_max_no_new_rounds,
+        )
+    except Exception as e:
+        cua_loop_error = str(e)
+        logger.exception("[list_reports] CUA list loop 실패: %s", e)
+
+    if cua_titles:
+        logger.info(
+            "[list_reports] CUA 목록 수집 성공: %d개 (steps=%s done=%s parse_errors=%s invalid_actions=%s)",
+            len(cua_titles),
+            cua_meta.get("steps"),
+            cua_meta.get("done"),
+            cua_meta.get("parse_errors"),
+            cua_meta.get("invalid_actions"),
+        )
+        return cua_titles
+
+    logger.warning(
+        "[list_reports] CUA 목록이 비어 fallback parser 사용 (steps=%s done=%s parse_errors=%s invalid_actions=%s err=%s)",
+        cua_meta.get("steps"),
+        cua_meta.get("done"),
+        cua_meta.get("parse_errors"),
+        cua_meta.get("invalid_actions"),
+        cua_loop_error[:120],
+    )
+    try:
+        body_text = page.inner_text("body")
+        fallback_titles = _parse_report_titles(body_text)
+        logger.info("[list_reports] fallback 목록 수집 결과: %d개", len(fallback_titles))
+        if fallback_titles:
+            logger.warning("[list_reports] fallback parser 경로로 목록 반환됨")
+            return fallback_titles
+        if cua_loop_error:
+            raise RuntimeError(f"CUA list loop failed: {cua_loop_error}")
+        if int(cua_meta.get("parse_errors") or 0) >= list_max_no_new_rounds:
+            raise RuntimeError("CUA list loop failed: repeated JSON parse errors")
+        if int(cua_meta.get("invalid_actions") or 0) >= list_max_no_new_rounds:
+            raise RuntimeError("CUA list loop failed: repeated invalid actions")
+        if not bool(cua_meta.get("done")) and int(cua_meta.get("steps") or 0) >= list_max_steps:
+            raise RuntimeError("CUA list loop reached step limit without stable result")
+        return fallback_titles
+    except Exception as e:
+        logger.exception("[list_reports] fallback parser 실패: %s", e)
+        raise
 
 
 def get_existing_report(page, notebook_url: str, report_index: int, output_path: str) -> str:

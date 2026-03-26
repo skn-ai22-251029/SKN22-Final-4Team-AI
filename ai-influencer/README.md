@@ -91,7 +91,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
   → /internal/report-message
   → 채널 선택 버튼
   → /internal/channel-select
-  → notebooklm-service /list-reports
+  → notebooklm-service /list-reports (gpt-5.4 CUA list loop)
       ├─ 기존 보고서 선택: /internal/report-select(select)
       │   → notebooklm-service /get-report
       │   → Discord 전송 + jobs.script_json.script_text 저장
@@ -386,15 +386,15 @@ Discord 사용자: /report
                [notebooklm-service /list-reports 조회]
                → 해당 채널의 기존 보고서 목록
                         │
-                ┌───────┴───────────────┐
-         [보고서 있음]            [보고서 없음]
-                │                      │
-                ▼                      ▼
-   [Discord 보고서 선택 버튼]   [WF-06 즉시 실행]
-   [보고서1] [보고서2] [새로 생성]  → 보고서 생성
-                │
-      사용자가 선택
-                │
+                ┌───────────┬───────────────┬────────────────────────┐
+         [보고서 있음]  [보고서 없음]   [조회 실패/지연]
+                │            │               │
+                ▼            ▼               ▼
+   [Discord 보고서 선택 버튼]  [🆕 새로 생성]  [🔄 다시 조회] [🆕 새로 생성]
+   [보고서1] [보고서2] [새로 생성]  버튼 노출      버튼 노출 (자동 fallback 없음)
+                │            │               │
+      사용자가 선택          └──────┬────────┘
+                │                   │
        ├─[기존 보고서 선택]──→ Discord에 보고서 전송
        │
        └─[새로 생성]────────→ [WF-06 실행] → 보고서 생성 → 전송
@@ -846,6 +846,7 @@ python register_command.py \
 1. Discord에서 `/report` 실행
    → 채널 선택 버튼 표시 (TOPIC_CHANNELS에 등록된 채널 수만큼)
 2. 채널 버튼 클릭 → 해당 채널의 보고서 목록 표시
+   (목록 조회 실패/지연 시 `[🔄 다시 조회] / [🆕 새로 생성]` 버튼 표시)
 3. 보고서 선택 또는 [새로 생성] → 보고서 텍스트 수신
 4. `[🎬 영상 제작]` 버튼 클릭 → WF-11 실행 (승인 후 WF-12, 최종 승인 시 WF-08)
 
@@ -905,7 +906,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | `/report` 채널 버튼에 삭제된 채널이 계속 보임 | 버튼 소스는 `TOPIC_CHANNELS` 기준. `.env` 수정 후 `docker-compose up -d --force-recreate messenger-gateway` 적용 |
 | `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
 | `/report` 채널 선택 후 목록이 안 뜨고 멈춘 것처럼 보임 | gateway 로그 `[channel-select:bg]`에서 list-reports 응답 여부 확인. 최신 버전은 최대 180초 대기 후 실패 시 `다시 조회/새로 생성` 버튼을 노출 |
-| `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[parse_titles]` 라인 수/파싱 개수 확인. UI 변경으로 파싱 실패 시 `다시 조회` 버튼으로 재시도 후 여전히 실패하면 새 생성 |
+| `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST]` 액션/`collect 추가` 로그와 `[list_reports] CUA 목록 수집 결과`를 확인. CUA가 빈 목록이면 fallback 파서가 동작하며, 둘 다 실패하면 `다시 조회` 버튼으로 재시도 |
 | WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |
 | 자동 보고서가 예상 채널이 아닌 곳에 옴 | auto-report는 `DISCORD_ALLOWED_CHANNEL_IDS`의 첫 번째 채널만 사용함. 순서 변경 후 gateway 재기동 필요 |
 | TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
