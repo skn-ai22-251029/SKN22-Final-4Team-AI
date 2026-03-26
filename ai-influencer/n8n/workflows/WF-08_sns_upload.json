@@ -20,7 +20,8 @@
           "assignments": [
             {"id": "b1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
             {"id": "b2", "name": "video_url", "value": "={{ $json.body.video_url }}", "type": "string"},
-            {"id": "b3", "name": "channel_id", "value": "={{ $json.body.channel_id }}", "type": "string"}
+            {"id": "b3", "name": "channel_id", "value": "={{ $json.body.channel_id }}", "type": "string"},
+            {"id": "b4", "name": "video_filename", "value": "={{ $json.body.video_filename ?? '' }}", "type": "string"}
           ]
         },
         "options": {}
@@ -59,7 +60,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ snippet: { title: $('Extract Fields').item.json.job_id.substring(0, 8) + ' - AI 인플루언서 콘텐츠', description: $json.concept_text || '', tags: ['AI', '인플루언서'], categoryId: '22' }, status: { privacyStatus: 'public' } }) }}",
+        "jsonBody": "={{ JSON.stringify({ snippet: { title: (($('Extract Fields').item.json.video_filename || '').replace(/\\.mp4$/i, '') || $('Extract Fields').item.json.job_id.substring(0, 8)) + ' - AI 인플루언서 콘텐츠', description: $json.concept_text || '', tags: ['AI', '인플루언서'], categoryId: '22' }, status: { privacyStatus: 'public' } }) }}",
         "options": {}
       },
       "id": "wf08-http-youtube",

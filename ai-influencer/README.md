@@ -125,6 +125,23 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 ---
 
+## 파일명 규칙 (전 워크플로우 공통)
+
+- 기준 규칙: `YYYYMMDD-{job_id}.{ext}`
+- 날짜 기준 타임존: `Asia/Seoul`
+- `job_id`는 전체 UUID를 사용
+- 동일 job의 산출물은 basename을 공유
+  - 대본: `YYYYMMDD-{job_id}.txt`
+  - TTS: `YYYYMMDD-{job_id}.wav`
+  - 영상(메타): `YYYYMMDD-{job_id}.mp4`
+
+예시 (`job_id=550e8400-e29b-41d4-a716-446655440000`, 2026-03-26 생성):
+- `20260326-550e8400-e29b-41d4-a716-446655440000.txt`
+- `20260326-550e8400-e29b-41d4-a716-446655440000.wav`
+- `20260326-550e8400-e29b-41d4-a716-446655440000.mp4`
+
+---
+
 ## 워크플로 상세 흐름
 
 ### WF-01: 콘텐츠 생성 요청 수신
@@ -924,3 +941,52 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | **Phase 2** | NotebookLM 연동 — 채널별 소스 수집 + 보고서 생성 | ✅ 완료 |
 | **Phase 3** | WF-11/12 분리(TTS + HeyGen) | ✅ 완료 |
 | **Phase 4** | SNS 자동 업로드 (YouTube, Instagram, TikTok) | ✅ 완료 |
+
+---
+
+## RunPod & Cloudflare 서버 구축 튜토리얼 (GPT-SoVITS-v4 실습)
+
+### 1. RunPod 환경 구성
+- RunPod에서 **RTX 5090** 인스턴스를 생성합니다.
+- 포트 번호를 `8888, 9874, 9880, 9872`로 설정하여 열어줍니다.
+- 8888 포트를 통해 Jupyter Notebook으로 접속한 후, **Terminal 1**을 켭니다.
+
+### 2. 로컬 서버 실행
+```bash
+# 디렉터리 이동
+cd /workspace/GPT-SoVITS-v4-real
+
+# Python 가상환경(venv) 활성화
+source /workspace/GPT-SoVITS-v4/venv/bin/activate
+
+# 로컬호스트 서버 실행 (API v2)
+python api_v2.py
+```
+
+### 3. Cloudflare 터널링으로 퍼블릭 URL 생성
+- 새 터미널(**Terminal 2**)을 켭니다.
+- Cloudflare 터널링 도구를 실행하기 위해 가상환경을 활성화합니다.
+- 포트 9880을 연결하여 퍼블릭 URL을 만들어줍니다.
+```bash
+# Python 가상환경(venv) 활성화
+source /workspace/GPT-SoVITS-v4/venv/bin/activate
+
+cloudflared tunnel --url http://127.0.0.1:9880/
+```
+
+### 트러블슈팅: Cloudflare 관련 오류 발생 시
+만약 `cloudflared` 실행 중 오류가 나거나 명령어가 없으면 아래로 수동 설치를 진행합니다.
+
+```bash
+# 1. 최신 패키지 리스트 업데이트
+apt-get update
+
+# 2. cloudflared 다운로드용 도구 설치 (이미 있을 수도 있음)
+apt-get install -y wget
+
+# 3. cloudflared 최신 버전 다운로드 (Linux 64-bit 기준)
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
+# 4. 다운로드한 패키지 설치
+dpkg -i cloudflared-linux-amd64.deb
+```

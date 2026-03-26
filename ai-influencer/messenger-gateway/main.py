@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import base64
+import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Awaitable, Optional
@@ -10,6 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from adapters.discord_adapter import DiscordAdapter
 from config import settings
+from utils.file_naming import build_filename
 from models.job import (
     AutoReportRequest,
     ChannelSelectRequest,
@@ -56,6 +59,111 @@ _REPORT_SYSTEM_PROMPT = (
     "인삿말(오프닝) - 본문 - 마무리(엔딩) 구조로 진행한다. "
     "[내용] "
 )
+
+
+def _extract_valid_basename(job_id: str, filename: object) -> Optional[str]:
+    if not isinstance(filename, str) or not filename:
+        return None
+    pattern = rf"^(\d{{8}}-{re.escape(job_id)})\.(txt|wav|mp4)$"
+    match = re.match(pattern, filename)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _resolve_media_basename(
+    job_id: str,
+    existing_script_json: object = None,
+    candidate_filename: Optional[str] = None,
+) -> str:
+    parsed = _as_script_json(existing_script_json)
+    media_names = parsed.get("media_names")
+    if isinstance(media_names, dict):
+        for key in ("report_filename", "audio_filename", "video_filename"):
+            candidate = media_names.get(key)
+            basename = _extract_valid_basename(job_id, candidate)
+            if basename:
+                return basename
+    candidate_basename = _extract_valid_basename(job_id, candidate_filename)
+    if candidate_basename:
+        return candidate_basename
+    return build_filename(job_id, "txt").rsplit(".", 1)[0]
+
+
+def _normalize_filename(
+    job_id: str,
+    ext: str,
+    candidate: Optional[str],
+    existing_script_json: object = None,
+) -> str:
+    normalized = f"{_resolve_media_basename(job_id, existing_script_json, candidate)}.{ext}"
+    if candidate and candidate != normalized:
+        logger.info("[file-naming] normalize %s filename job_id=%s from=%s to=%s", ext, job_id, candidate, normalized)
+    return normalized
+
+
+def _normalize_report_filename(
+    job_id: str,
+    candidate: Optional[str],
+    existing_script_json: object = None,
+) -> str:
+    return _normalize_filename(job_id, "txt", candidate, existing_script_json)
+
+
+def _normalize_audio_filename(
+    job_id: str,
+    candidate: Optional[str],
+    existing_script_json: object = None,
+) -> str:
+    return _normalize_filename(job_id, "wav", candidate, existing_script_json)
+
+
+def _normalize_video_filename(
+    job_id: str,
+    candidate: Optional[str],
+    existing_script_json: object = None,
+) -> str:
+    return _normalize_filename(job_id, "mp4", candidate, existing_script_json)
+
+
+def _as_script_json(value: object) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return dict(parsed)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _merge_script_json_with_media_names(
+    existing: object,
+    *,
+    report_filename: Optional[str] = None,
+    audio_filename: Optional[str] = None,
+    video_filename: Optional[str] = None,
+    script_text: Optional[str] = None,
+) -> dict:
+    merged = _as_script_json(existing)
+    if script_text is not None:
+        merged["script_text"] = script_text
+        merged["script"] = script_text  # backward compatibility
+        merged["script_summary"] = script_text[:200]
+    media_names = merged.get("media_names")
+    if not isinstance(media_names, dict):
+        media_names = {}
+    if report_filename:
+        media_names["report_filename"] = report_filename
+    if audio_filename:
+        media_names["audio_filename"] = audio_filename
+    if video_filename:
+        media_names["video_filename"] = video_filename
+    if media_names:
+        merged["media_names"] = media_names
+    return merged
 
 
 def _normalize_manual_job_id(job_id: str) -> str:
@@ -659,18 +767,18 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
 
         report_content = data["report_content"]
         file_bytes = base64.b64decode(data["file_content_b64"])
-        filename = data["filename"]
+        filename = _normalize_report_filename(body.job_id, data.get("filename"), job.get("script_json"))
 
         report_text = (report_content or "").strip()
-        if report_text:
-            await job_service.update_job(
-                body.job_id,
-                script_json={
-                    "script_text": report_text,
-                    "script": report_text,  # backward compatibility
-                    "script_summary": report_text[:200],
-                },
-            )
+        merged_script = _merge_script_json_with_media_names(
+            job.get("script_json"),
+            script_text=report_text if report_text else None,
+            report_filename=filename,
+        )
+        await job_service.update_job(
+            body.job_id,
+            script_json=merged_script,
+        )
 
         text = report_content
         if len(text) > 1800:
@@ -721,27 +829,33 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         logger.error("[discord] base64 decode failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=400, detail=f"Invalid file_content_b64: {e}")
 
+    existing_job = await job_service.get_job(body.job_id)
+    filename = _normalize_report_filename(
+        body.job_id,
+        body.filename,
+        existing_job.get("script_json") if existing_job else None,
+    )
     text = body.report_content
     if len(text) > 1800:
         text = text[:1800] + "\n\n[전체 내용은 첨부 파일 참조]"
 
     report_text = (body.report_content or "").strip()
-    if report_text:
-        await job_service.update_job(
-            body.job_id,
-            script_json={
-                "script_text": report_text,
-                "script": report_text,  # backward compatibility
-                "script_summary": report_text[:200],
-            },
-        )
+    merged_script = _merge_script_json_with_media_names(
+        existing_job.get("script_json") if existing_job else None,
+        script_text=report_text if report_text else None,
+        report_filename=filename,
+    )
+    await job_service.update_job(
+        body.job_id,
+        script_json=merged_script,
+    )
 
     try:
         await _discord_adapter.send_file_message(
             channel_id=body.messenger_channel_id,
             text=text,
             file_bytes=file_bytes,
-            filename=body.filename,
+            filename=filename,
             include_video_button=body.include_video_button,
             job_id=body.job_id,
         )
@@ -749,8 +863,8 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         logger.error("[discord] send_file_message failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info("[discord] send_report done job_id=%s filename=%s", body.job_id, body.filename)
-    return {"status": "sent"}
+    logger.info("[discord] send_report done job_id=%s filename=%s", body.job_id, filename)
+    return {"status": "sent", "filename": filename}
 
 
 @app.post("/internal/send-text")
@@ -773,6 +887,12 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         logger.error("[discord] audio base64 decode failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=400, detail=f"Invalid audio_content_b64: {e}")
 
+    existing_job = await job_service.get_job(body.job_id)
+    filename = _normalize_audio_filename(
+        body.job_id,
+        body.filename,
+        existing_job.get("script_json") if existing_job else None,
+    )
     caption = body.caption or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
     try:
         message_id, attachment_url = await _discord_adapter.send_tts_audio_message(
@@ -780,7 +900,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
             job_id=body.job_id,
             caption=caption,
             audio_bytes=audio_bytes,
-            filename=body.filename,
+            filename=filename,
             include_wf12_button=body.include_wf12_button,
         )
     except Exception as e:
@@ -788,13 +908,23 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
     resolved_audio_url = attachment_url or body.audio_file_path or None
-    await job_service.update_job(body.job_id, confirm_message_id=message_id, audio_url=resolved_audio_url)
-    logger.info("[discord] send_audio done job_id=%s filename=%s", body.job_id, body.filename)
+    merged_script = _merge_script_json_with_media_names(
+        existing_job.get("script_json") if existing_job else None,
+        audio_filename=filename,
+    )
+    await job_service.update_job(
+        body.job_id,
+        confirm_message_id=message_id,
+        audio_url=resolved_audio_url,
+        script_json=merged_script,
+    )
+    logger.info("[discord] send_audio done job_id=%s filename=%s", body.job_id, filename)
     return {
         "status": "sent",
         "message_id": message_id,
         "attachment_url": attachment_url,
         "audio_url": resolved_audio_url or "",
+        "filename": filename,
     }
 
 
@@ -839,6 +969,12 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
 @app.post("/internal/send-video-preview")
 async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     """WF-12 완료 후 호출 — Discord로 영상 미리보기 + 승인/반려 버튼을 전송한다."""
+    existing_job = await job_service.get_job(body.job_id)
+    normalized_video_filename = _normalize_video_filename(
+        body.job_id,
+        body.video_filename,
+        existing_job.get("script_json") if existing_job else None,
+    )
     try:
         message_id = await _discord_adapter.send_video_preview(
             channel_id=body.channel_id,
@@ -850,9 +986,23 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         logger.error("[discord] send_video_preview failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    await job_service.update_job(body.job_id, confirm_message_id=message_id)
+    merged_script = _merge_script_json_with_media_names(
+        existing_job.get("script_json") if existing_job else None,
+        video_filename=normalized_video_filename,
+    )
+    await job_service.update_job(
+        body.job_id,
+        confirm_message_id=message_id,
+        video_url=body.video_url,
+        script_json=merged_script,
+    )
     logger.info("[discord] send_video_preview done job_id=%s", body.job_id)
-    return {"job_id": body.job_id, "message_id": message_id}
+    return {
+        "job_id": body.job_id,
+        "message_id": message_id,
+        "video_filename": normalized_video_filename,
+        "video_url": body.video_url,
+    }
 
 
 @app.post("/internal/video-action")
@@ -867,10 +1017,18 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
 
     if body.action == "approved":
         video_url = job.get("video_url", "")
+        script_json = _as_script_json(job.get("script_json"))
+        media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
+        video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
         await job_service.transition_status(body.job_id, "PUBLISHING")
 
         try:
-            await n8n_service.call_wf08_sns_upload(body.job_id, video_url, channel_id)
+            await n8n_service.call_wf08_sns_upload(
+                body.job_id,
+                video_url,
+                channel_id,
+                video_filename=video_filename,
+            )
         except Exception as e:
             logger.error("call_wf08_sns_upload failed job_id=%s: %s", body.job_id, e)
 
