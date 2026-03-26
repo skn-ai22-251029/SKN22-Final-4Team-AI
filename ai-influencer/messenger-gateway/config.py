@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     postgres_password: str
 
     discord_bot_token: str = ""
+    discord_allowed_channel_ids: str = ""
 
     n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/wf-01-input"
     n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/wf-05-confirm"

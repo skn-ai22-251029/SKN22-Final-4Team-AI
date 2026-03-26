@@ -313,21 +313,80 @@ def _run_cua_loop(
 
 def _parse_report_titles(body_text: str) -> list[str]:
     """body text에서 스튜디오 보고서 타일 제목 목록을 파싱. 페이지 이동 없음."""
-    studio_pos = body_text.find("스튜디오")
-    if studio_pos < 0:
+    section_start = -1
+    for keyword in ("스튜디오", "Studio"):
+        pos = body_text.find(keyword)
+        if pos >= 0:
+            section_start = pos
+            break
+
+    if section_start < 0:
+        logger.warning("[parse_titles] studio section not found")
         return []
 
-    studio_section = body_text[studio_pos:]
+    studio_section = body_text[section_start:]
     lines = [l.strip() for l in studio_section.split("\n") if l.strip()]
+    logger.info("[parse_titles] studio lines=%d", len(lines))
 
-    time_pattern = re.compile(r"\d+[시분일주]간?\s*전")
-    titles = []
+    blacklist = {
+        "스튜디오",
+        "Studio",
+        "보고서",
+        "직접 만들기",
+        "소스",
+        "채팅",
+        "공유",
+        "설정",
+        "더보기",
+    }
+    time_pattern = re.compile(
+        r"(?:\d+\s*(?:초|분|시간|일|주|개월|달|년)\s*전|\d+\s*(?:sec|min|hour|day|week|month|year)s?\s*ago)",
+        re.IGNORECASE,
+    )
+
+    titles: list[str] = []
+
+    # 1) 시간 라벨 기준 역추적 (UI 변경에 비교적 강함)
     for i, line in enumerate(lines):
-        if time_pattern.search(line) and i > 0:
-            candidate = lines[i - 1]
-            if len(candidate) > 3 and candidate not in ("스튜디오", "보고서", "직접 만들기"):
+        if not time_pattern.search(line):
+            continue
+        for offset in (1, 2, 3):
+            if i - offset < 0:
+                continue
+            candidate = lines[i - offset].strip()
+            if (
+                len(candidate) < 4
+                or len(candidate) > 120
+                or candidate in blacklist
+                or time_pattern.search(candidate)
+            ):
+                continue
+            titles.append(candidate)
+            break
+
+    # 2) 텍스트 페어 패턴 fallback (title\nN시간 전)
+    if not titles:
+        pair_pattern = re.compile(
+            r"(?P<title>[^\n]{4,120})\n(?P<time>(?:\d+\s*(?:초|분|시간|일|주|개월|달|년)\s*전|\d+\s*(?:sec|min|hour|day|week|month|year)s?\s*ago))",
+            re.IGNORECASE,
+        )
+        for m in pair_pattern.finditer(studio_section):
+            candidate = (m.group("title") or "").strip()
+            if candidate and candidate not in blacklist:
                 titles.append(candidate)
-    return titles
+
+    # 중복 제거 (순서 유지)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for t in titles:
+        key = t.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+
+    logger.info("[parse_titles] parsed titles=%d", len(deduped))
+    return deduped
 
 
 def list_reports(page, notebook_url: str) -> list[str]:

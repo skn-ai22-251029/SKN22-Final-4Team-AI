@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import base64
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Awaitable, Optional
 
@@ -10,11 +11,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from adapters.discord_adapter import DiscordAdapter
 from config import settings
 from models.job import (
+    AutoReportRequest,
     ChannelSelectRequest,
     ConfirmActionRequest,
     IncomingMessageRequest,
     ListJobsRequest,
     ManualGenerateRequest,
+    MessengerSource,
     ReportMessageRequest,
     ReportSelectRequest,
     ReportToVideoRequest,
@@ -37,6 +40,22 @@ logger = logging.getLogger(__name__)
 # 싱글턴 어댑터 및 httpx 클라이언트
 _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
+
+_REPORT_SYSTEM_PROMPT = (
+    "[중요] 대사 외 다른 표기는 절대 넣지 않는다.(예시: \"[오프닝]\") "
+    "대본의 제목도 넣지 않는다. [내용]에 대한 대사만 작성한다. "
+    "\"?, !, ., ,\" 글쓰기에 필요한 기호만 사용한다. "
+    "기호를 적절히 사용해서 TTS가 읽을 때 자연스럽게 이어지는 억양을 준다(물음표는 올리는 악센트, 마침표는 쉬어가는 악센트, 쉼표는 문장이 길어서 정말 필요할 때만 사용한다.) "
+    "[제약사항] 반드시 한글만으로 이루어져야 한다. "
+    "영어 사용 금지(예시: \"AI\" -> \"에이아이\") "
+    "숫자도 한글로 표기할 것. "
+    "마크다운 문법 사용하지 않고 텍스트만으로 작성한다. "
+    "[형식] 50초 분량의 짧은 영상의 대사(약 300자). "
+    "반드시 하리의 컨셉이 유지되어야 한다. "
+    "대사만 포함되어야 한다. "
+    "인삿말(오프닝) - 본문 - 마무리(엔딩) 구조로 진행한다. "
+    "[내용] "
+)
 
 
 def _normalize_manual_job_id(job_id: str) -> str:
@@ -144,6 +163,32 @@ def _parse_topic_channels(raw: str) -> list[dict]:
         seen.add(cid)
         channels.append({"id": cid, "name": name})
     return channels
+
+
+def _parse_csv_ids(raw: str) -> list[str]:
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
+def _get_primary_discord_channel_id() -> str:
+    channel_ids = _parse_csv_ids(settings.discord_allowed_channel_ids)
+    if not channel_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="DISCORD_ALLOWED_CHANNEL_IDS is empty; cannot route auto report",
+        )
+    return channel_ids[0]
+
+
+def _build_auto_report_prompt(body: AutoReportRequest) -> str:
+    segments: list[str] = []
+    if body.channel_name:
+        segments.append(f"대상 채널명: {body.channel_name}.")
+    if body.source_title:
+        segments.append(f"최신 참고 영상 제목: {body.source_title}.")
+    if body.source_url:
+        segments.append(f"최신 참고 영상 URL: {body.source_url}.")
+    segments.append("위 최신 소스를 참고해 오늘 업로드 흐름에 맞는 대사를 작성한다.")
+    return _REPORT_SYSTEM_PROMPT + " ".join(segments)
 
 
 def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> None:
@@ -338,6 +383,43 @@ async def report_message(_: AuthDep, body: ReportMessageRequest) -> dict:
     return {"job_id": body.job_id, "status": "accepted"}
 
 
+@app.post("/internal/auto-report")
+async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
+    """WF-09 소스 추가 성공 후 자동으로 WF-06 보고서 생성을 트리거한다."""
+    target_channel_id = _get_primary_discord_channel_id()
+    prompt = _build_auto_report_prompt(body)
+    job_id = str(uuid.uuid4())
+
+    report_body = ReportMessageRequest(
+        job_id=job_id,
+        messenger_source=MessengerSource.DISCORD,
+        messenger_user_id="system:auto-report",
+        messenger_channel_id=target_channel_id,
+        prompt=prompt,
+        notebook_id="",
+        channel_id=body.channel_id,
+        character_id="default-character",
+    )
+
+    await job_service.create_job(report_body)
+    wf06_ok = await _call_wf06(report_body, raise_on_error=True)
+    if not wf06_ok:
+        raise HTTPException(status_code=500, detail="WF-06 trigger failed")
+    logger.info(
+        "[auto-report] triggered job_id=%s discord_channel=%s youtube_channel=%s source=%s",
+        job_id,
+        target_channel_id,
+        body.channel_id,
+        body.source_url,
+    )
+    return {
+        "status": "triggered",
+        "job_id": job_id,
+        "messenger_channel_id": target_channel_id,
+        "youtube_channel_id": body.channel_id,
+    }
+
+
 async def _get_all_channels() -> list[dict]:
     """채널 버튼 목록은 TOPIC_CHANNELS만 사용한다."""
     channels = _parse_topic_channels(settings.topic_channels)
@@ -374,12 +456,14 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
     try:
         await _discord_adapter.send_text_message(
             body.messenger_channel_id,
-            "🔎 채널을 확인했습니다. 기존 보고서 목록을 조회 중입니다... (최대 1분)",
+            "🔎 채널을 확인했습니다. 기존 보고서 목록을 조회 중입니다... (최대 3분)",
         )
     except Exception as e:
         logger.warning("[channel-select:bg] start notice failed job_id=%s: %s", body.job_id, e)
 
     reports: list[str] = []
+    list_reports_error: str = ""
+    list_reports_failed = False
     try:
         resp = await _http_client.post(
             f"{settings.notebooklm_service_url}/list-reports",
@@ -388,19 +472,23 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
                 "channel_id": body.channel_id or None,
             },
             headers={"X-Internal-Secret": settings.gateway_internal_secret},
-            timeout=60.0,
+            timeout=180.0,
         )
         if resp.status_code == 200:
             data = resp.json()
             if data.get("status") == "success":
                 reports = data.get("reports", [])
             else:
+                list_reports_failed = True
+                list_reports_error = str(data.get("error") or "status!=success")
                 logger.warning(
                     "[channel-select:bg] list-reports status!=success job_id=%s error=%s",
                     body.job_id,
                     data.get("error"),
                 )
         else:
+            list_reports_failed = True
+            list_reports_error = f"HTTP {resp.status_code}"
             logger.warning(
                 "[channel-select:bg] list-reports non-200 job_id=%s status=%s body=%s",
                 body.job_id,
@@ -408,7 +496,9 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
                 (resp.text or "")[:300],
             )
     except Exception as e:
-        logger.warning("[report-message] list-reports 조회 실패 (WF-06 fallback): %s", e)
+        list_reports_failed = True
+        list_reports_error = str(e)
+        logger.warning("[report-message] list-reports 조회 실패: %s", e)
 
     if reports:
         try:
@@ -422,19 +512,45 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
             return
         except Exception as e:
             logger.error("[report-message] send_report_list failed job_id=%s: %s", body.job_id, e)
+            list_reports_failed = True
+            list_reports_error = f"send_report_list failed: {e}"
 
+    # 자동 fallback으로 바로 WF-06 실행하지 않고, 사용자 선택 버튼(다시 조회/새로 생성)을 제공한다.
+    if list_reports_failed:
+        reason_text = (
+            "⚠️ 기존 보고서 목록 조회에 실패했습니다.\n"
+            f"사유: {list_reports_error[:160]}\n"
+            "아래에서 `다시 조회` 또는 `새로 생성`을 선택해주세요."
+        )
+        try:
+            await _discord_adapter.send_report_recovery_actions(
+                channel_id=body.messenger_channel_id,
+                job_id=body.job_id,
+                selected_channel_id=body.channel_id,
+                reason_text=reason_text,
+                include_retry=True,
+            )
+        except Exception as e:
+            logger.warning("[channel-select:bg] recovery action send failed job_id=%s: %s", body.job_id, e)
+        return
+
+    # 정상적으로 성공 응답이지만 목록이 비어 있는 경우
     try:
-        await _discord_adapter.send_text_message(
-            body.messenger_channel_id,
-            "📄 기존 보고서가 없거나 조회에 실패해 새 보고서 생성을 시작합니다... (최대 5~10분)",
+        await _discord_adapter.send_report_recovery_actions(
+            channel_id=body.messenger_channel_id,
+            job_id=body.job_id,
+            selected_channel_id=body.channel_id,
+            reason_text=(
+                "📄 해당 채널의 기존 보고서를 찾지 못했습니다.\n"
+                "아래에서 `새로 생성`을 선택해 보고서를 만들 수 있습니다."
+            ),
+            include_retry=False,
         )
     except Exception as e:
-        logger.warning("[channel-select:bg] fallback notice failed job_id=%s: %s", body.job_id, e)
-
-    await _call_wf06(body)
+        logger.warning("[channel-select:bg] empty-list action send failed job_id=%s: %s", body.job_id, e)
 
 
-async def _call_wf06(body: ReportMessageRequest) -> None:
+async def _call_wf06(body: ReportMessageRequest, *, raise_on_error: bool = False) -> bool:
     logger.info(
         "[report-wf06] trigger job_id=%s channel_id=%s messenger_channel=%s",
         body.job_id,
@@ -452,6 +568,7 @@ async def _call_wf06(body: ReportMessageRequest) -> None:
             channel_id=body.channel_id,
             character_id=body.character_id,
         )
+        return True
     except Exception as e:
         logger.error("[discord] call_wf06_report failed job_id=%s: %s", body.job_id, e)
         await job_service.update_job(body.job_id, error_message=str(e))
@@ -462,6 +579,9 @@ async def _call_wf06(body: ReportMessageRequest) -> None:
             )
         except Exception:
             logger.warning("[report-wf06] failed to notify channel for wf06 error job_id=%s", body.job_id)
+        if raise_on_error:
+            raise
+    return False
 
 
 @app.post("/internal/channel-select")

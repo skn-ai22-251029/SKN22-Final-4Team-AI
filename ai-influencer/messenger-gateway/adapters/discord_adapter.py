@@ -225,6 +225,51 @@ class DiscordAdapter(MessengerAdapter):
         resp.raise_for_status()
         logger.info("[discord] send_report_list job=%s reports=%d", job_id, len(reports))
 
+    async def send_report_recovery_actions(
+        self,
+        channel_id: str,
+        job_id: str,
+        selected_channel_id: str,
+        reason_text: str,
+        *,
+        include_retry: bool = True,
+    ) -> None:
+        """보고서 목록 조회 실패/빈 목록 상황에서 재시도/새 생성 버튼을 전송한다."""
+        buttons = []
+        if include_retry:
+            buttons.append(
+                {
+                    "type": 2,
+                    "label": "🔄 다시 조회",
+                    "style": 2,
+                    "custom_id": f"select_channel:{job_id}:{selected_channel_id}",
+                }
+            )
+        buttons.append(
+            {
+                "type": 2,
+                "label": "🆕 새로 생성",
+                "style": 1,
+                "custom_id": f"new_report:{job_id}:{selected_channel_id}",
+            }
+        )
+
+        payload = {
+            "content": reason_text,
+            "components": [{"type": 1, "components": buttons}],
+        }
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        logger.info(
+            "[discord] send_report_recovery_actions job=%s include_retry=%s",
+            job_id,
+            include_retry,
+        )
+
     async def send_channel_list(
         self, channel_id: str, job_id: str, channels: list[dict]
     ) -> None:
