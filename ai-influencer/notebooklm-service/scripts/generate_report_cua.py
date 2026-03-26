@@ -4,9 +4,12 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
+from typing import Optional
 
 from playwright.sync_api import sync_playwright, Page
 from openai import OpenAI
@@ -20,6 +23,13 @@ logger = logging.getLogger("generate_report_cua")
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 BROWSER_PROFILE_DIR = DATA_DIR / "browser_state" / "browser_profile"
+CHROMIUM_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
+DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
+_BROWSER_INSTALL_ATTEMPTED = False
 
 SYSTEM_PROMPT = """You are a browser automation assistant controlling a Chromium browser via Playwright.
 Given a screenshot of the current browser state and a task, output a JSON action to perform.
@@ -39,6 +49,32 @@ Rules:
 - Do NOT include report text in the done action — text will be extracted from the DOM automatically.
 - If the report is still generating, use "wait".
 - Coordinates must be within 1280x800 viewport.
+"""
+
+LIST_SYSTEM_PROMPT = """You are a browser automation assistant for listing saved report titles in NotebookLM Studio.
+Given a screenshot and task context, output ONLY one JSON object in one of these formats:
+
+1) Collect visible titles:
+{"action":"collect","titles":["title1","title2",...]}
+
+2) Click:
+{"action":"click","x":<int>,"y":<int>,"reason":"<why>"}
+
+3) Scroll:
+{"action":"scroll","x":<int>,"y":<int>,"delta_y":<int>}
+
+4) Wait:
+{"action":"wait","ms":<milliseconds>}
+
+5) Done:
+{"action":"done"}
+
+Rules:
+- `titles` must contain only titles actually visible in the screenshot.
+- Do not fabricate titles.
+- Do not click a report tile in list mode; only navigate/open Studio panel if needed.
+- Prefer `collect` when titles are visible, `scroll` when more titles may exist.
+- Output only JSON and nothing else.
 """
 
 ALLOWED_CUA_HOSTS = {
@@ -116,6 +152,144 @@ def _build_openai_client() -> OpenAI:
     if not api_key:
         raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
     return OpenAI(api_key=api_key)
+
+
+def _is_profile_lock_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    tokens = (
+        "processsingleton",
+        "user data directory is already in use",
+        "profile appears to be in use",
+        "another browser is using",
+        "singletonlock",
+        "lock file",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _is_browser_missing_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    tokens = (
+        "please run the following command to install new browsers",
+        "playwright install",
+        "executable doesn't exist",
+        "browser has not been found",
+    )
+    return any(token in msg for token in tokens)
+
+
+def _ensure_chromium_installed(phase: str) -> None:
+    """런타임에서 Chromium이 누락된 경우 1회 자가 복구."""
+    global _BROWSER_INSTALL_ATTEMPTED
+    if _BROWSER_INSTALL_ATTEMPTED:
+        return
+    _BROWSER_INSTALL_ATTEMPTED = True
+    logger.warning("[%s] Chromium 누락 감지 — playwright install chromium 시도", phase)
+    result = subprocess.run(
+        ["python3", "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        raise RuntimeError(
+            f"[{phase}] playwright install chromium 실패: {(stderr or stdout or f'code={result.returncode}')[:400]}"
+        )
+    logger.info("[%s] playwright install chromium 완료", phase)
+
+
+def _launch_context_with_retry(playwright, headless: bool, phase: str, max_attempts: int = 12):
+    """브라우저 프로필 잠금 충돌 시 재시도하며 context를 연다."""
+    BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return playwright.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_PROFILE_DIR),
+                headless=headless,
+                args=CHROMIUM_LAUNCH_ARGS,
+                viewport=DEFAULT_VIEWPORT,
+            )
+        except Exception as e:
+            last_error = e
+            if _is_browser_missing_error(e):
+                _ensure_chromium_installed(phase)
+                continue
+            if not _is_profile_lock_error(e):
+                raise
+            wait_sec = min(10, 1 + attempt)
+            logger.warning(
+                "[%s] 브라우저 프로필 잠금 감지 (%d/%d): %s → %ds 후 재시도",
+                phase, attempt, max_attempts, e, wait_sec
+            )
+            time.sleep(wait_sec)
+    raise RuntimeError(f"[{phase}] 브라우저 프로필 잠금 해제 대기 실패: {last_error}")
+
+
+def _parse_action_json(raw: str) -> dict:
+    """모델 응답에서 JSON action 파싱."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    if not text.startswith("{"):
+        first = text.find("{")
+        last = text.rfind("}")
+        if first >= 0 and last > first:
+            text = text[first:last + 1]
+
+    action = json.loads(text)
+    if not isinstance(action, dict):
+        raise json.JSONDecodeError("action must be an object", text, 0)
+    return action
+
+
+def _normalize_report_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", (title or "").strip())
+    title = title.strip("-•|")
+    return title
+
+
+def _sanitize_collected_titles(raw_titles) -> list[str]:
+    """collect 액션에서 받은 후보 제목을 정규화/필터링."""
+    if not isinstance(raw_titles, list):
+        return []
+
+    noise = {
+        "스튜디오",
+        "Studio",
+        "보고서",
+        "직접 만들기",
+        "소스",
+        "채팅",
+        "공유",
+        "설정",
+        "더보기",
+    }
+    time_only = re.compile(
+        r"^(?:\d+\s*(?:초|분|시간|일|주|개월|달|년)\s*전|\d+\s*(?:sec|min|hour|day|week|month|year)s?\s*ago)$",
+        re.IGNORECASE,
+    )
+
+    cleaned: list[str] = []
+    for v in raw_titles:
+        if not isinstance(v, str):
+            continue
+        t = _normalize_report_title(v)
+        if not t or len(t) < 2 or len(t) > 160:
+            continue
+        if t in noise:
+            continue
+        if time_only.search(t):
+            continue
+        cleaned.append(t)
+
+    return cleaned
 
 
 def _extract_studio_report(page) -> str:
@@ -242,6 +416,56 @@ def execute_action(page, action: dict) -> bool:
     return False
 
 
+def _execute_list_action(page, action: dict, panel_anchor: Optional[dict] = None) -> bool:
+    """list 모드 액션 실행. scroll은 Studio 패널 중심 좌표로 보정."""
+    t = action.get("action")
+    if t == "scroll":
+        anchor_x = 1080
+        anchor_y = 450
+        if panel_anchor:
+            anchor_x = int(panel_anchor.get("x", anchor_x))
+            anchor_y = int(panel_anchor.get("y", anchor_y))
+        delta = int(action.get("delta_y", 550))
+        page.mouse.move(anchor_x, anchor_y)
+        page.mouse.wheel(0, delta)
+        time.sleep(0.45)
+        return False
+
+    return execute_action(page, action)
+
+
+def _get_studio_panel_anchor(page) -> dict:
+    """Studio 패널 중심점 추정. 실패 시 우측 패널 기본값 반환."""
+    fallback = {"x": 1080, "y": 450}
+    js = """
+    () => {
+      const candidates = [
+        "[aria-label*='Studio']",
+        "[aria-label*='스튜디오']",
+        "[class*='studio']",
+        "[class*='Studio']",
+        "[data-testid*='studio']",
+      ];
+      for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 100 && r.height > 120) {
+          return {x: Math.round(r.left + r.width * 0.5), y: Math.round(r.top + r.height * 0.6)};
+        }
+      }
+      return null;
+    }
+    """
+    try:
+        pos = page.evaluate(js)
+        if isinstance(pos, dict) and "x" in pos and "y" in pos:
+            return {"x": int(pos["x"]), "y": int(pos["y"])}
+    except Exception as e:
+        logger.warning("[CUA][LIST] panel anchor 탐지 실패: %s", e)
+    return fallback
+
+
 def _run_cua_loop(
     page,
     client,
@@ -288,11 +512,7 @@ def _run_cua_loop(
         logger.info("[CUA][%s] 모델 응답: %s", phase, raw[:200])
 
         try:
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            action = json.loads(raw.strip())
+            action = _parse_action_json(raw)
         except json.JSONDecodeError as e:
             logger.error("[CUA][%s] JSON 파싱 실패: %s — %s", phase, e, raw)
             msgs.append({"role": "assistant", "content": raw})
@@ -311,23 +531,298 @@ def _run_cua_loop(
     return False
 
 
+def _run_list_cua_loop(
+    page,
+    client,
+    task: str,
+    max_steps: int,
+    max_no_new_rounds: int = 2,
+    min_steps_before_done: int = 4,
+    min_scrolls_for_empty: int = 3,
+    min_elapsed_sec_for_empty: float = 8.0,
+    max_model_errors: int = 4,
+) -> tuple[list[str], dict]:
+    """list 전용 CUA 루프: collect/scroll/done 기반으로 보고서 제목을 누적 수집."""
+    HISTORY_WINDOW = 4
+    msgs = [{"role": "system", "content": LIST_SYSTEM_PROMPT}]
+    collected: list[str] = []
+    seen = set()
+    no_new_rounds = 0
+    scroll_count = 0
+    collect_attempts = 0
+    empty_collect_rounds = 0
+    premature_done_count = 0
+    start_ts = time.monotonic()
+    panel_anchor = _get_studio_panel_anchor(page)
+    meta = {
+        "steps": 0,
+        "parse_errors": 0,
+        "invalid_actions": 0,
+        "model_errors": 0,
+        "done": False,
+        "elapsed_sec": 0.0,
+        "scroll_count": 0,
+        "collect_attempts": 0,
+        "premature_done_count": 0,
+        "termination_reason": "max_steps",
+        "empty_result_accepted": False,
+    }
+
+    for step in range(max_steps):
+        meta["steps"] = step + 1
+        _assert_allowed_url(page.url, "LIST")
+        screenshot_b64 = base64.b64encode(page.screenshot()).decode()
+        logger.info("[CUA][LIST] 스텝 %d/%d — collect=%d no_new=%d", step + 1, max_steps, len(collected), no_new_rounds)
+
+        history = msgs[1:]
+        if len(history) > HISTORY_WINDOW * 2:
+            history = history[-(HISTORY_WINDOW * 2):]
+        msgs = [msgs[0]] + history
+
+        instruction = (
+            f"{task}\n\n"
+            f"Current progress: already collected {len(collected)} unique titles.\n"
+            "If visible titles exist, prefer collect.\n"
+            "When no more new titles are discoverable, return done."
+        )
+
+        msgs.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        })
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-5.4",
+                messages=msgs,
+                max_completion_tokens=400,
+                temperature=0,
+            )
+        except Exception as e:
+            meta["model_errors"] = int(meta["model_errors"]) + 1
+            no_new_rounds += 1
+            logger.warning(
+                "[CUA][LIST] 모델 호출 실패 (%d/%d): %s",
+                meta["model_errors"],
+                max_model_errors,
+                e,
+            )
+            _execute_list_action(page, {"action": "wait", "ms": 1500}, panel_anchor)
+            if int(meta["model_errors"]) >= max_model_errors:
+                _execute_list_action(page, {"action": "scroll", "delta_y": 640}, panel_anchor)
+                scroll_count += 1
+            if int(meta["model_errors"]) >= (max_model_errors + 2):
+                meta["termination_reason"] = "model_errors_exceeded"
+                break
+            continue
+
+        raw = (response.choices[0].message.content or "").strip()
+        logger.info("[CUA][LIST] 모델 응답: %s", raw[:300])
+
+        try:
+            action = _parse_action_json(raw)
+        except json.JSONDecodeError as e:
+            logger.error("[CUA][LIST] JSON 파싱 실패: %s — %s", e, raw)
+            meta["parse_errors"] = int(meta["parse_errors"]) + 1
+            msgs.append({"role": "assistant", "content": raw})
+            no_new_rounds += 1
+            if no_new_rounds >= max_no_new_rounds + 2:
+                logger.warning("[CUA][LIST] 연속 JSON 파싱 실패로 중단")
+                break
+            continue
+
+        at = action.get("action")
+        if at not in {"collect", "scroll", "wait", "done", "click"}:
+            logger.warning("[CUA][LIST] 허용되지 않은 액션: %s", action)
+            meta["invalid_actions"] = int(meta["invalid_actions"]) + 1
+            action = {"action": "wait", "ms": 1200}
+            at = "wait"
+
+        msgs.append({"role": "assistant", "content": raw})
+        logger.info("[CUA][LIST] 액션: %s", action)
+
+        if at == "collect":
+            collect_attempts += 1
+            before = len(collected)
+            titles = _sanitize_collected_titles(action.get("titles", []))
+            for t in titles:
+                if t not in seen:
+                    seen.add(t)
+                    collected.append(t)
+            added = len(collected) - before
+            logger.info("[CUA][LIST] collect 추가=%d 총=%d", added, len(collected))
+            if added == 0:
+                empty_collect_rounds += 1
+                no_new_rounds += 1
+            else:
+                empty_collect_rounds = 0
+                no_new_rounds = 0
+        elif at == "done":
+            elapsed_sec = time.monotonic() - start_ts
+            can_accept_done = (
+                len(collected) > 0
+                or (
+                    step + 1 >= min_steps_before_done
+                    and scroll_count >= min_scrolls_for_empty
+                    and elapsed_sec >= min_elapsed_sec_for_empty
+                    and collect_attempts >= min_steps_before_done // 2
+                )
+            )
+            if can_accept_done:
+                logger.info("[CUA][LIST] done 수신 — 루프 종료 (accepted)")
+                meta["done"] = True
+                meta["termination_reason"] = "done"
+                meta["empty_result_accepted"] = len(collected) == 0
+                break
+            premature_done_count += 1
+            no_new_rounds += 1
+            logger.warning(
+                "[CUA][LIST] premature done 무시 (step=%d collected=%d scroll=%d elapsed=%.2fs)",
+                step + 1, len(collected), scroll_count, elapsed_sec,
+            )
+            _execute_list_action(page, {"action": "scroll", "delta_y": 620}, panel_anchor)
+            scroll_count += 1
+        else:
+            # scroll/wait/click만 execute_action에 위임
+            _execute_list_action(page, action, panel_anchor)
+            if at == "scroll":
+                no_new_rounds += 1
+                scroll_count += 1
+
+        elapsed_sec = time.monotonic() - start_ts
+        can_accept_empty = (
+            step + 1 >= min_steps_before_done
+            and scroll_count >= min_scrolls_for_empty
+            and elapsed_sec >= min_elapsed_sec_for_empty
+            and collect_attempts >= min_steps_before_done // 2
+        )
+        if no_new_rounds >= max_no_new_rounds:
+            if collected:
+                logger.info("[CUA][LIST] 신규 제목 없음 연속 %d회 — 종료(제목 확보)", no_new_rounds)
+                meta["termination_reason"] = "stagnation_with_titles"
+                break
+            if can_accept_empty:
+                logger.info("[CUA][LIST] 신규 제목 없음 연속 %d회 — 종료(빈목록 승인)", no_new_rounds)
+                meta["termination_reason"] = "stagnation_empty_accepted"
+                meta["empty_result_accepted"] = True
+                break
+            logger.info("[CUA][LIST] 탐색 부족 상태로 no_new 도달 — 탐색 연장")
+            no_new_rounds = max_no_new_rounds - 1
+            _execute_list_action(page, {"action": "scroll", "delta_y": 680}, panel_anchor)
+            scroll_count += 1
+
+    meta["elapsed_sec"] = round(time.monotonic() - start_ts, 2)
+    meta["scroll_count"] = scroll_count
+    meta["collect_attempts"] = collect_attempts
+    meta["premature_done_count"] = premature_done_count
+    meta["empty_collect_rounds"] = empty_collect_rounds
+    if meta.get("termination_reason") == "max_steps" and meta.get("done"):
+        meta["termination_reason"] = "done"
+
+    logger.info(
+        "[CUA][LIST] 종료 요약 reason=%s steps=%s elapsed=%.2fs titles=%d scroll=%d collect=%d premature_done=%d model_errors=%d empty_ok=%s",
+        meta.get("termination_reason"),
+        meta.get("steps"),
+        meta.get("elapsed_sec"),
+        len(collected),
+        scroll_count,
+        collect_attempts,
+        premature_done_count,
+        meta.get("model_errors"),
+        meta.get("empty_result_accepted"),
+    )
+    return collected, meta
+
+
 def _parse_report_titles(body_text: str) -> list[str]:
     """body text에서 스튜디오 보고서 타일 제목 목록을 파싱. 페이지 이동 없음."""
-    studio_pos = body_text.find("스튜디오")
-    if studio_pos < 0:
-        return []
+    try:
+        section_start = -1
+        for keyword in ("스튜디오", "Studio"):
+            pos = body_text.find(keyword)
+            if pos >= 0:
+                section_start = pos
+                break
 
-    studio_section = body_text[studio_pos:]
-    lines = [l.strip() for l in studio_section.split("\n") if l.strip()]
+        if section_start < 0:
+            logger.warning("[parse_titles] studio section not found")
+            return []
 
-    time_pattern = re.compile(r"\d+[시분일주]간?\s*전")
-    titles = []
-    for i, line in enumerate(lines):
-        if time_pattern.search(line) and i > 0:
-            candidate = lines[i - 1]
-            if len(candidate) > 3 and candidate not in ("스튜디오", "보고서", "직접 만들기"):
+        studio_section = body_text[section_start:]
+        lines = [l.strip() for l in studio_section.split("\n") if l.strip()]
+        logger.info("[parse_titles] studio lines=%d", len(lines))
+
+        blacklist = {
+            "스튜디오",
+            "Studio",
+            "보고서",
+            "직접 만들기",
+            "소스",
+            "채팅",
+            "공유",
+            "설정",
+            "더보기",
+        }
+        time_pattern = re.compile(
+            r"(?:\d+\s*(?:초|분|시간|일|주|개월|달|년)\s*전|\d+\s*(?:sec|min|hour|day|week|month|year)s?\s*ago)",
+            re.IGNORECASE,
+        )
+
+        titles: list[str] = []
+
+        # 1) 시간 라벨 기준 역추적 (UI 변경에 비교적 강함)
+        for i, line in enumerate(lines):
+            if not time_pattern.search(line):
+                continue
+            for offset in (1, 2, 3):
+                if i - offset < 0:
+                    continue
+                candidate = lines[i - offset].strip()
+                if (
+                    len(candidate) < 2
+                    or len(candidate) > 120
+                    or candidate in blacklist
+                    or time_pattern.search(candidate)
+                ):
+                    continue
                 titles.append(candidate)
-    return titles
+                break
+
+        # 2) 텍스트 페어 패턴 fallback (title\nN시간 전)
+        if not titles:
+            pair_pattern = re.compile(
+                r"(?P<title>[^\n]{2,120})\n(?P<time>(?:\d+\s*(?:초|분|시간|일|주|개월|달|년)\s*전|\d+\s*(?:sec|min|hour|day|week|month|year)s?\s*ago))",
+                re.IGNORECASE,
+            )
+            for m in pair_pattern.finditer(studio_section):
+                candidate = (m.group("title") or "").strip()
+                if candidate and candidate not in blacklist:
+                    titles.append(candidate)
+
+        # 중복 제거 (순서 유지)
+        deduped: list[str] = []
+        seen = set()
+        for t in titles:
+            key = t.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+
+        logger.info("[parse_titles] parsed titles=%d", len(deduped))
+        return deduped
+    except Exception as e:
+        logger.exception("[parse_titles] unexpected error: %s", e)
+        return []
 
 
 def list_reports(page, notebook_url: str) -> list[str]:
@@ -342,9 +837,95 @@ def list_reports(page, notebook_url: str) -> list[str]:
     _ensure_logged_in(page)
     time.sleep(2)
 
-    titles = _parse_report_titles(page.inner_text("body"))
-    logger.info("[list_reports] 보고서 %d개 발견: %s", len(titles), titles)
-    return titles
+    client = _build_openai_client()
+    task = (
+        "Task: In NotebookLM Studio, collect titles of saved reports already listed in the Studio panel.\n"
+        "Steps:\n"
+        "1. If Studio panel is not visible, open the Studio tab on the right.\n"
+        "2. Read visible saved report/document cards and return them with collect.\n"
+        "3. Scroll inside the Studio panel to discover more titles when needed.\n"
+        "4. Return done when no additional new titles are discoverable.\n"
+        "Important:\n"
+        "- Never click '보고서' generation tile for creating a new report.\n"
+        "- Never open a report tile in list mode.\n"
+        "- Only list existing saved report titles."
+    )
+
+    list_max_steps = 16
+    list_max_no_new_rounds = 4
+    list_min_steps_before_done = 5
+    list_min_scrolls_for_empty = 4
+    list_min_elapsed_sec_for_empty = 12.0
+
+    cua_titles: list[str] = []
+    cua_meta = {
+        "steps": 0,
+        "parse_errors": 0,
+        "invalid_actions": 0,
+        "done": False,
+    }
+    cua_loop_error = ""
+    try:
+        cua_titles, cua_meta = _run_list_cua_loop(
+            page,
+            client,
+            task=task,
+            max_steps=list_max_steps,
+            max_no_new_rounds=list_max_no_new_rounds,
+            min_steps_before_done=list_min_steps_before_done,
+            min_scrolls_for_empty=list_min_scrolls_for_empty,
+            min_elapsed_sec_for_empty=list_min_elapsed_sec_for_empty,
+        )
+    except Exception as e:
+        cua_loop_error = str(e)
+        logger.exception("[list_reports] CUA list loop 실패: %s", e)
+
+    if cua_titles:
+        logger.info(
+            "[list_reports] CUA 목록 수집 성공: %d개 (steps=%s done=%s parse_errors=%s invalid_actions=%s)",
+            len(cua_titles),
+            cua_meta.get("steps"),
+            cua_meta.get("done"),
+            cua_meta.get("parse_errors"),
+            cua_meta.get("invalid_actions"),
+        )
+        return cua_titles
+
+    logger.warning(
+        "[list_reports] CUA 목록이 비어 fallback parser 사용 (steps=%s done=%s parse_errors=%s invalid_actions=%s model_errors=%s err=%s)",
+        cua_meta.get("steps"),
+        cua_meta.get("done"),
+        cua_meta.get("parse_errors"),
+        cua_meta.get("invalid_actions"),
+        cua_meta.get("model_errors"),
+        cua_loop_error[:120],
+    )
+    try:
+        body_text = page.inner_text("body")
+        fallback_titles = _parse_report_titles(body_text)
+        logger.info("[list_reports] fallback 목록 수집 결과: %d개", len(fallback_titles))
+        if fallback_titles:
+            logger.warning("[list_reports] fallback parser 경로로 목록 반환됨")
+            return fallback_titles
+        if cua_loop_error:
+            raise RuntimeError(f"CUA list loop failed: {cua_loop_error}")
+        if bool(cua_meta.get("empty_result_accepted")):
+            logger.info("[list_reports] CUA 빈목록 승인 조건 충족 — 빈 배열 반환")
+            return []
+        if int(cua_meta.get("parse_errors") or 0) >= list_max_no_new_rounds:
+            raise RuntimeError("CUA list loop failed: repeated JSON parse errors")
+        if int(cua_meta.get("invalid_actions") or 0) >= list_max_no_new_rounds:
+            raise RuntimeError("CUA list loop failed: repeated invalid actions")
+        if int(cua_meta.get("model_errors") or 0) >= 4:
+            raise RuntimeError("CUA list loop failed: repeated model call errors")
+        if not bool(cua_meta.get("done")) and int(cua_meta.get("steps") or 0) >= list_max_steps:
+            raise RuntimeError("CUA list loop reached step limit without stable result")
+        raise RuntimeError(
+            "CUA list loop did not gather titles and empty-result acceptance criteria were not met"
+        )
+    except Exception as e:
+        logger.exception("[list_reports] fallback parser 실패: %s", e)
+        raise
 
 
 def get_existing_report(page, notebook_url: str, report_index: int, output_path: str) -> str:
@@ -440,16 +1021,7 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
 
     with sync_playwright() as p:
         logger.info("[CUA] Chromium 시작")
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            viewport={"width": 1280, "height": 800},
-        )
+        context = _launch_context_with_retry(p, headless=headless, phase="GENERATE")
         page = context.new_page()
         logger.info("[CUA] 노트북 URL 이동 중...")
         page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
@@ -552,12 +1124,7 @@ def main():
 
     elif args.mode == "list":
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_PROFILE_DIR),
-                headless=args.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                viewport={"width": 1280, "height": 800},
-            )
+            context = _launch_context_with_retry(p, headless=args.headless, phase="LIST")
             page = context.new_page()
             titles = list_reports(page, args.notebook_url)
             context.close()
@@ -568,12 +1135,7 @@ def main():
 
     elif args.mode == "get":
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_PROFILE_DIR),
-                headless=args.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                viewport={"width": 1280, "height": 800},
-            )
+            context = _launch_context_with_retry(p, headless=args.headless, phase="GET")
             page = context.new_page()
             result = get_existing_report(page, args.notebook_url, args.report_index, args.output)
             context.close()
@@ -581,4 +1143,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error("[CUA][FATAL] %s", e)
+        traceback.print_exc()
+        raise

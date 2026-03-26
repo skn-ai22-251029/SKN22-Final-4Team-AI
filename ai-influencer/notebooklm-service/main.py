@@ -55,6 +55,12 @@ def _cua_subprocess_env() -> dict:
         "HOME",
         "PYTHONPATH",
         "DISPLAY",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+        "XDG_CACHE_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
         "OPENAI_CUA_API_KEY",
         "OPENAI_API_KEY",      # fallback only
         "GOOGLE_EMAIL",
@@ -66,6 +72,51 @@ def _cua_subprocess_env() -> dict:
         if value is not None:
             env[key] = value
     return env
+
+
+def _is_playwright_browser_missing(text: str) -> bool:
+    raw = (text or "").lower()
+    if "playwright" not in raw:
+        return False
+    return (
+        "please run the following command to install new browsers" in raw
+        or "playwright install" in raw
+        or "executable doesn't exist" in raw
+        or "playwright team" in raw
+        or "browser has not been found" in raw
+    )
+
+
+def _install_playwright_chromium(env: dict, phase: str) -> bool:
+    """Playwright 브라우저 누락 시 Chromium 설치를 1회 시도."""
+    install_env = dict(env or {})
+    install_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
+    logger.warning("[%s] Playwright Chromium 설치 시도", phase)
+    try:
+        result = subprocess.run(
+            ["python3", "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=install_env,
+        )
+    except Exception as e:
+        logger.error("[%s] playwright install 실행 실패: %s", phase, e)
+        return False
+
+    if result.stdout:
+        for line in result.stdout.strip().splitlines():
+            logger.info("[playwright-install] %s", line)
+    if result.stderr:
+        for line in result.stderr.strip().splitlines():
+            logger.warning("[playwright-install:err] %s", line)
+
+    if result.returncode != 0:
+        logger.error("[%s] playwright install chromium 실패(code=%d)", phase, result.returncode)
+        return False
+
+    logger.info("[%s] playwright install chromium 완료", phase)
+    return True
 
 
 # ─────────────────────────────────────────
@@ -270,12 +321,27 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
     ]
     logger.info("[notebooklm] list_reports subprocess: %s", cmd)
 
+    env = _cua_subprocess_env()
+
+    def _exec_list_once() -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=_cua_subprocess_env())
+        result = _exec_list_once()
     except subprocess.TimeoutExpired:
-        return ListReportsResponse(status="error", error="list-reports timeout (120s)")
+        return ListReportsResponse(status="error", error="list-reports timeout (180s)")
     except Exception as e:
         return ListReportsResponse(status="error", error=str(e))
+
+    raw_err_first = (result.stderr or result.stdout or "").strip()
+    if result.returncode != 0 and _is_playwright_browser_missing(raw_err_first):
+        if _install_playwright_chromium(env, "list-reports"):
+            try:
+                result = _exec_list_once()
+            except subprocess.TimeoutExpired:
+                return ListReportsResponse(status="error", error="list-reports timeout (180s, after playwright install)")
+            except Exception as e:
+                return ListReportsResponse(status="error", error=f"list-reports retry failed: {e}")
 
     for line in (result.stdout or "").strip().splitlines():
         logger.info("[script] %s", line)
@@ -283,8 +349,28 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
         logger.warning("[script:err] %s", line)
 
     if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()[:300]
-        return ListReportsResponse(status="error", error=err)
+        raw_err = (result.stderr or result.stdout or "").strip()
+        concise_err = ""
+        error_tail = ""
+        if raw_err:
+            lines = [line.strip() for line in raw_err.splitlines() if line.strip()]
+            raw_lower = raw_err.lower()
+            if (
+                "playwright" in raw_lower
+                and ("install" in raw_lower or "executable doesn't exist" in raw_lower or "playwright team" in raw_lower)
+            ):
+                concise_err = "Playwright browser runtime missing. Rebuild notebooklm-service image with Chromium."
+                error_tail = ""
+            # traceback 전체 대신 마지막 핵심 라인(예외 타입/메시지)을 우선 노출
+            if not concise_err:
+                concise_err = lines[-1] if lines else raw_err
+            if lines:
+                error_tail = " | ".join(lines[-3:])
+        if not concise_err:
+            concise_err = f"list-reports subprocess failed (code={result.returncode})"
+        if error_tail:
+            concise_err = f"{concise_err} (tail: {error_tail})"
+        return ListReportsResponse(status="error", error=concise_err[:300])
 
     try:
         titles = json.loads(Path(output_path).read_text(encoding="utf-8"))

@@ -44,13 +44,20 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
        ▼                              ▼                          ▼
 [YouTube RSS 수집]           [WF-01: 스크립트 생성]    [채널 선택 버튼 표시]
 [notebooklm 소스 추가]              │                          │
+       │ (성공 시 auto-report)      │                          │
+       └──────────────→ [gateway /internal/auto-report]       │
+                               │                               │
+                          [WF-06: 보고서 생성]                 │
+                               │                               │
+                       [Discord 자동 보고서 전송]              │
+                                                               │
        │                       [컨펌 버튼 전송]            [채널 선택]
-[WF-10: 매일 노트북 생성]           │                          │
-                               [WF-05: 승인/수정]         [보고서 목록 조회]
-                                    │ 승인                      │
+       [WF-10: 매일 노트북 생성]           │                          │
+                                [WF-05: 승인/수정]         [보고서 목록 조회]
+                                     │ 승인                      │
                                [WF-11: TTS 생성]    [WF-06: 보고서 생성]
-                                    │                          │
-                                [WF-12: HeyGen 생성]        [영상 제작 요청]
+                                     │                          │
+                                 [WF-12: HeyGen 생성]        [영상 제작 요청]
 ```
 
 ---
@@ -84,11 +91,14 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
   → /internal/report-message
   → 채널 선택 버튼
   → /internal/channel-select
-  → notebooklm-service /list-reports
+  → notebooklm-service /list-reports (gpt-5.4 CUA list loop)
       ├─ 기존 보고서 선택: /internal/report-select(select)
       │   → notebooklm-service /get-report
       │   → Discord 전송 + jobs.script_json.script_text 저장
-      └─ 새로 생성: /internal/report-select(new) → WF-06
+      ├─ 기존 보고서 없음: [🆕 새로 생성] 버튼 노출
+      └─ 조회 실패/지연: [🔄 다시 조회] / [🆕 새로 생성] 버튼 노출
+          (자동 fallback으로 바로 생성하지 않음)
+      → 새로 생성 선택 시: /internal/report-select(new) → WF-06
           → notebooklm-service /generate
           → /internal/send-report
           → Discord 전송 + jobs.script_json.script_text 저장
@@ -316,6 +326,13 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
                                     ▼
                             [결과 로깅]
                             중복 건너뜀 / 소스 추가 완료 / 오류
+                                    │
+                    [added=true일 때만 자동 보고서 트리거]
+                                    ▼
+              [gateway /internal/auto-report]
+               - job_id 자동 생성
+               - Discord 전송 채널: DISCORD_ALLOWED_CHANNEL_IDS 첫 번째
+               - WF-06 호출 → 보고서 생성/첨부 전송
 ```
 
 ---
@@ -369,15 +386,15 @@ Discord 사용자: /report
                [notebooklm-service /list-reports 조회]
                → 해당 채널의 기존 보고서 목록
                         │
-                ┌───────┴───────────────┐
-         [보고서 있음]            [보고서 없음]
-                │                      │
-                ▼                      ▼
-   [Discord 보고서 선택 버튼]   [WF-06 즉시 실행]
-   [보고서1] [보고서2] [새로 생성]  → 보고서 생성
-                │
-      사용자가 선택
-                │
+                ┌───────────┬───────────────┬────────────────────────┐
+         [보고서 있음]  [보고서 없음]   [조회 실패/지연]
+                │            │               │
+                ▼            ▼               ▼
+   [Discord 보고서 선택 버튼]  [🆕 새로 생성]  [🔄 다시 조회] [🆕 새로 생성]
+   [보고서1] [보고서2] [새로 생성]  버튼 노출      버튼 노출 (자동 fallback 없음)
+                │            │               │
+      사용자가 선택          └──────┬────────┘
+                │                   │
        ├─[기존 보고서 선택]──→ Discord에 보고서 전송
        │
        └─[새로 생성]────────→ [WF-06 실행] → 보고서 생성 → 전송
@@ -396,7 +413,7 @@ Discord 사용자: /report
 | `WF-05_confirm_handler.json` | Webhook | `POST /webhook/wf-05-confirm` | 승인/수정 분기 및 상태 업데이트 | 승인→WF-11, 수정→WF-01 |
 | `WF-06_notebooklm_report.json` | Webhook | `POST /webhook/wf-06-report` | NotebookLM 보고서 생성 호출, 성공/실패 분기 | 성공→`/internal/send-report`, 실패→`/internal/send-text` |
 | `WF-08_sns_upload.json` | Webhook | `POST /webhook/wf-08-sns-upload` | `PUBLISHING` 전이, SNS 업로드 처리, post 기록 | 완료 알림 + `PUBLISHED` |
-| `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, 채널별 RSS 조회/재시도, 새 영상 필터 | notebooklm-service `/check-and-add-source` |
+| `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, 채널별 RSS 조회/재시도, 새 영상 필터 | source 추가 성공 시 gateway `/internal/auto-report` → WF-06 |
 | `WF-10-daily-notebook.json` | Schedule(매일 00:00) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
 | `WF-11_tts_generate.json` | Webhook | `POST /webhook/wf-11-tts-generate` | TTS 생성, WAV 저장, Discord 전송, `audio_url` 저장 | 승인 대기 또는 자동 WF-12 |
 | `WF-12_heygen_generate.json` | Webhook | `POST /webhook/wf-12-heygen-generate` | HeyGen 생성/폴링, 성공/실패 분기 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
@@ -516,6 +533,8 @@ TOPIC_CHANNELS=채널이름/채널ID+채널이름/채널ID+...
 ```
 - 채널이름: 노트북 및 보고서 식별 키로 사용됨
 - 채널ID: YouTube 채널 ID (UC로 시작하는 24자리)
+
+자동 보고서(auto-report) 경로에서는 `DISCORD_ALLOWED_CHANNEL_IDS`의 **첫 번째 채널 ID만** 전송 대상으로 사용합니다.
 
 ### 6. 전체 서비스 빌드 및 기동
 
@@ -794,6 +813,7 @@ python register_command.py \
 | `POST` | `/internal/channel-select` | discord-bot | 채널 버튼 클릭 → 보고서 목록 |
 | `POST` | `/internal/report-select` | discord-bot | 보고서 선택 또는 새로 생성 |
 | `POST` | `/internal/send-report` | n8n WF-06 | 보고서 텍스트 전송 |
+| `POST` | `/internal/auto-report` | n8n WF-09 | 소스 추가 성공 시 자동 WF-06 생성/전송 트리거 |
 | `POST` | `/internal/report-to-video` | discord-bot | 보고서 → 영상 제작 요청 |
 | `POST` | `/internal/tts-generate` | discord-bot | `/tts [job_id]` 수동 WF-11 실행 (미입력 시 최근 job 자동 선택) |
 | `POST` | `/internal/heygen-generate` | discord-bot | `/heygen [job_id]` 수동 WF-12 실행 (미입력 시 최근 job 자동 선택) |
@@ -826,6 +846,7 @@ python register_command.py \
 1. Discord에서 `/report` 실행
    → 채널 선택 버튼 표시 (TOPIC_CHANNELS에 등록된 채널 수만큼)
 2. 채널 버튼 클릭 → 해당 채널의 보고서 목록 표시
+   (목록 조회 실패/지연 시 `[🔄 다시 조회] / [🆕 새로 생성]` 버튼 표시)
 3. 보고서 선택 또는 [새로 생성] → 보고서 텍스트 수신
 4. `[🎬 영상 제작]` 버튼 클릭 → WF-11 실행 (승인 후 WF-12, 최종 승인 시 WF-08)
 
@@ -884,6 +905,11 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | notebooklm-service 연결 실패 | `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 형식(`=` 사용) 및 same network 확인 |
 | `/report` 채널 버튼에 삭제된 채널이 계속 보임 | 버튼 소스는 `TOPIC_CHANNELS` 기준. `.env` 수정 후 `docker-compose up -d --force-recreate messenger-gateway` 적용 |
 | `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
+| `/report` 채널 선택 후 목록이 안 뜨고 멈춘 것처럼 보임 | gateway 로그 `[channel-select:bg]`에서 list-reports 응답 여부 확인. 최신 버전은 최대 180초 대기 후 실패 시 `다시 조회/새로 생성` 버튼을 노출 |
+| `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST] 종료 요약`(`elapsed/scroll/collect/premature_done/termination_reason`)을 먼저 확인. 조기 `done`은 무시되고 최소 탐색 게이트(시간/스크롤/스텝) 미충족이면 빈목록 성공으로 처리하지 않으며, 이 경우 `다시 조회` 버튼으로 재시도 |
+| `/report`에서 `Looks like Playwright ... install` 또는 브라우저 실행 Traceback | `notebooklm-service` 이미지를 최신으로 재빌드해 Chromium 포함 여부를 반영: `docker-compose build --no-cache notebooklm-service && docker-compose up -d notebooklm-service` |
+| WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |
+| 자동 보고서가 예상 채널이 아닌 곳에 옴 | auto-report는 `DISCORD_ALLOWED_CHANNEL_IDS`의 첫 번째 채널만 사용함. 순서 변경 후 gateway 재기동 필요 |
 | TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
 | CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | `OPENAI_CUA_API_KEY` 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |
 | Gateway DB 연결 실패 | postgres healthcheck 통과 여부 및 환경변수 확인 |

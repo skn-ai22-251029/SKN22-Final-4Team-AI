@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 import discord
 import httpx
+from discord import app_commands
 from discord.ext import commands
 from pydantic_settings import BaseSettings
 
@@ -96,6 +97,41 @@ async def gateway_call(path: str, payload: dict) -> dict[str, Any]:
         raise
 
 
+def _clip_text(text: str, max_len: int = 1500) -> str:
+    normalized = (text or "").strip()
+    if len(normalized) <= max_len:
+        return normalized
+    return normalized[: max_len - 3] + "..."
+
+
+async def _safe_reply(interaction: discord.Interaction, text: str, *, ephemeral: bool = True) -> None:
+    message = _clip_text(text)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(message, ephemeral=ephemeral)
+        return
+    except Exception as e:
+        logger.error("[discord] safe reply failed: %s", e)
+
+    # 마지막 폴백: 채널 메시지 (ephemeral 보장은 불가)
+    try:
+        if interaction.channel:
+            await interaction.channel.send("⚠️ 명령 응답 전송에 실패했습니다. 잠시 후 다시 시도해주세요.")
+    except Exception as e:
+        logger.error("[discord] fallback channel reply failed: %s", e)
+
+
+async def _safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> None:
+    if interaction.response.is_done():
+        return
+    try:
+        await interaction.response.defer(ephemeral=ephemeral)
+    except Exception as e:
+        logger.error("[discord] defer failed: %s", e)
+
+
 # ─────────────────────────────────────────
 # 인메모리 수정 대기 상태 (pending_store)
 # ─────────────────────────────────────────
@@ -117,8 +153,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready() -> None:
     synced_global_count = 0
     try:
-        if SYNC_GUILD_IDS:
-            for guild_id in SYNC_GUILD_IDS:
+        target_guild_ids = SYNC_GUILD_IDS or [guild.id for guild in bot.guilds]
+        if target_guild_ids:
+            for guild_id in target_guild_ids:
                 guild = discord.Object(id=guild_id)
                 bot.tree.copy_global_to(guild=guild)
                 synced_guild = await bot.tree.sync(guild=guild)
@@ -134,6 +171,12 @@ async def on_ready() -> None:
         bot.user,
         synced_global_count,
     )
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    logger.exception("[discord] app command error: %s", error)
+    await _safe_reply(interaction, f"❌ 명령 처리 실패: {_clip_text(str(error), 500)}", ephemeral=True)
 
 
 @bot.event
@@ -272,19 +315,19 @@ async def report_command(
 @bot.tree.command(name="tts", description="기존 job_id로 WF-11(TTS) 생성을 시작합니다")
 async def tts_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)
-
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    normalized_job_id = (job_id or "").strip()
+    logger.info("[/tts] invoked user=%s channel=%s job_input=%s", user_id, interaction.channel_id, (job_id or "").strip())
 
     try:
+        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+            return
+
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+            return
+
+        await _safe_defer(interaction, ephemeral=True)
+        normalized_job_id = (job_id or "").strip()
         result = await gateway_call(
             "/internal/tts-generate",
             {
@@ -293,37 +336,40 @@ async def tts_command(interaction: discord.Interaction, job_id: str = "") -> Non
                 "messenger_channel_id": str(interaction.channel_id),
             },
         )
-        resolved_job_id = result.get("job_id", normalized_job_id)
+        resolved_job_id = (result.get("job_id") or normalized_job_id).strip()
+        if not resolved_job_id:
+            raise RuntimeError("gateway returned empty job_id")
+
         picked_latest = not normalized_job_id
-        await interaction.followup.send(
-            (
-                "🔊 WF-11(TTS) 시작 요청 완료 "
-                f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
-                if picked_latest
-                else f"🔊 WF-11(TTS) 시작 요청 완료: `{resolved_job_id[:8]}`"
-            ),
-            ephemeral=True,
+        message = (
+            "🔊 WF-11(TTS) 시작 요청 완료 "
+            f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
+            if picked_latest
+            else f"🔊 WF-11(TTS) 시작 요청 완료: `{resolved_job_id[:8]}`"
         )
+        await _safe_reply(interaction, message, ephemeral=True)
+        logger.info("[/tts] success user=%s resolved_job_id=%s", user_id, resolved_job_id)
     except Exception as e:
-        await interaction.followup.send(f"❌ /tts 실패: {e}", ephemeral=True)
+        logger.exception("[/tts] failed user=%s channel=%s job_input=%s", user_id, interaction.channel_id, (job_id or "").strip())
+        await _safe_reply(interaction, f"❌ /tts 실패: {_clip_text(str(e), 500)}", ephemeral=True)
 
 
 @bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
 async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)
-
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    normalized_job_id = (job_id or "").strip()
+    logger.info("[/heygen] invoked user=%s channel=%s job_input=%s", user_id, interaction.channel_id, (job_id or "").strip())
 
     try:
+        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+            return
+
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+            return
+
+        await _safe_defer(interaction, ephemeral=True)
+        normalized_job_id = (job_id or "").strip()
         result = await gateway_call(
             "/internal/heygen-generate",
             {
@@ -332,19 +378,27 @@ async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> 
                 "messenger_channel_id": str(interaction.channel_id),
             },
         )
-        resolved_job_id = result.get("job_id", normalized_job_id)
+        resolved_job_id = (result.get("job_id") or normalized_job_id).strip()
+        if not resolved_job_id:
+            raise RuntimeError("gateway returned empty job_id")
+
         picked_latest = not normalized_job_id
-        await interaction.followup.send(
-            (
-                "🎬 WF-12(HeyGen) 시작 요청 완료 "
-                f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
-                if picked_latest
-                else f"🎬 WF-12(HeyGen) 시작 요청 완료: `{resolved_job_id[:8]}`"
-            ),
-            ephemeral=True,
+        message = (
+            "🎬 WF-12(HeyGen) 시작 요청 완료 "
+            f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
+            if picked_latest
+            else f"🎬 WF-12(HeyGen) 시작 요청 완료: `{resolved_job_id[:8]}`"
         )
+        await _safe_reply(interaction, message, ephemeral=True)
+        logger.info("[/heygen] success user=%s resolved_job_id=%s", user_id, resolved_job_id)
     except Exception as e:
-        await interaction.followup.send(f"❌ /heygen 실패: {e}", ephemeral=True)
+        logger.exception(
+            "[/heygen] failed user=%s channel=%s job_input=%s",
+            user_id,
+            interaction.channel_id,
+            (job_id or "").strip(),
+        )
+        await _safe_reply(interaction, f"❌ /heygen 실패: {_clip_text(str(e), 500)}", ephemeral=True)
 
 
 @bot.tree.command(name="jobs", description="최근 job 목록을 조회합니다")

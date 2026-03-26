@@ -131,3 +131,10 @@ class ReportSelectRequest(BaseModel):
 class ChannelSelectRequest(BaseModel):
     job_id: str
     channel_id: str     # "UCUpJs89fSBXNolQGOYKn0YQ" (YouTube 채널 ID)
+
+
+class AutoReportRequest(BaseModel):
+    channel_id: str
+    channel_name: str = ""
+    source_url: str = ""
+    source_title: str = ""
