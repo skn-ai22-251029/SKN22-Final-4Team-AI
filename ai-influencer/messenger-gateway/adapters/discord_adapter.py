@@ -329,10 +329,11 @@ class DiscordAdapter(MessengerAdapter):
                 }
             ]
         payload_json = json.dumps({"content": text, "components": components})
+        content_type = "text/plain" if filename.lower().endswith(".txt") else "text/markdown"
         resp = await self._client.post(
             f"{BASE_URL}/channels/{channel_id}/messages",
             headers={"Authorization": f"Bot {self._token}"},
-            files={"files[0]": (filename, file_bytes, "text/markdown")},
+            files={"files[0]": (filename, file_bytes, content_type)},
             data={"payload_json": payload_json},
         )
         resp.raise_for_status()

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
@@ -39,12 +40,28 @@ SCRIPTS_DIR = Path(os.getenv("NOTEBOOKLM_SCRIPTS_DIR", "/app/scripts"))
 DATA_DIR = Path(os.getenv("NOTEBOOKLM_DATA_DIR", "/app/data"))
 REPORTS_DIR = DATA_DIR / "reports"
 LIBRARY_JSON = DATA_DIR / "library.json"
+KST = ZoneInfo("Asia/Seoul")
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
 app = FastAPI(title="NotebookLM Service")
+
+
+def _build_media_basename(job_id: str, now: Optional[datetime] = None) -> str:
+    current = now or datetime.now(tz=KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    kst_now = current.astimezone(KST)
+    return f"{kst_now.strftime('%Y%m%d')}-{job_id}"
+
+
+def _build_filename(job_id: str, ext: str, now: Optional[datetime] = None) -> str:
+    normalized_ext = (ext or "").strip().lstrip(".").lower()
+    if not normalized_ext:
+        raise ValueError("ext is required")
+    return f"{_build_media_basename(job_id, now)}.{normalized_ext}"
 
 
 def _cua_subprocess_env() -> dict:
@@ -451,8 +468,7 @@ async def generate(
             error="notebook_url이 필요합니다.",
         )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"report_{body.job_id[:8]}_{timestamp}.md"
+    output_filename = _build_filename(body.job_id, "txt")
     output_path = REPORTS_DIR / output_filename
 
     import asyncio
@@ -502,8 +518,7 @@ async def get_report_endpoint(
     if not notebook_url:
         return GenerateResponse(status="error", error="notebook_url을 결정할 수 없습니다.")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"report_{body.job_id[:8]}_{timestamp}_existing.md"
+    output_filename = _build_filename(body.job_id, "txt")
     output_path = REPORTS_DIR / output_filename
 
     import asyncio

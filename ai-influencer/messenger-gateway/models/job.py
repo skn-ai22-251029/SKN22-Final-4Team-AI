@@ -80,6 +80,7 @@ class SendVideoPreviewRequest(BaseModel):
     video_url: str
     channel_id: str
     user_id: str
+    video_filename: str = ""
 
 
 class SendAudioRequest(BaseModel):

@@ -121,14 +121,16 @@ async def call_wf08_sns_upload(
     job_id: str,
     video_url: str,
     channel_id: str,
+    video_filename: str = "",
 ) -> None:
     payload = {
         "job_id": job_id,
         "video_url": video_url,
         "channel_id": channel_id,
+        "video_filename": video_filename,
     }
     await _post_with_retry(settings.n8n_wf08_webhook_url, payload)
-    logger.info("call_wf08_sns_upload job_id=%s", job_id)
+    logger.info("call_wf08_sns_upload job_id=%s video_filename=%s", job_id, video_filename)
 
 
 async def call_wf06_report(
