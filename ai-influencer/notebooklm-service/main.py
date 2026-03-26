@@ -283,8 +283,15 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
         logger.warning("[script:err] %s", line)
 
     if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()[:300]
-        return ListReportsResponse(status="error", error=err)
+        raw_err = (result.stderr or result.stdout or "").strip()
+        concise_err = ""
+        if raw_err:
+            lines = [line.strip() for line in raw_err.splitlines() if line.strip()]
+            # traceback 전체 대신 마지막 핵심 라인(예외 타입/메시지)을 우선 노출
+            concise_err = lines[-1] if lines else raw_err
+        if not concise_err:
+            concise_err = f"list-reports subprocess failed (code={result.returncode})"
+        return ListReportsResponse(status="error", error=concise_err[:300])
 
     try:
         titles = json.loads(Path(output_path).read_text(encoding="utf-8"))
