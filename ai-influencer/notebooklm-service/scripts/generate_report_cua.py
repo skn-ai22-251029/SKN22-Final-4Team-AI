@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from playwright.sync_api import sync_playwright, Page
 from openai import OpenAI
@@ -332,7 +333,7 @@ def execute_action(page, action: dict) -> bool:
     return False
 
 
-def _execute_list_action(page, action: dict, panel_anchor: dict | None = None) -> bool:
+def _execute_list_action(page, action: dict, panel_anchor: Optional[dict] = None) -> bool:
     """list 모드 액션 실행. scroll은 Studio 패널 중심 좌표로 보정."""
     t = action.get("action")
     if t == "scroll":
