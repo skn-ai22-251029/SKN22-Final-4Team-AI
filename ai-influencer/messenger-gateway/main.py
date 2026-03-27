@@ -9,6 +9,7 @@ from typing import Annotated, Awaitable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from openai import AsyncOpenAI
 
 from adapters.discord_adapter import DiscordAdapter
 from config import settings
@@ -47,7 +48,7 @@ _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 
-_REPORT_SYSTEM_PROMPT = (
+_SCRIPT_REWRITE_PROMPT_BASE = (
     "[중요] 대사 외 다른 표기는 절대 넣지 않는다.(예시: \"[오프닝]\") "
     "대본의 제목도 넣지 않는다. [내용]에 대한 대사만 작성한다. "
     "\"?, !, ., ,\" 글쓰기에 필요한 기호만 사용한다. "
@@ -57,10 +58,15 @@ _REPORT_SYSTEM_PROMPT = (
     "숫자도 한글로 표기할 것. "
     "마크다운 문법 사용하지 않고 텍스트만으로 작성한다. "
     "[형식] 50초 분량의 짧은 영상의 대사(약 300자). "
-    "반드시 하리의 컨셉이 유지되어야 한다. "
+    "반드시 하리의 컨셉(발랄한 20대 초반 여성 유튜버이며 팬덤명은 '보리'이고 존댓말을 사용하지만 딱딱하지는 않다.)이 유지되어야 한다. "
     "대사만 포함되어야 한다. "
     "인삿말(오프닝) - 본문 - 마무리(엔딩) 구조로 진행한다. "
-    "[내용] "
+)
+_NOTEBOOKLM_REPORT_PROMPT = (
+    "삽입된 최신 소스를 바탕으로 사실 관계에 충실한 자세한 보고서를 작성한다. "
+    "핵심 주장, 배경, 사례, 수치, 맥락을 빠짐없이 정리한다. "
+    "원문 소스에 없는 내용은 추정하지 않는다. "
+    "대사체나 연출 지시 대신 설명형 보고서 문단으로만 작성한다."
 )
 
 
@@ -149,12 +155,36 @@ def _merge_script_json_with_media_names(
     audio_filename: Optional[str] = None,
     video_filename: Optional[str] = None,
     script_text: Optional[str] = None,
+    notebooklm_report_text: Optional[str] = None,
+    script_rewrite_prompt: Optional[str] = None,
+    script_rewrite_status: Optional[str] = None,
+    script_rewrite_error: Optional[str] = None,
 ) -> dict:
     merged = _as_script_json(existing)
     if script_text is not None:
         merged["script_text"] = script_text
         merged["script"] = script_text  # backward compatibility
         merged["script_summary"] = script_text[:200]
+    if notebooklm_report_text is not None:
+        if notebooklm_report_text:
+            merged["notebooklm_report_text"] = notebooklm_report_text
+        else:
+            merged.pop("notebooklm_report_text", None)
+    if script_rewrite_prompt is not None:
+        if script_rewrite_prompt:
+            merged["script_rewrite_prompt"] = script_rewrite_prompt
+        else:
+            merged.pop("script_rewrite_prompt", None)
+    if script_rewrite_status is not None:
+        if script_rewrite_status:
+            merged["script_rewrite_status"] = script_rewrite_status
+        else:
+            merged.pop("script_rewrite_status", None)
+    if script_rewrite_error is not None:
+        if script_rewrite_error:
+            merged["script_rewrite_error"] = script_rewrite_error
+        else:
+            merged.pop("script_rewrite_error", None)
     media_names = merged.get("media_names")
     if not isinstance(media_names, dict):
         media_names = {}
@@ -209,6 +239,222 @@ def _is_transient_notebooklm_error(err: Exception) -> bool:
         "no route to host",
     )
     return any(marker in msg for marker in transient_markers)
+
+
+def _default_tts_caption(*, auto_trigger_wf12: bool) -> str:
+    if auto_trigger_wf12:
+        return "🔊 TTS 완료. 영상 제작 모드로 WF-12(HeyGen)를 자동 실행합니다."
+    return "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+
+
+def _build_script_rewrite_instruction(custom_prompt: str) -> str:
+    custom_prompt = (custom_prompt or "").strip()
+    if not custom_prompt:
+        return _SCRIPT_REWRITE_PROMPT_BASE
+    return f"{_SCRIPT_REWRITE_PROMPT_BASE} {custom_prompt}"
+
+
+def _extract_completion_text(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    parts.append(stripped)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> str:
+    api_key = settings.openai_api_key.strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured for script rewrite")
+
+    client = AsyncOpenAI(api_key=api_key)
+    try:
+        response = await client.chat.completions.create(
+            model=settings.script_rewrite_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "너는 NotebookLM 원문 보고서를 최종 숏폼 대본으로 재작성하는 편집자다. "
+                        "원문 보고서의 사실만 사용하고, 원문에 없는 추측이나 설정을 추가하지 않는다. "
+                        "반드시 최종 대본 텍스트만 출력한다."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "다음 원문 보고서를 바탕으로 최종 대본을 작성하라.\n"
+                        "제목, 메모, 불릿, 마크다운 설명 없이 최종 대사 본문만 출력한다.\n\n"
+                        f"[작성 지침]\n{rewrite_instruction}\n\n"
+                        f"[원문 보고서]\n{raw_report_text}"
+                    ),
+                },
+            ],
+        )
+    finally:
+        await client.close()
+
+    if not response.choices:
+        raise RuntimeError("script rewrite returned no choices")
+    text = _extract_completion_text(response.choices[0].message.content)
+    if not text:
+        raise RuntimeError("script rewrite returned empty content")
+    return text
+
+
+async def _prepare_report_delivery(
+    *,
+    job_id: str,
+    raw_report_text: str,
+    existing_script_json: object,
+    filename: str,
+    rewrite_prompt: str,
+) -> tuple[str, bytes, dict]:
+    raw_report_text = (raw_report_text or "").strip()
+    rewrite_instruction = _build_script_rewrite_instruction(rewrite_prompt)
+    final_script_text = raw_report_text
+    rewrite_status = "skipped_empty_report"
+    rewrite_error = ""
+
+    if raw_report_text:
+        try:
+            final_script_text = await _rewrite_report_to_script(raw_report_text, rewrite_instruction)
+            rewrite_status = "success"
+        except Exception as e:
+            rewrite_status = "fallback_raw"
+            rewrite_error = str(e)
+            logger.exception("[script-rewrite] failed job_id=%s", job_id)
+
+    merged_script = _merge_script_json_with_media_names(
+        existing_script_json,
+        script_text=final_script_text if final_script_text else None,
+        report_filename=filename,
+        notebooklm_report_text=raw_report_text,
+        script_rewrite_prompt=rewrite_instruction,
+        script_rewrite_status=rewrite_status,
+        script_rewrite_error=rewrite_error,
+    )
+    return final_script_text, final_script_text.encode("utf-8"), merged_script
+
+
+async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[str, str]:
+    tts_api_url = settings.tts_api_url.strip()
+    if not tts_api_url:
+        raise RuntimeError("TTS_API_URL is not configured")
+
+    tts_body = {
+        "text": script_text,
+        "text_lang": settings.tts_text_lang or "ko",
+        "prompt_lang": settings.tts_prompt_lang or settings.tts_text_lang or "ko",
+        "media_type": "wav",
+        "streaming_mode": False,
+        "top_k": settings.tts_top_k,
+        "sample_steps": settings.tts_sample_steps,
+        "super_sampling": settings.tts_super_sampling,
+        "fragment_interval": settings.tts_fragment_interval,
+    }
+
+    ref_audio_path = settings.tts_ref_audio_path.strip()
+    prompt_text = settings.tts_prompt_text.strip()
+    if ref_audio_path:
+        tts_body["ref_audio_path"] = ref_audio_path
+    if prompt_text:
+        tts_body["prompt_text"] = prompt_text
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        endpoint = tts_api_url if tts_api_url.rstrip("/").endswith("/tts") else f"{tts_api_url.rstrip('/')}/tts"
+        resp = await client.post(
+            endpoint,
+            json=tts_body,
+            headers={"Content-Type": "application/json"},
+        )
+        if not resp.is_success:
+            raise RuntimeError(f"TTS API failed: {resp.status_code} {resp.text}")
+        audio_b64 = base64.b64encode(resp.content).decode("ascii")
+
+    filename = _normalize_audio_filename(job_id, None, None)
+    return audio_b64, filename
+
+
+async def _run_tts_generation(
+    *,
+    job_id: str,
+    script_text: str,
+    channel_id: str,
+    user_id: str,
+    auto_trigger_wf12: bool,
+) -> None:
+    try:
+        await job_service.transition_status(job_id, "GENERATING")
+        audio_b64, filename = await _generate_tts_audio_content(job_id, script_text)
+        send_result = await send_audio(
+            None,
+            SendAudioRequest(
+                messenger_source=MessengerSource.DISCORD,
+                messenger_channel_id=channel_id,
+                job_id=job_id,
+                audio_content_b64=audio_b64,
+                audio_file_path="",
+                filename=filename,
+                caption=_default_tts_caption(auto_trigger_wf12=auto_trigger_wf12),
+                include_wf12_button=not auto_trigger_wf12,
+            ),
+        )
+        await job_service.transition_status(job_id, "APPROVED")
+        await job_service.update_job(job_id, error_message="")
+
+        if auto_trigger_wf12:
+            approved_audio_url = str(send_result.get("audio_url") or "").strip()
+            if not approved_audio_url:
+                raise RuntimeError("Generated TTS audio_url is empty")
+            await n8n_service.call_wf12_heygen_generate(
+                job_id,
+                channel_id,
+                user_id,
+                audio_file_path="",
+                audio_url=approved_audio_url,
+            )
+    except Exception as e:
+        logger.exception("[tts-direct] failed job_id=%s: %r", job_id, e)
+        await job_service.transition_status(job_id, "FAILED")
+        await job_service.update_job(job_id, error_message=f"TTS 생성 실패: {e}")
+        try:
+            await _discord_adapter.send_text_message(
+                channel_id,
+                f"❌ TTS 생성에 실패했습니다.\nJob ID: {job_id[:8]}\n오류: {e}",
+            )
+        except Exception as notify_err:
+            logger.error("[tts-direct] failure notify failed job_id=%s: %s", job_id, notify_err)
+
+
+def _spawn_tts_generation(
+    *,
+    job_id: str,
+    script_text: str,
+    channel_id: str,
+    user_id: str,
+    auto_trigger_wf12: bool,
+) -> None:
+    asyncio.create_task(
+        _run_tts_generation(
+            job_id=job_id,
+            script_text=script_text,
+            channel_id=channel_id,
+            user_id=user_id,
+            auto_trigger_wf12=auto_trigger_wf12,
+        )
+    )
 
 
 async def _post_notebooklm_with_retry(
@@ -361,7 +607,7 @@ def _build_auto_report_prompt(body: AutoReportRequest) -> str:
     if body.source_url:
         segments.append(f"최신 참고 영상 URL: {body.source_url}.")
     segments.append("위 최신 소스를 참고해 오늘 업로드 흐름에 맞는 대사를 작성한다.")
-    return _REPORT_SYSTEM_PROMPT + " ".join(segments)
+    return " ".join(segments)
 
 
 def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> None:
@@ -740,7 +986,7 @@ async def _call_wf06(body: ReportMessageRequest, *, raise_on_error: bool = False
             messenger_source=body.messenger_source.value,
             messenger_user_id=body.messenger_user_id,
             messenger_channel_id=body.messenger_channel_id,
-            prompt=body.prompt,
+            prompt=_NOTEBOOKLM_REPORT_PROMPT,
             notebook_id=body.notebook_id,
             channel_id=body.channel_id,
             character_id=body.character_id,
@@ -835,21 +1081,20 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             return
 
         report_content = data["report_content"]
-        file_bytes = base64.b64decode(data["file_content_b64"])
         filename = _normalize_report_filename(body.job_id, data.get("filename"), job.get("script_json"))
-
-        report_text = (report_content or "").strip()
-        merged_script = _merge_script_json_with_media_names(
-            job.get("script_json"),
-            script_text=report_text if report_text else None,
-            report_filename=filename,
+        final_script_text, file_bytes, merged_script = await _prepare_report_delivery(
+            job_id=body.job_id,
+            raw_report_text=report_content,
+            existing_script_json=job.get("script_json"),
+            filename=filename,
+            rewrite_prompt=job.get("concept_text", ""),
         )
         await job_service.update_job(
             body.job_id,
             script_json=merged_script,
         )
 
-        text = report_content
+        text = final_script_text
         if len(text) > 1800:
             text = text[:1800] + "\n\n[전체 내용은 첨부 파일 참조]"
 
@@ -899,14 +1144,13 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
-    if body.file_content_b64:
-        try:
-            file_bytes = base64.b64decode(body.file_content_b64)
-        except Exception as e:
-            logger.error("[discord] base64 decode failed job_id=%s: %s", body.job_id, e)
-            raise HTTPException(status_code=400, detail=f"Invalid file_content_b64: {e}")
-    else:
-        file_bytes = (body.report_content or "").encode("utf-8")
+    final_script_text, file_bytes, merged_script = await _prepare_report_delivery(
+        job_id=body.job_id,
+        raw_report_text=body.report_content,
+        existing_script_json=existing_job.get("script_json") if existing_job else None,
+        filename=filename,
+        rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
+    )
 
     stored = None
     upload_error = None
@@ -926,7 +1170,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     if upload_error is not None and is_link_only_report:
         raise HTTPException(status_code=500, detail=f"Report upload failed: {upload_error}")
 
-    text = body.report_content
+    text = final_script_text
     if len(text) > 1800:
         overflow_hint = (
             "[전체 내용은 아래 링크 참조]"
@@ -935,12 +1179,6 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         )
         text = text[:1800] + f"\n\n{overflow_hint}"
 
-    report_text = (body.report_content or "").strip()
-    merged_script = _merge_script_json_with_media_names(
-        existing_job.get("script_json") if existing_job else None,
-        script_text=report_text if report_text else None,
-        report_filename=filename,
-    )
     report_storage_url = stored.s3_uri if stored else ""
     await job_service.update_job(
         body.job_id,
@@ -1013,6 +1251,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
+    stored = None
     try:
         stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_tts,
@@ -1022,10 +1261,9 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         )
     except Exception as e:
         logger.error("[storage] tts upload failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"TTS upload failed: {e}")
 
     caption = body.caption or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
-    if stored.size_bytes > _discord_attachment_limit_bytes():
+    if stored and stored.size_bytes > _discord_attachment_limit_bytes():
         try:
             message_id = await _discord_adapter.send_tts_link_message(
                 channel_id=body.messenger_channel_id,
@@ -1039,6 +1277,11 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
             logger.error("[discord] send_tts_link_message failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=500, detail=str(e))
     else:
+        if stored is None and len(audio_bytes) > _discord_attachment_limit_bytes():
+            raise HTTPException(
+                status_code=500,
+                detail="TTS upload failed and audio exceeds Discord attachment size limit",
+            )
         try:
             message_id, attachment_url = await _discord_adapter.send_tts_audio_message(
                 channel_id=body.messenger_channel_id,
@@ -1052,7 +1295,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
             logger.error("[discord] send_tts_audio_message failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=500, detail=str(e))
 
-    resolved_audio_url = stored.s3_uri
+    resolved_audio_url = stored.s3_uri if stored else attachment_url
     merged_script = _merge_script_json_with_media_names(
         existing_job.get("script_json") if existing_job else None,
         audio_filename=filename,
@@ -1061,7 +1304,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         body.job_id,
         confirm_message_id=message_id,
         audio_url=resolved_audio_url,
-        final_url=stored.s3_uri,
+        final_url=stored.s3_uri if stored else attachment_url,
         script_json=merged_script,
     )
     logger.info("[discord] send_audio done job_id=%s filename=%s", body.job_id, filename)
@@ -1069,9 +1312,9 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         "status": "sent",
         "message_id": message_id,
         "attachment_url": attachment_url,
-        "audio_url": stored.presigned_url,
+        "audio_url": stored.presigned_url if stored else attachment_url,
         "filename": filename,
-        "s3_uri": stored.s3_uri,
+        "s3_uri": stored.s3_uri if stored else "",
     }
 
 
@@ -1231,7 +1474,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
         if step == "script":
             await job_service.transition_status(body.job_id, "WAITING_APPROVAL")
             confirm_message_id = job.get("confirm_message_id")
-            script_json = job.get("script_json") or {}
+            script_json = _as_script_json(job.get("script_json"))
             title = script_json.get("title", "대본")
             script_summary = script_json.get("script_summary") or script_json.get("script", "")[:100]
             try:
@@ -1249,14 +1492,14 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
 
         elif step == "tts":
             await job_service.transition_status(body.job_id, "APPROVED")
-            script_json = job.get("script_json") or {}
+            script_json = _as_script_json(job.get("script_json"))
             script_text = script_json.get("script_text") or script_json.get("script", "")
             try:
-                await n8n_service.call_wf11_tts_generate(
-                    body.job_id,
-                    script_text,
-                    channel_id,
-                    user_id,
+                _spawn_tts_generation(
+                    job_id=body.job_id,
+                    script_text=script_text,
+                    channel_id=channel_id,
+                    user_id=user_id,
                     auto_trigger_wf12=False,
                 )
                 await _discord_adapter.send_text_message(channel_id, "🔊 TTS를 재생성합니다...")
@@ -1283,7 +1526,7 @@ async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    script_json = job.get("script_json") or {}
+    script_json = _as_script_json(job.get("script_json"))
     script_text = script_json.get("script_text") or script_json.get("script", "")
     if not script_text:
         raise HTTPException(status_code=400, detail="No script found in job")
@@ -1294,11 +1537,11 @@ async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
     await job_service.transition_status(body.job_id, "APPROVED")
 
     try:
-        await n8n_service.call_wf11_tts_generate(
-            body.job_id,
-            script_text,
-            channel_id,
-            user_id,
+        _spawn_tts_generation(
+            job_id=body.job_id,
+            script_text=script_text,
+            channel_id=channel_id,
+            user_id=user_id,
             auto_trigger_wf12=False,
         )
         await _discord_adapter.send_text_message(
@@ -1320,7 +1563,7 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    script_json = job.get("script_json") or {}
+    script_json = _as_script_json(job.get("script_json"))
     script_text = script_json.get("script_text") or script_json.get("script", "")
     if not script_text:
         raise HTTPException(status_code=400, detail="No script found in job")
@@ -1331,11 +1574,11 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
     await job_service.transition_status(body.job_id, "APPROVED")
 
     try:
-        await n8n_service.call_wf11_tts_generate(
-            body.job_id,
-            script_text,
-            channel_id,
-            user_id,
+        _spawn_tts_generation(
+            job_id=body.job_id,
+            script_text=script_text,
+            channel_id=channel_id,
+            user_id=user_id,
             auto_trigger_wf12=True,
         )
         await _discord_adapter.send_text_message(
@@ -1364,18 +1607,18 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
 
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
-    script_json = job.get("script_json") or {}
+    script_json = _as_script_json(job.get("script_json"))
     script_text = script_json.get("script_text") or script_json.get("script", "")
     if not script_text:
         raise HTTPException(status_code=400, detail="No script_text found in resolved job")
 
     await job_service.transition_status(resolved_job_id, "APPROVED")
     try:
-        await n8n_service.call_wf11_tts_generate(
-            resolved_job_id,
-            script_text,
-            channel_id,
-            user_id,
+        _spawn_tts_generation(
+            job_id=resolved_job_id,
+            script_text=script_text,
+            channel_id=channel_id,
+            user_id=user_id,
             auto_trigger_wf12=False,
         )
     except Exception as e:

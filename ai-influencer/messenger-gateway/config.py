@@ -13,6 +13,8 @@ class Settings(BaseSettings):
 
     discord_bot_token: str = ""
     discord_allowed_channel_ids: str = ""
+    openai_api_key: str = ""
+    script_rewrite_model: str = "gpt-5.4-mini"
 
     n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/wf-01-input"
     n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/wf-05-confirm"
@@ -23,6 +25,15 @@ class Settings(BaseSettings):
 
     notebooklm_service_url: str = "http://notebooklm-service:8090"
     topic_channels: str = ""
+    tts_api_url: str = ""
+    tts_ref_audio_path: str = ""
+    tts_prompt_text: str = ""
+    tts_text_lang: str = "ko"
+    tts_prompt_lang: str = "ko"
+    tts_top_k: int = 20
+    tts_sample_steps: int = 32
+    tts_super_sampling: bool = True
+    tts_fragment_interval: float = 0.4
 
     # Cross-account S3 (AssumeRole)
     media_s3_bucket: str = ""
@@ -30,6 +41,9 @@ class Settings(BaseSettings):
     media_s3_role_arn: str = ""
     media_s3_external_id: str = ""
     media_s3_role_session_name: str = "ai-influencer-media-session"
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_session_token: str = ""
     media_presign_expires_seconds: int = 86400
     media_max_discord_file_bytes: int = 10 * 1024 * 1024
     media_s3_prefix_reports: str = "reports"

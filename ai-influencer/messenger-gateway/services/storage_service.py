@@ -35,14 +35,40 @@ def _normalize_prefix(prefix: str) -> str:
 def _validate_settings() -> None:
     if not settings.media_s3_bucket:
         raise RuntimeError("MEDIA_S3_BUCKET is required")
-    if not settings.media_s3_role_arn:
-        raise RuntimeError("MEDIA_S3_ROLE_ARN is required")
+
+
+def _static_credentials() -> dict:
+    access_key = (settings.aws_access_key_id or "").strip()
+    secret_key = (settings.aws_secret_access_key or "").strip()
+    session_token = (settings.aws_session_token or "").strip()
+    if not access_key or not secret_key:
+        return {}
+
+    creds = {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
+    if session_token:
+        creds["aws_session_token"] = session_token
+    return creds
+
+
+def _should_assume_role() -> bool:
+    role_arn = (settings.media_s3_role_arn or "").strip()
+    if not role_arn:
+        return False
+    if ":role/" not in role_arn:
+        logger.warning("[storage] MEDIA_S3_ROLE_ARN is not an IAM role ARN, falling back to direct credentials")
+        return False
+    return True
 
 
 def _assume_role_credentials() -> dict:
     global _cached_credentials, _cached_credentials_expires_at
 
     _validate_settings()
+    if not _should_assume_role():
+        raise RuntimeError("MEDIA_S3_ROLE_ARN must be a valid IAM role ARN for AssumeRole")
     now = datetime.utcnow()
     if (
         _cached_credentials is not None
@@ -51,7 +77,12 @@ def _assume_role_credentials() -> dict:
     ):
         return _cached_credentials
 
-    sts = boto3.client("sts", region_name=settings.media_s3_region, config=_BOTO_RETRY_CONFIG)
+    sts = boto3.client(
+        "sts",
+        region_name=settings.media_s3_region,
+        config=_BOTO_RETRY_CONFIG,
+        **_static_credentials(),
+    )
     assume_kwargs = {
         "RoleArn": settings.media_s3_role_arn,
         "RoleSessionName": settings.media_s3_role_session_name,
@@ -73,7 +104,8 @@ def _assume_role_credentials() -> dict:
 
 def _get_s3_client():
     global _s3_client, _s3_client_access_key_id
-    creds = _assume_role_credentials()
+    _validate_settings()
+    creds = _assume_role_credentials() if _should_assume_role() else _static_credentials()
     access_key_id = creds.get("aws_access_key_id")
     if _s3_client is None or _s3_client_access_key_id != access_key_id:
         _s3_client = boto3.client(
