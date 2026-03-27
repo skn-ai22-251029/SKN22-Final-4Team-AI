@@ -148,7 +148,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, job_id: $('RunPod TTS + Save WAV').item.json.job_id, audio_content_b64: $('RunPod TTS + Save WAV').item.json.audio_content_b64, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, filename: $('RunPod TTS + Save WAV').item.json.filename, caption: '🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행됩니다.', include_wf12_button: true }) }}",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, job_id: $('RunPod TTS + Save WAV').item.json.job_id, audio_content_b64: $('RunPod TTS + Save WAV').item.json.audio_content_b64, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, filename: $('RunPod TTS + Save WAV').item.json.filename, caption: ($('RunPod TTS + Save WAV').item.json.auto_trigger_wf12 ? '🔊 TTS 완료. 영상 제작 모드로 WF-12(HeyGen)를 자동 실행합니다.' : '🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행됩니다.'), include_wf12_button: (!$('RunPod TTS + Save WAV').item.json.auto_trigger_wf12) }) }}",
         "options": {}
       },
       "id": "wf11-http-send-audio",

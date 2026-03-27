@@ -470,6 +470,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     # video_reject_step: video_reject_step:{job_id}:{step}
     # tts_approve:       tts_approve:{job_id}
     # tts_reject:        tts_reject:{job_id}
+    # report_to_tts:     report_to_tts:{job_id}
+    # report_to_video:   report_to_video:{job_id}
     # select_report:     select_report:{job_id}:{channel_id}:{index}
     # new_report:        new_report:{job_id}:{channel_id}
     # select_channel:    select_channel:{job_id}:{channel_id}
@@ -571,6 +573,17 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 "/internal/report-to-video",
                 {"job_id": job_id},
             )
+            await interaction.followup.send("🎬 영상 제작 모드 시작: TTS 후 WF-12까지 자동 진행됩니다.", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "report_to_tts":
+        try:
+            await gateway_call(
+                "/internal/report-to-tts",
+                {"job_id": job_id},
+            )
+            await interaction.followup.send("🔊 TTS 제작을 시작합니다. 완료 후 승인/반려를 선택하세요.", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 

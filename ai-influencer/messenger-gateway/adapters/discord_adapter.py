@@ -310,24 +310,32 @@ class DiscordAdapter(MessengerAdapter):
         text: str,
         file_bytes: bytes,
         filename: str,
+        include_tts_button: bool = False,
         include_video_button: bool = False,
         job_id: str = "",
     ) -> None:
         components = []
-        if include_video_button and job_id:
-            components = [
+        action_buttons = []
+        if include_tts_button and job_id:
+            action_buttons.append(
                 {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "🎬 영상으로 제작",
-                            "style": 1,
-                            "custom_id": f"report_to_video:{job_id}",
-                        }
-                    ],
+                    "type": 2,
+                    "label": "🔊 TTS만 제작",
+                    "style": 2,
+                    "custom_id": f"report_to_tts:{job_id}",
                 }
-            ]
+            )
+        if include_video_button and job_id:
+            action_buttons.append(
+                {
+                    "type": 2,
+                    "label": "🎬 영상으로 제작",
+                    "style": 1,
+                    "custom_id": f"report_to_video:{job_id}",
+                }
+            )
+        if action_buttons:
+            components = [{"type": 1, "components": action_buttons}]
         payload_json = json.dumps({"content": text, "components": components})
         content_type = "text/plain" if filename.lower().endswith(".txt") else "text/markdown"
         resp = await self._client.post(
@@ -344,6 +352,7 @@ class DiscordAdapter(MessengerAdapter):
         channel_id: str,
         text: str,
         report_url: str,
+        include_tts_button: bool = False,
         include_video_button: bool = False,
         job_id: str = "",
     ) -> str:
@@ -354,20 +363,27 @@ class DiscordAdapter(MessengerAdapter):
             prefix = prefix[:max_prefix_len]
         content = f"{prefix}{suffix}"
         components = []
-        if include_video_button and job_id:
-            components = [
+        action_buttons = []
+        if include_tts_button and job_id:
+            action_buttons.append(
                 {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "🎬 영상으로 제작",
-                            "style": 1,
-                            "custom_id": f"report_to_video:{job_id}",
-                        }
-                    ],
+                    "type": 2,
+                    "label": "🔊 TTS만 제작",
+                    "style": 2,
+                    "custom_id": f"report_to_tts:{job_id}",
                 }
-            ]
+            )
+        if include_video_button and job_id:
+            action_buttons.append(
+                {
+                    "type": 2,
+                    "label": "🎬 영상으로 제작",
+                    "style": 1,
+                    "custom_id": f"report_to_video:{job_id}",
+                }
+            )
+        if action_buttons:
+            components = [{"type": 1, "components": action_buttons}]
         payload = {"content": content, "components": components}
         resp = await self._client.post(
             f"{BASE_URL}/channels/{channel_id}/messages",

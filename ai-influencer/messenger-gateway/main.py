@@ -24,6 +24,7 @@ from models.job import (
     MessengerSource,
     ReportMessageRequest,
     ReportSelectRequest,
+    ReportToTtsRequest,
     ReportToVideoRequest,
     SendAudioRequest,
     SendConfirmRequest,
@@ -799,6 +800,7 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
                 text=text,
                 file_bytes=file_bytes,
                 filename=filename,
+                include_tts_button=True,
                 include_video_button=True,
                 job_id=body.job_id,
             )
@@ -887,6 +889,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
                 channel_id=body.messenger_channel_id,
                 text=text,
                 report_url=stored.presigned_url,
+                include_tts_button=body.include_tts_button,
                 include_video_button=body.include_video_button,
                 job_id=body.job_id,
             )
@@ -900,6 +903,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
                 text=text,
                 file_bytes=file_bytes,
                 filename=filename,
+                include_tts_button=body.include_tts_button,
                 include_video_button=body.include_video_button,
                 job_id=body.job_id,
             )
@@ -929,7 +933,7 @@ async def send_text(_: AuthDep, body: SendTextRequest) -> dict:
 
 @app.post("/internal/send-audio")
 async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
-    """WF-11에서 호출 — Discord로 TTS 완료본(WAV + 승인/반려 버튼) 전송."""
+    """WF-11에서 호출 — Discord로 TTS 완료본 전송(분기별 승인/반려 버튼 선택 노출)."""
     if not body.audio_content_b64:
         raise HTTPException(status_code=400, detail="audio_content_b64 is required")
     try:
@@ -1207,9 +1211,9 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
     raise HTTPException(status_code=400, detail=f"Unknown action: {body.action}")
 
 
-@app.post("/internal/report-to-video")
-async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
-    """/report 결과의 '영상으로 제작' 버튼 클릭 처리 — WF-11(TTS) 직접 트리거."""
+@app.post("/internal/report-to-tts")
+async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
+    """/report 결과의 'TTS만 제작' 버튼 클릭 처리 — WF-11(TTS)만 트리거."""
     job = await job_service.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1237,11 +1241,48 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
             "🔊 TTS 생성을 시작합니다. 완료본 확인 후 승인하면 WF-12(HeyGen)로 진행됩니다.",
         )
     except Exception as e:
+        logger.error("call_wf11 (report_to_tts) failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.info("[discord] report_to_tts triggered job_id=%s", body.job_id)
+    return {"job_id": body.job_id, "status": "triggered", "mode": "tts-only"}
+
+
+@app.post("/internal/report-to-video")
+async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
+    """/report 결과의 '영상으로 제작' 버튼 클릭 처리 — WF-11 후 WF-12 자동 트리거."""
+    job = await job_service.get_job(body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    script_json = job.get("script_json") or {}
+    script_text = script_json.get("script_text") or script_json.get("script", "")
+    if not script_text:
+        raise HTTPException(status_code=400, detail="No script found in job")
+
+    channel_id = job["messenger_channel_id"]
+    user_id = job["messenger_user_id"]
+
+    await job_service.transition_status(body.job_id, "APPROVED")
+
+    try:
+        await n8n_service.call_wf11_tts_generate(
+            body.job_id,
+            script_text,
+            channel_id,
+            user_id,
+            auto_trigger_wf12=True,
+        )
+        await _discord_adapter.send_text_message(
+            channel_id,
+            "🎬 영상 제작 모드로 진행합니다. TTS 생성 후 WF-12(HeyGen)까지 자동 실행됩니다.",
+        )
+    except Exception as e:
         logger.error("call_wf11 (report_to_video) failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
     logger.info("[discord] report_to_video triggered job_id=%s", body.job_id)
-    return {"job_id": body.job_id, "status": "triggered"}
+    return {"job_id": body.job_id, "status": "triggered", "mode": "video-auto"}
 
 
 @app.post("/internal/tts-generate")

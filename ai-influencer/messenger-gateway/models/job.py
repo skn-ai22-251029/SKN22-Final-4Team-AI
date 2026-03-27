@@ -72,6 +72,7 @@ class SendReportRequest(BaseModel):
     report_content: str
     file_content_b64: str
     filename: str
+    include_tts_button: bool = False
     include_video_button: bool = False
     file_url: str = ""
 
@@ -108,6 +109,10 @@ class VideoActionRequest(BaseModel):
 
 
 class ReportToVideoRequest(BaseModel):
+    job_id: str
+
+
+class ReportToTtsRequest(BaseModel):
     job_id: str
 
 

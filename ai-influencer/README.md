@@ -102,8 +102,13 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
           → notebooklm-service /generate
           → /internal/send-report
           → Discord 전송 + jobs.script_json.script_text 저장
-  → [🎬 영상 제작] 버튼 클릭
-  → /internal/report-to-video → WF-11
+  → 보고서 메시지 버튼 분기
+      ├─ [🔊 TTS만 제작]
+      │   → /internal/report-to-tts
+      │   → WF-11 (auto_trigger_wf12=false, TTS 승인/반려 버튼 유지)
+      └─ [🎬 영상으로 제작]
+          → /internal/report-to-video
+          → WF-11 (auto_trigger_wf12=true) → WF-12 자동 진행
 ```
 
 ### `/jobs [purpose]`
@@ -154,7 +159,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 - 파일 크기 ≤ 10MB: Discord 파일 첨부 전송
 - 파일 크기 > 10MB: Discord 텍스트 메시지로 Presigned URL 전송(기본 24시간)
 - 링크 전송 메시지에서도 기존 버튼 UX를 유지
-  - 보고서: `[🎬 영상으로 제작]`
+  - 보고서: `[🔊 TTS만 제작]`, `[🎬 영상으로 제작]`
   - TTS: `[✅ 승인 (WF-12 진행)] [❌ 반려]`
 
 ### 필수 환경변수
@@ -259,7 +264,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 [notebooklm-service /generate 호출]
       │
       ├─[성공]──→ [gateway /internal/send-report 호출]
-      │           → Discord에 보고서 텍스트 + [🎬 영상 제작] 버튼 전송
+      │           → Discord에 보고서 텍스트 + [🔊 TTS만 제작] [🎬 영상으로 제작] 버튼 전송
       │
       └─[실패]──→ [gateway /internal/send-text 호출]
                   → Discord에 오류 메시지 전송
@@ -270,7 +275,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 ### WF-11: TTS 생성 + Discord 공유
 
 ```
-[Webhook 수신] ← WF-05 승인 / report_to_video / 재생성
+[Webhook 수신] ← WF-05 승인 / report_to_tts / report_to_video / 재생성
       │
       ▼
 [요청 파싱] job_id, script_text, auto_trigger_wf12
@@ -283,7 +288,9 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
       │
       ▼
 [gateway /internal/send-audio 호출]
-→ Discord에 WAV + [✅ 승인(WF-12)] [❌ 반려] 버튼 전송
+→ Discord에 WAV 전송
+    ├─ auto_trigger_wf12=false: [✅ 승인(WF-12)] [❌ 반려] 버튼 전송
+    └─ auto_trigger_wf12=true : 승인 버튼 없이 안내 후 WF-12 자동 진행
       │
       ▼
 [DB 업데이트] status=APPROVED, audio_url 저장
@@ -870,6 +877,7 @@ python register_command.py \
 | `POST` | `/internal/report-select` | discord-bot | 보고서 선택 또는 새로 생성 |
 | `POST` | `/internal/send-report` | n8n WF-06 | 보고서 텍스트 전송 |
 | `POST` | `/internal/auto-report` | n8n WF-09 | 소스 추가 성공 시 자동 WF-06 생성/전송 트리거 |
+| `POST` | `/internal/report-to-tts` | discord-bot | 보고서 → TTS만 제작 요청 |
 | `POST` | `/internal/report-to-video` | discord-bot | 보고서 → 영상 제작 요청 |
 | `POST` | `/internal/tts-generate` | discord-bot | `/tts [job_id]` 수동 WF-11 실행 (미입력 시 최근 job 자동 선택) |
 | `POST` | `/internal/heygen-generate` | discord-bot | `/heygen [job_id]` 수동 WF-12 실행 (미입력 시 최근 job 자동 선택) |
@@ -904,7 +912,8 @@ python register_command.py \
 2. 채널 버튼 클릭 → 해당 채널의 보고서 목록 표시
    (목록 조회 실패/지연 시 `[🔄 다시 조회] / [🆕 새로 생성]` 버튼 표시)
 3. 보고서 선택 또는 [새로 생성] → 보고서 텍스트 수신
-4. `[🎬 영상 제작]` 버튼 클릭 → WF-11 실행 (승인 후 WF-12, 최종 승인 시 WF-08)
+4. `[🔊 TTS만 제작]` 버튼 클릭 → WF-11 실행 (TTS 승인/반려 버튼 노출)
+5. `[🎬 영상으로 제작]` 버튼 클릭 → WF-11 실행 후 WF-12 자동 진행
 
 ### 수동 TTS / HeyGen 실행
 
@@ -923,6 +932,30 @@ python register_command.py \
 
 > Discord에서 옵션이 여전히 `필수`로 보이면, 봇 재배포 후 슬래시 명령 재동기화가 필요합니다.  
 > `DISCORD_GUILD_ID`를 설정하면 길드 단위로 즉시 동기화됩니다.
+
+### 대본→TTS→S3 저장 검증 (운영 E2E)
+
+아래 스크립트로 특정 `job_id`의 WF-11 경로를 한 번에 검증할 수 있습니다.
+
+```bash
+cd ai-influencer
+./scripts/verify_tts_to_s3.sh <job_id> --since 60m
+```
+
+검증 항목:
+- gateway 로그에서 `/internal/send-audio` 완료 여부
+- DB `jobs`에서 `script_text` 길이, `audio_url(s3://...)`, `media_names.audio_filename`
+- `audio_url`이 가리키는 S3 객체 `HEAD` 성공(크기 > 0)
+
+PASS 기준:
+- `send_audio done job_id=<job_id>`
+- `audio_url = s3://<bucket>/tts/YYYYMMDD-<job_id>.wav`
+- S3 HEAD 성공
+
+실패 시 우선 점검:
+- `MEDIA_S3_ROLE_ARN`, `MEDIA_S3_BUCKET`, `MEDIA_S3_REGION`, `MEDIA_S3_EXTERNAL_ID`
+- 타겟 계정 IAM Trust/Permission(`sts:AssumeRole`, `s3:PutObject/GetObject`)
+- n8n WF-11 최신 워크플로 재임포트/재기동 여부
 
 ### 자동 수집 확인
 

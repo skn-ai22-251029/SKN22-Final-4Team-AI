@@ -127,7 +127,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ messenger_source: $('Extract Fields').item.json.messenger_source, messenger_channel_id: $('Extract Fields').item.json.messenger_channel_id, job_id: $('Extract Fields').item.json.job_id, report_content: $('Call NotebookLM Service').item.json.report_content, file_content_b64: $('Call NotebookLM Service').item.json.file_content_b64, filename: $('Call NotebookLM Service').item.json.filename, include_video_button: true }) }}",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: $('Extract Fields').item.json.messenger_source, messenger_channel_id: $('Extract Fields').item.json.messenger_channel_id, job_id: $('Extract Fields').item.json.job_id, report_content: $('Call NotebookLM Service').item.json.report_content, file_content_b64: $('Call NotebookLM Service').item.json.file_content_b64, filename: $('Call NotebookLM Service').item.json.filename, include_tts_button: true, include_video_button: true }) }}",
         "options": {}
       },
       "id": "wf06-http-send-report",
