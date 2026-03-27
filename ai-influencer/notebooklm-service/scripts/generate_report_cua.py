@@ -466,6 +466,83 @@ def _get_studio_panel_anchor(page) -> dict:
     return fallback
 
 
+def _ensure_studio_panel_visible(page) -> None:
+    """Studio 패널/탭이 닫혀 있으면 가능한 셀렉터로 열기를 시도한다."""
+    try:
+        body_text = page.inner_text("body")
+        existing_titles = _parse_report_titles(body_text)
+        if existing_titles:
+            logger.info("[list_reports] Studio 패널 내 제목이 이미 보임: %d개", len(existing_titles))
+            return
+        if "Studio" in body_text or "스튜디오" in body_text:
+            logger.info("[list_reports] body text에 Studio 섹션 존재")
+            return
+    except Exception as e:
+        logger.warning("[list_reports] Studio 패널 사전 확인 실패: %s", e)
+
+    selectors = [
+        "[role='tab'][aria-label*='Studio']",
+        "[role='tab'][aria-label*='스튜디오']",
+        "button[aria-label*='Studio']",
+        "button[aria-label*='스튜디오']",
+        "text=Studio",
+        "text=스튜디오",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if not locator.is_visible(timeout=1000):
+                continue
+            locator.click(timeout=2000)
+            logger.info("[list_reports] Studio 탭 열기 시도: %s", selector)
+            time.sleep(1.0)
+            return
+        except Exception:
+            continue
+
+
+def _collect_titles_via_dom_scan(page, max_rounds: int = 4) -> list[str]:
+    """Studio 패널을 몇 차례 스캔하며 body text parser로 제목을 수집한다."""
+    panel_anchor = _get_studio_panel_anchor(page)
+    seen = set()
+    collected: list[str] = []
+    no_new_rounds = 0
+
+    for round_idx in range(max_rounds):
+        try:
+            body_text = page.inner_text("body")
+        except Exception as e:
+            logger.warning("[list_reports] DOM 스캔 body 읽기 실패(round=%d): %s", round_idx + 1, e)
+            break
+
+        titles = _parse_report_titles(body_text)
+        before = len(collected)
+        for title in titles:
+            if title not in seen:
+                seen.add(title)
+                collected.append(title)
+
+        added = len(collected) - before
+        logger.info(
+            "[list_reports] DOM 스캔 round=%d/%d added=%d total=%d",
+            round_idx + 1,
+            max_rounds,
+            added,
+            len(collected),
+        )
+        if added == 0:
+            no_new_rounds += 1
+        else:
+            no_new_rounds = 0
+
+        if no_new_rounds >= 2:
+            break
+        if round_idx < max_rounds - 1:
+            _execute_list_action(page, {"action": "scroll", "delta_y": 640}, panel_anchor)
+
+    return collected
+
+
 def _run_cua_loop(
     page,
     client,
@@ -836,6 +913,12 @@ def list_reports(page, notebook_url: str) -> list[str]:
 
     _ensure_logged_in(page)
     time.sleep(2)
+    _ensure_studio_panel_visible(page)
+
+    dom_titles = _collect_titles_via_dom_scan(page, max_rounds=4)
+    if dom_titles:
+        logger.info("[list_reports] DOM 스캔 목록 수집 성공: %d개", len(dom_titles))
+        return dom_titles
 
     client = _build_openai_client()
     task = (
@@ -901,6 +984,11 @@ def list_reports(page, notebook_url: str) -> list[str]:
         cua_loop_error[:120],
     )
     try:
+        _ensure_studio_panel_visible(page)
+        dom_titles = _collect_titles_via_dom_scan(page, max_rounds=3)
+        if dom_titles:
+            logger.warning("[list_reports] CUA 이후 DOM 스캔 경로로 목록 반환됨")
+            return dom_titles
         body_text = page.inner_text("body")
         fallback_titles = _parse_report_titles(body_text)
         logger.info("[list_reports] fallback 목록 수집 결과: %d개", len(fallback_titles))
@@ -908,6 +996,9 @@ def list_reports(page, notebook_url: str) -> list[str]:
             logger.warning("[list_reports] fallback parser 경로로 목록 반환됨")
             return fallback_titles
         if cua_loop_error:
+            if "step limit" in cua_loop_error.lower():
+                logger.warning("[list_reports] step limit 도달 + DOM/Fallback 빈결과 — 빈 목록으로 처리")
+                return []
             raise RuntimeError(f"CUA list loop failed: {cua_loop_error}")
         if bool(cua_meta.get("empty_result_accepted")):
             logger.info("[list_reports] CUA 빈목록 승인 조건 충족 — 빈 배열 반환")
@@ -919,7 +1010,8 @@ def list_reports(page, notebook_url: str) -> list[str]:
         if int(cua_meta.get("model_errors") or 0) >= 4:
             raise RuntimeError("CUA list loop failed: repeated model call errors")
         if not bool(cua_meta.get("done")) and int(cua_meta.get("steps") or 0) >= list_max_steps:
-            raise RuntimeError("CUA list loop reached step limit without stable result")
+            logger.warning("[list_reports] max_steps 종료 + DOM/Fallback 빈결과 — 빈 목록으로 처리")
+            return []
         raise RuntimeError(
             "CUA list loop did not gather titles and empty-result acceptance criteria were not met"
         )
@@ -941,9 +1033,12 @@ def get_existing_report(page, notebook_url: str, report_index: int, output_path:
 
     _ensure_logged_in(page)
     time.sleep(2)
+    _ensure_studio_panel_visible(page)
 
     # 타일 목록 파싱 (제목 확인용, navigate 없음)
-    titles = _parse_report_titles(page.inner_text("body"))
+    titles = _collect_titles_via_dom_scan(page, max_rounds=3)
+    if not titles:
+        titles = _parse_report_titles(page.inner_text("body"))
     if not titles:
         raise RuntimeError("보고서 목록이 비어 있습니다.")
     if report_index >= len(titles):
