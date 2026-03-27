@@ -73,6 +73,7 @@ class SendReportRequest(BaseModel):
     file_content_b64: str
     filename: str
     include_video_button: bool = False
+    file_url: str = ""
 
 
 class SendVideoPreviewRequest(BaseModel):
@@ -92,6 +93,7 @@ class SendAudioRequest(BaseModel):
     filename: str
     caption: str = ""
     include_wf12_button: bool = True
+    audio_url: str = ""
 
 
 class TtsActionRequest(BaseModel):

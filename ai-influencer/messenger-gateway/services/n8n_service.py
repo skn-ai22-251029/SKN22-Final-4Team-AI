@@ -123,6 +123,8 @@ async def call_wf08_sns_upload(
     channel_id: str,
     video_filename: str = "",
 ) -> None:
+    if not video_url:
+        raise ValueError("video_url is required for WF-08 upload")
     payload = {
         "job_id": job_id,
         "video_url": video_url,

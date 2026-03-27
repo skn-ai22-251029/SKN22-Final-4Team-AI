@@ -339,6 +339,47 @@ class DiscordAdapter(MessengerAdapter):
         resp.raise_for_status()
         logger.info("[discord] send_file_message channel=%s filename=%s", channel_id, filename)
 
+    async def send_report_link_message(
+        self,
+        channel_id: str,
+        text: str,
+        report_url: str,
+        include_video_button: bool = False,
+        job_id: str = "",
+    ) -> str:
+        prefix = (text or "").strip() or "📄 보고서 생성이 완료되었습니다."
+        suffix = f"\n\n📎 보고서 링크(24시간 유효):\n{report_url}"
+        max_prefix_len = max(0, 1900 - len(suffix))
+        if len(prefix) > max_prefix_len:
+            prefix = prefix[:max_prefix_len]
+        content = f"{prefix}{suffix}"
+        components = []
+        if include_video_button and job_id:
+            components = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "label": "🎬 영상으로 제작",
+                            "style": 1,
+                            "custom_id": f"report_to_video:{job_id}",
+                        }
+                    ],
+                }
+            ]
+        payload = {"content": content, "components": components}
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        logger.info("[discord] send_report_link_message channel=%s message_id=%s", channel_id, message_id)
+        return message_id
+
     async def send_tts_audio_message(
         self,
         channel_id: str,
@@ -386,3 +427,50 @@ class DiscordAdapter(MessengerAdapter):
             attachment_url = str(attachments[0].get("url") or "")
         logger.info("[discord] send_tts_audio_message job=%s message_id=%s", job_id, message_id)
         return message_id, attachment_url
+
+    async def send_tts_link_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        caption: str,
+        audio_url: str,
+        include_wf12_button: bool = True,
+    ) -> str:
+        components = []
+        if include_wf12_button:
+            components = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "label": "✅ 승인 (WF-12 진행)",
+                            "style": 3,
+                            "custom_id": f"tts_approve:{job_id}",
+                        },
+                        {
+                            "type": 2,
+                            "label": "❌ 반려",
+                            "style": 4,
+                            "custom_id": f"tts_reject:{job_id}",
+                        },
+                    ],
+                }
+            ]
+        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+        suffix = f"\n\n📎 TTS 링크(24시간 유효):\n{audio_url}"
+        max_prefix_len = max(0, 1900 - len(suffix))
+        if len(prefix) > max_prefix_len:
+            prefix = prefix[:max_prefix_len]
+        content = f"{prefix}{suffix}"
+        payload = {"content": content, "components": components}
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        logger.info("[discord] send_tts_link_message job=%s message_id=%s", job_id, message_id)
+        return message_id

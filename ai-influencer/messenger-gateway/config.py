@@ -24,6 +24,18 @@ class Settings(BaseSettings):
     notebooklm_service_url: str = "http://notebooklm-service:8090"
     topic_channels: str = ""
 
+    # Cross-account S3 (AssumeRole)
+    media_s3_bucket: str = ""
+    media_s3_region: str = "ap-northeast-2"
+    media_s3_role_arn: str = ""
+    media_s3_external_id: str = ""
+    media_s3_role_session_name: str = "ai-influencer-media-session"
+    media_presign_expires_seconds: int = 86400
+    media_max_discord_file_bytes: int = 10 * 1024 * 1024
+    media_s3_prefix_reports: str = "reports"
+    media_s3_prefix_tts: str = "tts"
+    media_s3_prefix_videos: str = "videos"
+
     class Config:
         env_file = ".env"
         case_sensitive = False

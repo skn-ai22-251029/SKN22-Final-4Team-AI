@@ -142,6 +142,45 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 ---
 
+## 교차 계정 S3 저장 전략
+
+- 저장 대상: 대본(`.txt`), TTS(`.wav`), 영상(`.mp4`)
+- 저장 위치: **다른 AWS 계정의 S3 버킷**
+- 접근 방식: **AssumeRole + 비공개 버킷 + Presigned URL**
+- 객체 키: `reports/`, `tts/`, `videos/` prefix + `YYYYMMDD-{job_id}.{ext}`
+
+### Discord 전송 정책
+
+- 파일 크기 ≤ 10MB: Discord 파일 첨부 전송
+- 파일 크기 > 10MB: Discord 텍스트 메시지로 Presigned URL 전송(기본 24시간)
+- 링크 전송 메시지에서도 기존 버튼 UX를 유지
+  - 보고서: `[🎬 영상으로 제작]`
+  - TTS: `[✅ 승인 (WF-12 진행)] [❌ 반려]`
+
+### 필수 환경변수
+
+| 변수 | 설명 |
+|------|------|
+| `MEDIA_S3_BUCKET` | 타겟 S3 버킷명(타 AWS 계정) |
+| `MEDIA_S3_REGION` | S3 리전 |
+| `MEDIA_S3_ROLE_ARN` | 타겟 계정에서 AssumeRole 할 IAM Role ARN |
+| `MEDIA_S3_EXTERNAL_ID` | (선택) 외부 ID |
+| `MEDIA_S3_ROLE_SESSION_NAME` | STS 세션명 |
+| `MEDIA_PRESIGN_EXPIRES_SECONDS` | Presigned URL 만료(기본 86400) |
+| `MEDIA_MAX_DISCORD_FILE_BYTES` | 첨부 임계치(기본 10485760, 10MB) |
+| `MEDIA_S3_PREFIX_REPORTS` | 대본 prefix (기본 `reports`) |
+| `MEDIA_S3_PREFIX_TTS` | TTS prefix (기본 `tts`) |
+| `MEDIA_S3_PREFIX_VIDEOS` | 영상 prefix (기본 `videos`) |
+
+### AWS IAM 설정 요약 (교차 계정)
+
+1. **타겟 계정(S3 보유)**에 업로드 전용 Role 생성 (예: `AiInfluencerMediaWriterRole`)
+2. Trust policy에서 소스 계정의 실행 Role(EC2/ECS)을 Principal로 허용
+3. 권한은 버킷 전체가 아닌 `reports/*`, `tts/*`, `videos/*` prefix로 최소권한 부여
+4. 소스 계정 실행 Role에 `sts:AssumeRole` 권한 추가
+
+---
+
 ## 워크플로 상세 흐름
 
 ### WF-01: 콘텐츠 생성 요청 수신

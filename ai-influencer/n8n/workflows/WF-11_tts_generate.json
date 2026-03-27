@@ -163,7 +163,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='APPROVED', audio_url='{{ $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('audio_filename', '{{ $('RunPod TTS + Save WAV').item.json.filename }}')), updated_at=NOW() WHERE id='{{ $('RunPod TTS + Save WAV').item.json.job_id }}'",
+        "query": "UPDATE jobs SET status='APPROVED', audio_url='{{ $('Send TTS Audio to Gateway').item.json.s3_uri || $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('audio_filename', '{{ $('RunPod TTS + Save WAV').item.json.filename }}')), updated_at=NOW() WHERE id='{{ $('RunPod TTS + Save WAV').item.json.job_id }}'",
         "options": {}
       },
       "id": "wf11-pg-save-audio",
@@ -229,7 +229,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, audio_url: $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }) }}",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_file_path: '', audio_url: $('Send TTS Audio to Gateway').item.json.audio_url }) }}",
         "options": {}
       },
       "id": "wf11-http-trigger-wf12",

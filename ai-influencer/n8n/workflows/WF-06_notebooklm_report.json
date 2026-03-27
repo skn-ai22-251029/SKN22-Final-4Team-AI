@@ -103,7 +103,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='PUBLISHED', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
+        "query": "UPDATE jobs SET status='PUBLISHED', final_url='{{ $('Send Report to Gateway').item.json.s3_uri || '' }}', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
         "options": {}
       },
       "id": "wf06-pg-published",
@@ -188,12 +188,12 @@
     },
     "IF Success": {
       "main": [
-        [{"node": "Update to PUBLISHED", "type": "main", "index": 0}],
+        [{"node": "Send Report to Gateway", "type": "main", "index": 0}],
         [{"node": "Update to FAILED", "type": "main", "index": 0}]
       ]
     },
-    "Update to PUBLISHED": {
-      "main": [[{"node": "Send Report to Gateway", "type": "main", "index": 0}]]
+    "Send Report to Gateway": {
+      "main": [[{"node": "Update to PUBLISHED", "type": "main", "index": 0}]]
     },
     "Update to FAILED": {
       "main": [[{"node": "Send Error to Gateway", "type": "main", "index": 0}]]

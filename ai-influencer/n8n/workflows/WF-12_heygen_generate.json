@@ -136,7 +136,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='WAITING_VIDEO_APPROVAL', video_url='{{ $('HeyGen Create + Poll').item.json.video_url }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('video_filename', '{{ $('HeyGen Create + Poll').item.json.video_filename }}')), updated_at=NOW() WHERE id='{{ $('HeyGen Create + Poll').item.json.job_id }}'",
+        "query": "UPDATE jobs SET status='WAITING_VIDEO_APPROVAL', video_url='{{ $('Send Video Preview').item.json.s3_uri || $('HeyGen Create + Poll').item.json.video_url }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('video_filename', '{{ $('HeyGen Create + Poll').item.json.video_filename }}')), updated_at=NOW() WHERE id='{{ $('HeyGen Create + Poll').item.json.job_id }}'",
         "options": {}
       },
       "id": "wf12-pg-waiting",
@@ -279,7 +279,7 @@
       "main": [
         [
           {
-            "node": "Set WAITING_VIDEO_APPROVAL",
+            "node": "Send Video Preview",
             "type": "main",
             "index": 0
           }
@@ -294,10 +294,13 @@
       ]
     },
     "Set WAITING_VIDEO_APPROVAL": {
+      "main": []
+    },
+    "Send Video Preview": {
       "main": [
         [
           {
-            "node": "Send Video Preview",
+            "node": "Set WAITING_VIDEO_APPROVAL",
             "type": "main",
             "index": 0
           }

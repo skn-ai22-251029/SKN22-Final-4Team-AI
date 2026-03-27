@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from adapters.discord_adapter import DiscordAdapter
 from config import settings
 from utils.file_naming import build_filename
+from services.storage_service import presign_s3_uri, put_bytes_and_presign
 from models.job import (
     AutoReportRequest,
     ChannelSelectRequest,
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 # 싱글턴 어댑터 및 httpx 클라이언트
 _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
+_DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 
 _REPORT_SYSTEM_PROMPT = (
     "[중요] 대사 외 다른 표기는 절대 넣지 않는다.(예시: \"[오프닝]\") "
@@ -164,6 +166,13 @@ def _merge_script_json_with_media_names(
     if media_names:
         merged["media_names"] = media_names
     return merged
+
+
+def _discord_attachment_limit_bytes() -> int:
+    limit = settings.media_max_discord_file_bytes
+    if limit <= 0:
+        return _DISCORD_ATTACHMENT_LIMIT_BYTES
+    return limit
 
 
 def _normalize_manual_job_id(job_id: str) -> str:
@@ -823,21 +832,41 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
 @app.post("/internal/send-report")
 async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     """n8n WF-06에서 호출 — Discord로 보고서 파일을 전송한다."""
-    try:
-        file_bytes = base64.b64decode(body.file_content_b64)
-    except Exception as e:
-        logger.error("[discord] base64 decode failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=400, detail=f"Invalid file_content_b64: {e}")
-
     existing_job = await job_service.get_job(body.job_id)
     filename = _normalize_report_filename(
         body.job_id,
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
+    if body.file_content_b64:
+        try:
+            file_bytes = base64.b64decode(body.file_content_b64)
+        except Exception as e:
+            logger.error("[discord] base64 decode failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=400, detail=f"Invalid file_content_b64: {e}")
+    else:
+        file_bytes = (body.report_content or "").encode("utf-8")
+
+    try:
+        stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_reports,
+            filename=filename,
+            content=file_bytes,
+            content_type="text/plain; charset=utf-8",
+        )
+    except Exception as e:
+        logger.error("[storage] report upload failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"Report upload failed: {e}")
+
+    is_link_only_report = stored.size_bytes > _discord_attachment_limit_bytes()
     text = body.report_content
     if len(text) > 1800:
-        text = text[:1800] + "\n\n[전체 내용은 첨부 파일 참조]"
+        overflow_hint = (
+            "[전체 내용은 아래 링크 참조]"
+            if is_link_only_report
+            else "[전체 내용은 첨부 파일 참조]"
+        )
+        text = text[:1800] + f"\n\n{overflow_hint}"
 
     report_text = (body.report_content or "").strip()
     merged_script = _merge_script_json_with_media_names(
@@ -845,26 +874,46 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         script_text=report_text if report_text else None,
         report_filename=filename,
     )
+    report_storage_url = stored.s3_uri
     await job_service.update_job(
         body.job_id,
+        final_url=report_storage_url,
         script_json=merged_script,
     )
 
-    try:
-        await _discord_adapter.send_file_message(
-            channel_id=body.messenger_channel_id,
-            text=text,
-            file_bytes=file_bytes,
-            filename=filename,
-            include_video_button=body.include_video_button,
-            job_id=body.job_id,
-        )
-    except Exception as e:
-        logger.error("[discord] send_file_message failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+    if is_link_only_report:
+        try:
+            await _discord_adapter.send_report_link_message(
+                channel_id=body.messenger_channel_id,
+                text=text,
+                report_url=stored.presigned_url,
+                include_video_button=body.include_video_button,
+                job_id=body.job_id,
+            )
+        except Exception as e:
+            logger.error("[discord] send_report_link_message failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        try:
+            await _discord_adapter.send_file_message(
+                channel_id=body.messenger_channel_id,
+                text=text,
+                file_bytes=file_bytes,
+                filename=filename,
+                include_video_button=body.include_video_button,
+                job_id=body.job_id,
+            )
+        except Exception as e:
+            logger.error("[discord] send_file_message failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
 
     logger.info("[discord] send_report done job_id=%s filename=%s", body.job_id, filename)
-    return {"status": "sent", "filename": filename}
+    return {
+        "status": "sent",
+        "filename": filename,
+        "file_url": stored.presigned_url,
+        "s3_uri": report_storage_url,
+    }
 
 
 @app.post("/internal/send-text")
@@ -881,6 +930,8 @@ async def send_text(_: AuthDep, body: SendTextRequest) -> dict:
 @app.post("/internal/send-audio")
 async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
     """WF-11에서 호출 — Discord로 TTS 완료본(WAV + 승인/반려 버튼) 전송."""
+    if not body.audio_content_b64:
+        raise HTTPException(status_code=400, detail="audio_content_b64 is required")
     try:
         audio_bytes = base64.b64decode(body.audio_content_b64)
     except Exception as e:
@@ -893,21 +944,46 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
-    caption = body.caption or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
     try:
-        message_id, attachment_url = await _discord_adapter.send_tts_audio_message(
-            channel_id=body.messenger_channel_id,
-            job_id=body.job_id,
-            caption=caption,
-            audio_bytes=audio_bytes,
+        stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_tts,
             filename=filename,
-            include_wf12_button=body.include_wf12_button,
+            content=audio_bytes,
+            content_type="audio/wav",
         )
     except Exception as e:
-        logger.error("[discord] send_tts_audio_message failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("[storage] tts upload failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"TTS upload failed: {e}")
 
-    resolved_audio_url = attachment_url or body.audio_file_path or None
+    caption = body.caption or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+    if stored.size_bytes > _discord_attachment_limit_bytes():
+        try:
+            message_id = await _discord_adapter.send_tts_link_message(
+                channel_id=body.messenger_channel_id,
+                job_id=body.job_id,
+                caption=caption,
+                audio_url=stored.presigned_url,
+                include_wf12_button=body.include_wf12_button,
+            )
+            attachment_url = stored.presigned_url
+        except Exception as e:
+            logger.error("[discord] send_tts_link_message failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        try:
+            message_id, attachment_url = await _discord_adapter.send_tts_audio_message(
+                channel_id=body.messenger_channel_id,
+                job_id=body.job_id,
+                caption=caption,
+                audio_bytes=audio_bytes,
+                filename=filename,
+                include_wf12_button=body.include_wf12_button,
+            )
+        except Exception as e:
+            logger.error("[discord] send_tts_audio_message failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    resolved_audio_url = stored.s3_uri
     merged_script = _merge_script_json_with_media_names(
         existing_job.get("script_json") if existing_job else None,
         audio_filename=filename,
@@ -916,6 +992,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         body.job_id,
         confirm_message_id=message_id,
         audio_url=resolved_audio_url,
+        final_url=stored.s3_uri,
         script_json=merged_script,
     )
     logger.info("[discord] send_audio done job_id=%s filename=%s", body.job_id, filename)
@@ -923,8 +1000,9 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         "status": "sent",
         "message_id": message_id,
         "attachment_url": attachment_url,
-        "audio_url": resolved_audio_url or "",
+        "audio_url": stored.presigned_url,
         "filename": filename,
+        "s3_uri": stored.s3_uri,
     }
 
 
@@ -942,8 +1020,14 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
         audio_url = job.get("audio_url", "")
         if not audio_url:
             raise HTTPException(status_code=400, detail="No audio_url found in job")
-        audio_file_path = audio_url if isinstance(audio_url, str) and audio_url.startswith("/") else ""
-        approved_audio_url = "" if audio_file_path else audio_url
+        audio_file_path = ""
+        approved_audio_url = audio_url
+        if isinstance(audio_url, str) and audio_url.startswith("s3://"):
+            try:
+                approved_audio_url = presign_s3_uri(audio_url)
+            except Exception as e:
+                logger.error("[storage] presign audio s3 uri failed job_id=%s: %s", body.job_id, e)
+                raise HTTPException(status_code=500, detail=f"audio presign failed: {e}")
         try:
             await n8n_service.call_wf12_heygen_generate(
                 job_id=body.job_id,
@@ -976,11 +1060,29 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         existing_job.get("script_json") if existing_job else None,
     )
     try:
+        video_resp = await _http_client.get(body.video_url, timeout=300.0)
+        video_resp.raise_for_status()
+    except Exception as e:
+        logger.error("[storage] video source download failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"Video download failed: {e}")
+
+    try:
+        stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_videos,
+            filename=normalized_video_filename,
+            content=video_resp.content,
+            content_type=video_resp.headers.get("content-type") or "video/mp4",
+        )
+    except Exception as e:
+        logger.error("[storage] video upload failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"Video upload failed: {e}")
+
+    try:
         message_id = await _discord_adapter.send_video_preview(
             channel_id=body.channel_id,
             user_id=body.user_id,
             job_id=body.job_id,
-            video_url=body.video_url,
+            video_url=stored.presigned_url,
         )
     except Exception as e:
         logger.error("[discord] send_video_preview failed job_id=%s: %s", body.job_id, e)
@@ -990,10 +1092,12 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         existing_job.get("script_json") if existing_job else None,
         video_filename=normalized_video_filename,
     )
+    video_storage_url = stored.s3_uri
     await job_service.update_job(
         body.job_id,
         confirm_message_id=message_id,
-        video_url=body.video_url,
+        video_url=video_storage_url,
+        final_url=video_storage_url,
         script_json=merged_script,
     )
     logger.info("[discord] send_video_preview done job_id=%s", body.job_id)
@@ -1001,7 +1105,8 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         "job_id": body.job_id,
         "message_id": message_id,
         "video_filename": normalized_video_filename,
-        "video_url": body.video_url,
+        "video_url": stored.presigned_url,
+        "s3_uri": video_storage_url,
     }
 
 
@@ -1017,6 +1122,12 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
 
     if body.action == "approved":
         video_url = job.get("video_url", "")
+        if isinstance(video_url, str) and video_url.startswith("s3://"):
+            try:
+                video_url = presign_s3_uri(video_url)
+            except Exception as e:
+                logger.error("[storage] presign video s3 uri failed job_id=%s: %s", body.job_id, e)
+                raise HTTPException(status_code=500, detail=f"video presign failed: {e}")
         script_json = _as_script_json(job.get("script_json"))
         media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
         video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
