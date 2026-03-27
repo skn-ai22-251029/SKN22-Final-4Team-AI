@@ -995,6 +995,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | `/report` 채널 버튼에 삭제된 채널이 계속 보임 | 버튼 소스는 `TOPIC_CHANNELS` 기준. `.env` 수정 후 `docker-compose up -d --force-recreate messenger-gateway` 적용 |
 | `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
 | `/report` 채널 선택 후 목록이 안 뜨고 멈춘 것처럼 보임 | gateway 로그 `[channel-select:bg]`에서 list-reports 응답 여부 확인. 최신 버전은 최대 180초 대기 후 실패 시 `다시 조회/새로 생성` 버튼을 노출 |
+| `/report` 채널 선택 직후 `Temporary failure in name resolution` | 최신 gateway는 일시 DNS 오류를 자동 재시도(최대 3회)합니다. 계속 실패하면 1) `.env`의 `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 확인 2) `docker-compose exec messenger-gateway getent hosts notebooklm-service`로 DNS 확인 3) `docker-compose up -d --force-recreate messenger-gateway notebooklm-service` 재생성 |
 | `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST] 종료 요약`(`elapsed/scroll/collect/premature_done/termination_reason`)을 먼저 확인. 조기 `done`은 무시되고 최소 탐색 게이트(시간/스크롤/스텝) 미충족이면 빈목록 성공으로 처리하지 않으며, 이 경우 `다시 조회` 버튼으로 재시도 |
 | `/report`에서 `Looks like Playwright ... install` 또는 브라우저 실행 Traceback | `notebooklm-service` 이미지를 최신으로 재빌드해 Chromium 포함 여부를 반영: `docker-compose build --no-cache notebooklm-service && docker-compose up -d notebooklm-service` |
 | WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |

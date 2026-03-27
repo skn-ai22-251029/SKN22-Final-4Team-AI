@@ -194,6 +194,61 @@ def _to_iso8601(value: object) -> str:
     return str(value)
 
 
+def _is_transient_notebooklm_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    transient_markers = (
+        "temporary failure in name resolution",
+        "name or service not known",
+        "nodename nor servname provided",
+        "connection refused",
+        "connection reset by peer",
+        "connect timeout",
+        "read timeout",
+        "timed out",
+        "network is unreachable",
+        "no route to host",
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+async def _post_notebooklm_with_retry(
+    endpoint: str,
+    payload: dict,
+    *,
+    timeout_seconds: float,
+    max_attempts: int = 3,
+    backoff_seconds: float = 1.5,
+) -> httpx.Response:
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = await _http_client.post(
+                f"{settings.notebooklm_service_url}{endpoint}",
+                json=payload,
+                headers={"X-Internal-Secret": settings.gateway_internal_secret},
+                timeout=timeout_seconds,
+            )
+            return resp
+        except Exception as e:
+            last_error = e
+            is_transient = _is_transient_notebooklm_error(e)
+            if attempt >= max_attempts or not is_transient:
+                raise
+            wait = backoff_seconds * attempt
+            logger.warning(
+                "[notebooklm] transient request failure endpoint=%s attempt=%d/%d wait=%.1fs err=%s",
+                endpoint,
+                attempt,
+                max_attempts,
+                wait,
+                e,
+            )
+            await asyncio.sleep(wait)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"unexpected notebooklm request failure: {endpoint}")
+
+
 async def _resolve_manual_job(
     body: ManualGenerateRequest,
     *,
@@ -583,14 +638,15 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
     list_reports_error: str = ""
     list_reports_failed = False
     try:
-        resp = await _http_client.post(
-            f"{settings.notebooklm_service_url}/list-reports",
-            json={
+        resp = await _post_notebooklm_with_retry(
+            "/list-reports",
+            {
                 "notebook_id": body.notebook_id or None,
                 "channel_id": body.channel_id or None,
             },
-            headers={"X-Internal-Secret": settings.gateway_internal_secret},
-            timeout=180.0,
+            timeout_seconds=180.0,
+            max_attempts=3,
+            backoff_seconds=1.5,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -615,7 +671,10 @@ async def _handle_channel_selected_bg(body: ReportMessageRequest) -> None:
             )
     except Exception as e:
         list_reports_failed = True
-        list_reports_error = str(e)
+        if _is_transient_notebooklm_error(e):
+            list_reports_error = "일시적인 네트워크/DNS 문제로 NotebookLM 연결에 실패했습니다."
+        else:
+            list_reports_error = str(e)
         logger.warning("[report-message] list-reports 조회 실패: %s", e)
 
     if reports:
