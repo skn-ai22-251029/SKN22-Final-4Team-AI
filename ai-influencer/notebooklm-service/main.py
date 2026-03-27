@@ -40,6 +40,7 @@ SCRIPTS_DIR = Path(os.getenv("NOTEBOOKLM_SCRIPTS_DIR", "/app/scripts"))
 DATA_DIR = Path(os.getenv("NOTEBOOKLM_DATA_DIR", "/app/data"))
 REPORTS_DIR = DATA_DIR / "reports"
 LIBRARY_JSON = DATA_DIR / "library.json"
+SOURCES_LOG_JSON = DATA_DIR / "sources_log.json"
 
 
 def _load_kst_timezone():
@@ -240,19 +241,66 @@ def verify_secret(x_internal_secret: Optional[str] = None) -> None:
 # 노트북 URL 결정
 # ─────────────────────────────────────────
 
+def _clean_notebook_url(url: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url or "")
+    return urlunparse(parsed._replace(query="", fragment=""))
+
+
+def _load_sources_by_notebook() -> dict[str, int]:
+    try:
+        if not SOURCES_LOG_JSON.exists():
+            return {}
+        data = json.loads(SOURCES_LOG_JSON.read_text(encoding="utf-8"))
+        counts: dict[str, int] = {}
+        for item in data.get("sources", []):
+            clean_url = _clean_notebook_url(item.get("notebook_url", ""))
+            if not clean_url:
+                continue
+            counts[clean_url] = counts.get(clean_url, 0) + 1
+        return counts
+    except Exception as e:
+        logger.warning("[resolve] sources_log.json 읽기 실패: %s", e)
+        return {}
+
+
 def _get_notebook_url(channel_id: str) -> Optional[str]:
-    """channel_id → notebook_url 직접 조회. 쿼리 파라미터는 제거해서 반환."""
+    """channel_id → notebook_url 조회. 최신 노트북이 비어 있으면 history의 유효 노트북으로 fallback."""
     try:
         if not LIBRARY_JSON.exists():
             return None
-        lib = json.loads(LIBRARY_JSON.read_text())
+        lib = json.loads(LIBRARY_JSON.read_text(encoding="utf-8"))
         ch = lib.get("channels", {}).get(channel_id)
         if ch and ch.get("notebook_url"):
-            from urllib.parse import urlparse, urlunparse
-            parsed = urlparse(ch["notebook_url"])
-            clean_url = urlunparse(parsed._replace(query="", fragment=""))
-            logger.info("[resolve] channel_id=%s → %s", channel_id, clean_url)
-            return clean_url
+            current_raw = ch["notebook_url"]
+            current_clean = _clean_notebook_url(current_raw)
+            source_counts = _load_sources_by_notebook()
+            current_count = source_counts.get(current_clean, 0)
+
+            if current_count > 0 or "addSource=true" not in current_raw:
+                logger.info("[resolve] channel_id=%s → %s", channel_id, current_clean)
+                return current_clean
+
+            history = ch.get("history") or []
+            for item in history:
+                candidate_clean = _clean_notebook_url(item.get("notebook_url", ""))
+                if not candidate_clean or candidate_clean == current_clean:
+                    continue
+                if source_counts.get(candidate_clean, 0) > 0:
+                    logger.warning(
+                        "[resolve] channel_id=%s current notebook empty → fallback %s",
+                        channel_id,
+                        candidate_clean,
+                    )
+                    return candidate_clean
+
+            logger.warning(
+                "[resolve] channel_id=%s current notebook has no logged sources, fallback 후보 없음 → %s",
+                channel_id,
+                current_clean,
+            )
+            return current_clean
         logger.warning("[resolve] channel_id=%r 에 해당하는 노트북 없음", channel_id)
     except Exception as e:
         logger.warning("library.json 읽기 실패: %s", e)

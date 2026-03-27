@@ -12,6 +12,16 @@ logger = logging.getLogger(__name__)
 _pool: Optional[asyncpg.Pool] = None
 
 
+def _normalize_job_row(row: asyncpg.Record | None) -> Optional[dict[str, Any]]:
+    if row is None:
+        return None
+    result = dict(row)
+    job_id = result.get("id")
+    if job_id is not None:
+        result["id"] = str(job_id)
+    return result
+
+
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
@@ -61,7 +71,7 @@ async def create_job(data: Union[IncomingMessageRequest, ReportMessageRequest]) 
         data.messenger_user_id,
         data.messenger_channel_id,
     )
-    result = dict(row)
+    result = _normalize_job_row(row)
     logger.info("[%s] create_job job_id=%s", data.messenger_source.value, data.job_id)
     return result
 
@@ -69,9 +79,7 @@ async def create_job(data: Union[IncomingMessageRequest, ReportMessageRequest]) 
 async def get_job(job_id: str) -> Optional[dict[str, Any]]:
     pool = await get_db_pool()
     row = await pool.fetchrow("SELECT * FROM jobs WHERE id::text = $1", job_id)
-    if row is None:
-        return None
-    return dict(row)
+    return _normalize_job_row(row)
 
 
 async def update_job(job_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -95,7 +103,7 @@ async def update_job(job_id: str, **kwargs: Any) -> dict[str, Any]:
     pool = await get_db_pool()
     row = await pool.fetchrow(query, *values)
     logger.info("update_job job_id=%s fields=%s", job_id, list(kwargs.keys()))
-    return dict(row)
+    return _normalize_job_row(row)
 
 
 async def transition_status(
@@ -109,7 +117,7 @@ async def transition_status(
         new_status,
         job_id,
     )
-    result = dict(row)
+    result = _normalize_job_row(row)
     logger.info("transition_status job_id=%s -> %s", job_id, new_status)
     return result
 

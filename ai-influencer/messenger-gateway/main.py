@@ -908,6 +908,8 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     else:
         file_bytes = (body.report_content or "").encode("utf-8")
 
+    stored = None
+    upload_error = None
     try:
         stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_reports,
@@ -916,10 +918,14 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
             content_type="text/plain; charset=utf-8",
         )
     except Exception as e:
+        upload_error = e
         logger.error("[storage] report upload failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"Report upload failed: {e}")
 
-    is_link_only_report = stored.size_bytes > _discord_attachment_limit_bytes()
+    attachment_limit = _discord_attachment_limit_bytes()
+    is_link_only_report = stored.size_bytes > attachment_limit if stored else len(file_bytes) > attachment_limit
+    if upload_error is not None and is_link_only_report:
+        raise HTTPException(status_code=500, detail=f"Report upload failed: {upload_error}")
+
     text = body.report_content
     if len(text) > 1800:
         overflow_hint = (
@@ -935,10 +941,10 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         script_text=report_text if report_text else None,
         report_filename=filename,
     )
-    report_storage_url = stored.s3_uri
+    report_storage_url = stored.s3_uri if stored else ""
     await job_service.update_job(
         body.job_id,
-        final_url=report_storage_url,
+        final_url=report_storage_url or None,
         script_json=merged_script,
     )
 
@@ -947,7 +953,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
             await _discord_adapter.send_report_link_message(
                 channel_id=body.messenger_channel_id,
                 text=text,
-                report_url=stored.presigned_url,
+                report_url=stored.presigned_url if stored else "",
                 include_tts_button=body.include_tts_button,
                 include_video_button=body.include_video_button,
                 job_id=body.job_id,
@@ -974,7 +980,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     return {
         "status": "sent",
         "filename": filename,
-        "file_url": stored.presigned_url,
+        "file_url": stored.presigned_url if stored else "",
         "s3_uri": report_storage_url,
     }
 

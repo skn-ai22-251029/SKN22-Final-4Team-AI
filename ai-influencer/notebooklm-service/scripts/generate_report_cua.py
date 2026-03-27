@@ -387,6 +387,14 @@ def _extract_report_from_dom(page) -> str:
     return ""
 
 
+def _body_contains_text(page, needle: str) -> bool:
+    try:
+        return needle in page.inner_text("body")
+    except Exception as e:
+        logger.warning("[CUA] body text 확인 실패 needle=%r err=%s", needle, e)
+        return False
+
+
 def execute_action(page, action: dict) -> bool:
     """액션 실행. done이면 True 반환."""
     t = action.get("action")
@@ -541,6 +549,201 @@ def _collect_titles_via_dom_scan(page, max_rounds: int = 4) -> list[str]:
             _execute_list_action(page, {"action": "scroll", "delta_y": 640}, panel_anchor)
 
     return collected
+
+
+def _click_first_visible(page, selectors: list[str], *, timeout_ms: int = 1500) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.click(timeout=timeout_ms)
+            logger.info("[dom] click selector=%s", selector)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_first_text(page, texts: list[str], *, exact: bool = True, timeout_ms: int = 1500) -> bool:
+    for text in texts:
+        try:
+            locator = page.get_by_text(text, exact=exact).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.click(timeout=timeout_ms)
+            logger.info("[dom] click text=%r", text)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _focus_first_visible(page, selectors: list[str], *, timeout_ms: int = 1500) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.click(timeout=timeout_ms)
+            logger.info("[dom] focus selector=%s", selector)
+            time.sleep(0.5)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _dismiss_blocking_dialogs(page) -> None:
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    close_selectors = [
+        "button[aria-label*='닫기']",
+        "[role='button'][aria-label*='닫기']",
+        "button[aria-label*='Close']",
+        "[role='button'][aria-label*='Close']",
+        "button:has-text('닫기')",
+        "[role='button']:has-text('닫기')",
+        "button:has-text('Close')",
+        "[role='button']:has-text('Close')",
+    ]
+    _click_first_visible(page, close_selectors, timeout_ms=800)
+
+
+def _try_dom_prepare_report_prompt(page) -> bool:
+    """보고서 생성 입력창까지 DOM 셀렉터로 진입 시도."""
+    _dismiss_blocking_dialogs(page)
+    _ensure_studio_panel_visible(page)
+
+    report_selectors = [
+        "button:has-text('보고서')",
+        "[role='button']:has-text('보고서')",
+        "[aria-label='보고서']",
+        "button:has-text('Report')",
+        "[role='button']:has-text('Report')",
+        "[aria-label='Report']",
+    ]
+    custom_selectors = [
+        "button:has-text('직접 만들기')",
+        "[role='button']:has-text('직접 만들기')",
+        "[aria-label='직접 만들기']",
+        "button:has-text('Custom')",
+        "[role='button']:has-text('Custom')",
+        "[aria-label='Custom']",
+    ]
+    input_selectors = [
+        "textarea",
+        "[role='textbox']",
+        ".ProseMirror",
+        "[contenteditable='true']",
+    ]
+
+    if not (
+        _click_first_visible(page, report_selectors, timeout_ms=2500)
+        or _click_first_text(page, ["보고서", "Report"], exact=True, timeout_ms=2500)
+    ):
+        logger.info("[dom] report tile not found")
+        return False
+    if not (
+        _click_first_visible(page, custom_selectors, timeout_ms=2500)
+        or _click_first_text(page, ["직접 만들기", "Custom"], exact=True, timeout_ms=2500)
+    ):
+        logger.info("[dom] custom option not found")
+        return False
+    if not _focus_first_visible(page, input_selectors, timeout_ms=2500):
+        logger.info("[dom] prompt input not found")
+        return False
+    return True
+
+
+def _try_dom_click_generate(page) -> bool:
+    """생성 버튼을 DOM 셀렉터로 클릭 시도."""
+    selectors = [
+        "button:has-text('생성')",
+        "[role='button']:has-text('생성')",
+        "button:has-text('Generate')",
+        "[role='button']:has-text('Generate')",
+    ]
+    return _click_first_visible(page, selectors, timeout_ms=2500)
+
+
+def _sanitize_report_titles(titles: list[str]) -> list[str]:
+    blocked = {
+        "auto_tab_group",
+        "chevron_forward",
+        "chevron_right",
+        "arrow_forward",
+        "more_vert",
+        "more_horiz",
+        "보고서",
+        "직접 만들기",
+        "스튜디오",
+        "Studio",
+    }
+    cleaned: list[str] = []
+    seen = set()
+    for title in titles:
+        normalized = (title or "").strip()
+        if not normalized or normalized in blocked or len(normalized) < 2:
+            continue
+        if re.fullmatch(r"[a-z_]+", normalized):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return cleaned
+
+
+def _choose_generated_report_title(previous_titles: list[str], current_titles: list[str]) -> str:
+    previous_set = set(_sanitize_report_titles(previous_titles))
+    current_cleaned = _sanitize_report_titles(current_titles)
+    for title in current_cleaned:
+        if title not in previous_set:
+            return title
+    return current_cleaned[0] if current_cleaned else ""
+
+
+def _try_dom_open_report_tile(page, target_title: str) -> bool:
+    if not target_title:
+        return False
+    candidates = [
+        page.get_by_text(target_title, exact=True).first,
+        page.locator(f"[aria-label={json.dumps(target_title)}]").first,
+    ]
+    for locator in candidates:
+        try:
+            locator.wait_for(state="visible", timeout=2500)
+            locator.click(timeout=2500)
+            logger.info("[dom] report tile opened title=%r", target_title)
+            time.sleep(1.0)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _open_report_tile(page, client, target_title: str, report_index: int = 0) -> None:
+    if _try_dom_open_report_tile(page, target_title):
+        return
+
+    task_open_tile = (
+        "Task: In the NotebookLM Studio panel, open the saved report tile that was just generated.\n"
+        f"Target title: '{target_title[:80]}'\n"
+        f"It is report number {report_index + 1} in the visible list.\n"
+        "Steps:\n"
+        "1. If the Studio panel is not open on the right, click the Studio tab.\n"
+        "2. Find the target saved report tile.\n"
+        "3. Click the tile to open its content.\n"
+        '4. Output {"action":"done"} only when the report content view is open.\n'
+        "Do NOT click the '보고서' generator card."
+    )
+    if not _run_cua_loop(page, client, task_open_tile, max_steps=12, phase="OPEN_TILE"):
+        raise RuntimeError(f"생성된 보고서 타일 열기 실패: {target_title[:80]}")
+    time.sleep(2)
 
 
 def _run_cua_loop(
@@ -843,6 +1046,12 @@ def _parse_report_titles(body_text: str) -> list[str]:
             "Studio",
             "보고서",
             "직접 만들기",
+            "auto_tab_group",
+            "chevron_forward",
+            "chevron_right",
+            "arrow_forward",
+            "more_vert",
+            "more_horiz",
             "소스",
             "채팅",
             "공유",
@@ -1126,13 +1335,18 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
 
         _ensure_logged_in(page)
         time.sleep(2)
+        existing_titles_before = _sanitize_report_titles(_collect_titles_via_dom_scan(page, max_rounds=2))
+        logger.info("[CUA] 생성 전 보고서 목록: %d개", len(existing_titles_before))
 
         # Phase 1: 입력 필드까지 내비게이션 (프롬프트 텍스트 GPT에 노출 안 함)
         logger.info("[CUA] Phase 1 시작: 보고서 입력 필드로 내비게이션")
-        if not _run_cua_loop(page, client, TASK_PHASE1, max_steps=15, phase="P1"):
-            context.close()
-            raise RuntimeError("Phase 1 실패: 입력 필드 포커스 불가 (15 스텝 초과)")
-        logger.info("[CUA] Phase 1 완료: 입력 필드 포커스됨")
+        if _try_dom_prepare_report_prompt(page):
+            logger.info("[CUA] Phase 1 완료: DOM 경로로 입력 필드 포커스됨")
+        else:
+            if not _run_cua_loop(page, client, TASK_PHASE1, max_steps=15, phase="P1"):
+                context.close()
+                raise RuntimeError("Phase 1 실패: 입력 필드 포커스 불가 (15 스텝 초과)")
+            logger.info("[CUA] Phase 1 완료: CUA 경로로 입력 필드 포커스됨")
 
         # Phase 2: Playwright로 직접 프롬프트 입력 (GPT에 프롬프트 텍스트 비노출)
         logger.info("[CUA] Phase 2: 프롬프트 직접 입력 (%d chars)", len(prompt))
@@ -1142,51 +1356,64 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
 
         # Phase 3a: Generate 버튼 클릭
         logger.info("[CUA] Phase 3a 시작: Generate 버튼 클릭")
-        if not _run_cua_loop(page, client, TASK_PHASE3_CLICK, max_steps=5, phase="P3a"):
-            context.close()
-            raise RuntimeError("Phase 3a 실패: Generate 버튼 클릭 불가 (5 스텝 초과)")
-        logger.info("[CUA] Phase 3a 완료: Generate 버튼 클릭됨")
+        if _try_dom_click_generate(page):
+            logger.info("[CUA] Phase 3a 완료: DOM 경로로 Generate 버튼 클릭됨")
+        else:
+            if not _run_cua_loop(page, client, TASK_PHASE3_CLICK, max_steps=5, phase="P3a"):
+                context.close()
+                raise RuntimeError("Phase 3a 실패: Generate 버튼 클릭 불가 (5 스텝 초과)")
+            logger.info("[CUA] Phase 3a 완료: CUA 경로로 Generate 버튼 클릭됨")
         time.sleep(3)  # 생성 시작 대기
 
         # Phase 3b: Playwright 네이티브 대기 (2단계)
         # Step 1: "보고서 생성 중" 나타날 때까지 기다림 (생성이 시작됐는지 확인)
         logger.info("[CUA] Phase 3b-1: '보고서 생성 중' 나타날 때까지 대기 (최대 30초)")
-        try:
-            page.wait_for_function(
-                "() => document.body.innerText.includes('보고서 생성 중')",
-                timeout=30000,
-            )
+        loading_seen = False
+        for _ in range(30):
+            if _body_contains_text(page, "보고서 생성 중"):
+                loading_seen = True
+                break
+            time.sleep(1)
+        if loading_seen:
             logger.info("[CUA] Phase 3b-1: '보고서 생성 중' 감지됨 — 생성 시작 확인")
-        except Exception as e:
-            logger.warning("[CUA] Phase 3b-1: '보고서 생성 중' 30초 내 미감지 (%s) — 이미 완료됐거나 다른 상태", e)
+        else:
+            logger.warning("[CUA] Phase 3b-1: '보고서 생성 중' 30초 내 미감지 — 이미 완료됐거나 다른 상태")
 
         # Step 2: "보고서 생성 중" 사라질 때까지 기다림 (생성 완료 확인)
         logger.info("[CUA] Phase 3b-2: '보고서 생성 중' 사라질 때까지 대기 (최대 %dms)", PHASE3B_WAIT_MS)
-        try:
-            page.wait_for_function(
-                "() => !document.body.innerText.includes('보고서 생성 중')",
-                timeout=PHASE3B_WAIT_MS,
-            )
+        loading_cleared = not loading_seen
+        deadline = time.monotonic() + (PHASE3B_WAIT_MS / 1000)
+        while time.monotonic() < deadline:
+            if not _body_contains_text(page, "보고서 생성 중"):
+                loading_cleared = True
+                break
+            time.sleep(2)
+        if loading_cleared:
             logger.info("[CUA] Phase 3b-2 완료: '보고서 생성 중' 사라짐")
-        except Exception as e:
-            logger.warning("[CUA] Phase 3b-2 타임아웃 (%dms): %s — 강제 추출 시도", PHASE3B_WAIT_MS, e)
+        else:
+            logger.warning("[CUA] Phase 3b-2 타임아웃 (%dms) — 강제 추출 시도", PHASE3B_WAIT_MS)
 
         time.sleep(3)  # 렌더링 안정화
+        current_titles = _sanitize_report_titles(_collect_titles_via_dom_scan(page, max_rounds=2))
+        target_title = _choose_generated_report_title(existing_titles_before, current_titles)
+        logger.info(
+            "[CUA] 생성 후 보고서 목록: before=%d after=%d target=%r",
+            len(existing_titles_before),
+            len(current_titles),
+            target_title,
+        )
+        if target_title:
+            _open_report_tile(page, client, target_title, report_index=0)
 
-        # 스튜디오 보고서 폴링 (최대 120초, 5초 간격)
-        # _extract_studio_report는 생성 중이면 "" 반환 → 실제 내용이 나올 때까지 재시도
+        # 보고서 DOM 폴링 (최대 120초, 5초 간격)
         report_text = ""
         for attempt in range(24):
-            report_text = _extract_studio_report(page)
-            if report_text:
-                logger.info("[CUA] 스튜디오 보고서 확인됨 (시도 %d/%d)", attempt + 1, 24)
-                break
-            logger.info("[CUA] 추출 재시도 %d/24 — 스튜디오 콘텐츠 대기 중...", attempt + 1)
-            time.sleep(5)
-
-        if not report_text:
-            logger.warning("[CUA] 스튜디오 폴링 실패 — CSS 셀렉터 폴백 시도")
             report_text = _extract_report_from_dom(page)
+            if report_text:
+                logger.info("[CUA] 보고서 DOM 확인됨 (시도 %d/%d)", attempt + 1, 24)
+                break
+            logger.info("[CUA] 추출 재시도 %d/24 — 보고서 DOM 대기 중...", attempt + 1)
+            time.sleep(5)
 
         context.close()
 

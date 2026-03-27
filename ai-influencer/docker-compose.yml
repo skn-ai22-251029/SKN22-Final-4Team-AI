@@ -25,7 +25,9 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - internal
+      internal:
+        aliases:
+          - ai_influencer
 
   n8n:
     image: n8nio/n8n:latest
