@@ -5,10 +5,10 @@ import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
@@ -40,7 +40,19 @@ SCRIPTS_DIR = Path(os.getenv("NOTEBOOKLM_SCRIPTS_DIR", "/app/scripts"))
 DATA_DIR = Path(os.getenv("NOTEBOOKLM_DATA_DIR", "/app/data"))
 REPORTS_DIR = DATA_DIR / "reports"
 LIBRARY_JSON = DATA_DIR / "library.json"
-KST = ZoneInfo("Asia/Seoul")
+
+
+def _load_kst_timezone():
+    try:
+        return ZoneInfo("Asia/Seoul")
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "[timezone] Asia/Seoul zoneinfo unavailable; falling back to fixed UTC+09:00"
+        )
+        return timezone(timedelta(hours=9), name="Asia/Seoul")
+
+
+KST = _load_kst_timezone()
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
