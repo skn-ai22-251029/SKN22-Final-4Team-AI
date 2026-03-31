@@ -22,6 +22,11 @@ def _normalize_job_row(row: asyncpg.Record | None) -> Optional[dict[str, Any]]:
     return result
 
 
+async def _ensure_schema(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS heygen_avatar_id TEXT")
+
+
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
@@ -34,6 +39,7 @@ async def get_db_pool() -> asyncpg.Pool:
             min_size=2,
             max_size=10,
         )
+        await _ensure_schema(_pool)
         logger.info("DB pool created")
     return _pool
 
@@ -80,6 +86,26 @@ async def get_job(job_id: str) -> Optional[dict[str, Any]]:
     pool = await get_db_pool()
     row = await pool.fetchrow("SELECT * FROM jobs WHERE id::text = $1", job_id)
     return _normalize_job_row(row)
+
+
+async def get_character(character_id: str) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow("SELECT * FROM characters WHERE id = $1", character_id)
+    return dict(row) if row is not None else None
+
+
+async def update_character_avatar(character_id: str, avatar_id: str) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    normalized_avatar_id = (avatar_id or "").strip() or None
+    row = await pool.fetchrow(
+        "UPDATE characters SET heygen_avatar_id = $1 WHERE id = $2 RETURNING *",
+        normalized_avatar_id,
+        character_id,
+    )
+    if row is None:
+        return None
+    logger.info("update_character_avatar character_id=%s avatar_id=%s", character_id, normalized_avatar_id or "")
+    return dict(row)
 
 
 async def update_job(job_id: str, **kwargs: Any) -> dict[str, Any]:

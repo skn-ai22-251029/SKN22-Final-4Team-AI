@@ -105,6 +105,7 @@ async def call_wf12_heygen_generate(
     user_id: str,
     audio_file_path: str = "",
     audio_url: str = "",
+    avatar_id: str = "",
 ) -> None:
     payload = {
         "job_id": job_id,
@@ -112,6 +113,7 @@ async def call_wf12_heygen_generate(
         "user_id": user_id,
         "audio_file_path": audio_file_path,
         "audio_url": audio_url,
+        "avatar_id": avatar_id,
     }
     await _post_with_retry(settings.n8n_wf12_webhook_url, payload)
     logger.info("call_wf12_heygen_generate job_id=%s", job_id)

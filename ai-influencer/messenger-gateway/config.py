@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     tts_sample_steps: int = 32
     tts_super_sampling: bool = True
     tts_fragment_interval: float = 0.4
+    heygen_api_key: str = ""
+    heygen_avatar_id: str = ""
+    heygen_api_base_url: str = "https://api.heygen.com"
+    heygen_upload_base_url: str = "https://upload.heygen.com"
 
     # Cross-account S3 (AssumeRole)
     media_s3_bucket: str = ""
@@ -46,7 +50,8 @@ class Settings(BaseSettings):
     aws_session_token: str = ""
     media_presign_expires_seconds: int = 86400
     media_max_discord_file_bytes: int = 10 * 1024 * 1024
-    media_s3_prefix_reports: str = "reports"
+    media_s3_prefix_reports: str = "subtitle"
+    media_s3_prefix_scripts: str = "scripts"
     media_s3_prefix_tts: str = "tts"
     media_s3_prefix_videos: str = "videos"
 

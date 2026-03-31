@@ -110,6 +110,7 @@ class VideoActionRequest(BaseModel):
 
 class ReportToVideoRequest(BaseModel):
     job_id: str
+    avatar_id: str = ""
 
 
 class ReportToTtsRequest(BaseModel):
@@ -120,6 +121,16 @@ class ManualGenerateRequest(BaseModel):
     job_id: str = ""
     messenger_user_id: str = ""
     messenger_channel_id: str = ""
+    avatar_id: str = ""
+
+
+class HeygenSmokeTestRequest(BaseModel):
+    avatar_id: str = ""
+
+
+class CharacterAvatarRequest(BaseModel):
+    character_id: str
+    avatar_id: str = ""
 
 
 class ListJobsRequest(BaseModel):
