@@ -378,6 +378,8 @@ def _extract_completion_text(content: object) -> str:
 
 
 def _extract_json_object(text: str) -> dict:
+    # LLM 응답은 코드블록/설명문이 섞일 수 있어서
+    # "가능하면 JSON 객체 하나"만 안전하게 뽑아낸다.
     candidate = (text or "").strip()
     if not candidate:
         return {}
@@ -403,6 +405,8 @@ def _extract_json_object(text: str) -> dict:
 
 
 async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> tuple[str, str]:
+    # NotebookLM 원문 보고서를 한 번 더 정제해
+    # 자막용/ TTS용 스크립트를 동시에 만든다.
     api_key = settings.openai_api_key.strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured for script rewrite")
@@ -447,6 +451,8 @@ async def _prepare_report_delivery(
     filename: str,
     rewrite_prompt: str,
 ) -> tuple[str, bytes, str, dict]:
+    # 기본값은 "원문 보고서를 그대로 사용"이고,
+    # rewrite 성공 시에만 subtitle/tts 스크립트를 교체한다.
     raw_report_text = (raw_report_text or "").strip()
     rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt)
     subtitle_script_text = raw_report_text
@@ -483,6 +489,8 @@ def _upload_tts_script_file(
     tts_script_text: str,
     existing_script_json: object,
 ) -> tuple[object | None, dict]:
+    # 사용자에게 노출되는 subtitle 파일과 별개로,
+    # TTS용 스크립트도 별도 S3 prefix(scripts/)에 보관한다.
     normalized_filename = _normalize_report_filename(job_id, filename, existing_script_json)
     if not tts_script_text.strip():
         return None, _merge_script_json_with_media_names(
@@ -506,6 +514,8 @@ def _upload_tts_script_file(
 
 
 async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[str, str]:
+    # gateway가 직접 TTS API를 호출해 WAV 바이트를 받아오고,
+    # 이후 Discord/S3 저장은 send_audio 엔드포인트에 위임한다.
     tts_api_url = settings.tts_api_url.strip()
     if not tts_api_url:
         raise RuntimeError("TTS_API_URL is not configured")
@@ -553,6 +563,7 @@ async def _run_tts_generation(
     auto_trigger_wf12: bool,
 ) -> None:
     try:
+        # 1) TTS 생성 2) Discord/S3 저장 3) 필요 시 WF-12 자동 트리거 순서로 진행한다.
         await job_service.transition_status(job_id, "GENERATING")
         audio_b64, filename = await _generate_tts_audio_content(job_id, script_text)
         send_result = await send_audio(
@@ -572,6 +583,8 @@ async def _run_tts_generation(
         await job_service.update_job(job_id, error_message="")
 
         if auto_trigger_wf12:
+            # report_to_video 경로는 TTS 승인 버튼을 기다리지 않고
+            # 생성된 audio_url을 바로 WF-12 입력으로 넘긴다.
             job = await job_service.get_job(job_id)
             if job is None:
                 raise RuntimeError(f"Job not found while resolving HeyGen avatar: {job_id}")
@@ -583,7 +596,6 @@ async def _run_tts_generation(
                 job_id,
                 channel_id,
                 user_id,
-                audio_file_path="",
                 audio_url=approved_audio_url,
                 avatar_id=resolved_avatar_id,
             )
@@ -609,6 +621,8 @@ def _spawn_tts_generation(
     user_id: str,
     auto_trigger_wf12: bool,
 ) -> None:
+    # slash command/버튼 응답을 오래 붙잡지 않기 위해
+    # 실제 TTS 생성은 background task로 분리한다.
     asyncio.create_task(
         _run_tts_generation(
             job_id=job_id,
@@ -762,6 +776,8 @@ def _get_primary_discord_channel_id() -> str:
 
 
 def _build_auto_report_prompt(body: AutoReportRequest) -> str:
+    # WF-09 자동 수집 경로에서는 최신 영상 메타데이터만 붙여
+    # "오늘 보고서"용 최소 프롬프트를 만든다.
     segments: list[str] = []
     if body.channel_name:
         segments.append(f"대상 채널명: {body.channel_name}.")
@@ -774,6 +790,8 @@ def _build_auto_report_prompt(body: AutoReportRequest) -> str:
 
 
 def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> None:
+    # background task 예외는 호출 스택 밖으로 사라지므로
+    # done callback에서 반드시 로그로 다시 끌어올린다.
     task = asyncio.create_task(coro)
 
     def _done_callback(done_task: asyncio.Task) -> None:
@@ -842,6 +860,7 @@ def get_adapter(messenger_source: str) -> DiscordAdapter:
 @app.post("/internal/message")
 async def receive_message(_: AuthDep, body: IncomingMessageRequest) -> dict:
     """봇 서비스가 포워딩하는 사용자 메시지를 수신한다."""
+    # /create 요청의 진입점: DB에 job을 만들고, 실제 스크립트 생성은 WF-01로 넘긴다.
     await job_service.create_job(body)
 
     try:
@@ -864,6 +883,7 @@ async def receive_message(_: AuthDep, body: IncomingMessageRequest) -> dict:
 @app.post("/internal/send-confirm")
 async def send_confirm(_: AuthDep, body: SendConfirmRequest) -> dict:
     """n8n WF-04에서 호출 — Discord로 컨펌 메시지를 전송한다."""
+    # Discord 버튼 메시지 id를 DB에 저장해 두어야 이후 승인/수정 시 버튼 제거가 가능하다.
     try:
         confirm_message_id = await _discord_adapter.send_confirm_message(
             channel_id=body.messenger_channel_id,
@@ -898,7 +918,12 @@ async def confirm_action(_: AuthDep, body: ConfirmActionRequest) -> dict:
     confirm_message_id = job.get("confirm_message_id")
 
     if body.action == "approved":
-        await job_service.transition_status(body.job_id, "APPROVED")
+        # 실제 후속 처리(WF-05)가 성공한 뒤에만 Discord 쪽 성공 메시지를 보낸다.
+        try:
+            await n8n_service.call_wf05_confirm(body.job_id, "approved")
+        except Exception as e:
+            logger.error("call_wf05_confirm failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=502, detail=f"WF-05 trigger failed: {e}")
 
         if confirm_message_id:
             try:
@@ -911,28 +936,21 @@ async def confirm_action(_: AuthDep, body: ConfirmActionRequest) -> dict:
         except Exception as e:
             logger.error("[discord] send_text_message failed job_id=%s: %s", body.job_id, e)
 
-        try:
-            await n8n_service.call_wf05_confirm(body.job_id, "approved")
-        except Exception as e:
-            logger.error("call_wf05_confirm failed job_id=%s: %s", body.job_id, e)
-
         logger.info("[discord] confirm_action=approved job_id=%s", body.job_id)
         return {"job_id": body.job_id, "action": "approved"}
 
     elif body.action == "revision_requested":
         if not body.revision_note:
+            # 첫 클릭 시에는 note를 아직 모르므로 "다음 사용자 메시지 대기" 상태만 기록한다.
             await job_service.update_job(body.job_id, status="REVISION_REQUESTED")
             logger.info("[discord] confirm_action=revision_requested (pending note) job_id=%s", body.job_id)
             return {"job_id": body.job_id, "action": "revision_requested", "pending_note": True}
 
-        await job_service.transition_status(body.job_id, "REVISION_REQUESTED")
-
-        current_revision_count = job.get("revision_count", 0) or 0
-        await job_service.update_job(
-            body.job_id,
-            revision_note=body.revision_note,
-            revision_count=current_revision_count + 1,
-        )
+        try:
+            await n8n_service.call_wf05_confirm(body.job_id, "revision_requested", body.revision_note)
+        except Exception as e:
+            logger.error("call_wf05_confirm failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=502, detail=f"WF-05 trigger failed: {e}")
 
         if confirm_message_id:
             try:
@@ -945,11 +963,6 @@ async def confirm_action(_: AuthDep, body: ConfirmActionRequest) -> dict:
         except Exception as e:
             logger.error("[discord] send_text_message failed job_id=%s: %s", body.job_id, e)
 
-        try:
-            await n8n_service.call_wf05_confirm(body.job_id, "revision_requested", body.revision_note)
-        except Exception as e:
-            logger.error("call_wf05_confirm failed job_id=%s: %s", body.job_id, e)
-
         logger.info("[discord] confirm_action=revision_requested job_id=%s", body.job_id)
         return {"job_id": body.job_id, "action": "revision_requested"}
 
@@ -960,7 +973,8 @@ async def confirm_action(_: AuthDep, body: ConfirmActionRequest) -> dict:
 async def report_message(_: AuthDep, body: ReportMessageRequest) -> dict:
     """봇 서비스가 report: 프리픽스 메시지를 포워딩한다."""
     await job_service.create_job(body)
-    # 즉시 반환 후 background에서 list-reports → 버튼 or WF-06
+    # /report는 응답 속도를 위해 즉시 반환하고,
+    # background task에서 채널 선택/기존 보고서 조회/WF-06 분기를 처리한다.
     asyncio.create_task(_handle_report_message_bg(body))
     return {"job_id": body.job_id, "status": "accepted"}
 
@@ -968,6 +982,7 @@ async def report_message(_: AuthDep, body: ReportMessageRequest) -> dict:
 @app.post("/internal/auto-report")
 async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
     """WF-09 소스 추가 성공 후 자동으로 WF-06 보고서 생성을 트리거한다."""
+    # 자동 수집 경로는 Discord 사용자 대신 system:auto-report 계정으로 job을 만든다.
     target_channel_id = _get_primary_discord_channel_id()
     prompt = _build_auto_report_prompt(body)
     job_id = str(uuid.uuid4())
@@ -1310,6 +1325,7 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
 @app.post("/internal/send-report")
 async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     """n8n WF-06에서 호출 — Discord로 보고서 파일을 전송한다."""
+    # 여기서 raw report -> subtitle/tts 스크립트 분리, S3 저장, Discord 전송을 한 번에 마무리한다.
     existing_job = await job_service.get_job(body.job_id)
     filename = _normalize_report_filename(
         body.job_id,
@@ -1324,6 +1340,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
     )
     try:
+        # TTS용 파일 업로드 실패는 사용자 보고서 전송을 막지 않도록 분리 처리한다.
         _, merged_script = _upload_tts_script_file(
             job_id=body.job_id,
             filename=filename,
@@ -1348,6 +1365,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
 
     attachment_limit = _discord_attachment_limit_bytes()
     is_link_only_report = stored.size_bytes > attachment_limit if stored else len(file_bytes) > attachment_limit
+    # Discord 첨부 제한을 넘으면 링크 메시지로 전환하고, 그마저 업로드가 없으면 에러로 본다.
     if upload_error is not None and is_link_only_report:
         raise HTTPException(status_code=500, detail=f"Report upload failed: {upload_error}")
 
@@ -1434,6 +1452,8 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
     )
     stored = None
     try:
+        # 오디오는 항상 S3 저장을 먼저 시도하고,
+        # 실패 시에만 Discord attachment URL을 최종 URL로 사용한다.
         stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_tts,
             filename=filename,
@@ -1445,6 +1465,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
 
     caption = body.caption or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
     if stored and stored.size_bytes > _discord_attachment_limit_bytes():
+        # 큰 파일은 Discord 첨부 대신 presigned link + 버튼 메시지로 전송한다.
         try:
             message_id = await _discord_adapter.send_tts_link_message(
                 channel_id=body.messenger_channel_id,
@@ -1458,6 +1479,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
             logger.error("[discord] send_tts_link_message failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=500, detail=str(e))
     else:
+        # 기본 경로: Discord에 직접 WAV를 올리고 attachment URL을 받는다.
         if stored is None and len(audio_bytes) > _discord_attachment_limit_bytes():
             raise HTTPException(
                 status_code=500,
@@ -1510,11 +1532,11 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
     user_id = job["messenger_user_id"]
 
     if body.action == "approve":
+        # WF-12는 외부 URL을 읽어야 하므로 s3:// 저장값은 presigned URL로 바꿔 넘긴다.
         resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
         audio_url = job.get("audio_url", "")
         if not audio_url:
             raise HTTPException(status_code=400, detail="No audio_url found in job")
-        audio_file_path = ""
         approved_audio_url = audio_url
         if isinstance(audio_url, str) and audio_url.startswith("s3://"):
             try:
@@ -1527,7 +1549,6 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
                 job_id=body.job_id,
                 channel_id=channel_id,
                 user_id=user_id,
-                audio_file_path=audio_file_path,
                 audio_url=approved_audio_url,
                 avatar_id=resolved_avatar_id,
             )
@@ -1554,6 +1575,8 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
 @app.post("/internal/send-video-preview")
 async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     """WF-12 완료 후 호출 — Discord로 영상 미리보기 + 승인/반려 버튼을 전송한다."""
+    # WF-12가 준 video_url을 다시 내려받아 S3에 통일 저장한 뒤,
+    # Discord에는 presigned preview 링크와 승인/반려 버튼을 보낸다.
     existing_job = await job_service.get_job(body.job_id)
     normalized_video_filename = _normalize_video_filename(
         body.job_id,
@@ -1622,6 +1645,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
     user_id = job["messenger_user_id"]
 
     if body.action == "approved":
+        # 최종 승인 시점에는 gateway가 직접 업로드하지 않고 WF-08에 SNS 업로드를 위임한다.
         video_url = job.get("video_url", "")
         if isinstance(video_url, str) and video_url.startswith("s3://"):
             try:
@@ -1632,7 +1656,6 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
         script_json = _as_script_json(job.get("script_json"))
         media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
         video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
-        await job_service.transition_status(body.job_id, "PUBLISHING")
 
         try:
             await n8n_service.call_wf08_sns_upload(
@@ -1643,6 +1666,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
             )
         except Exception as e:
             logger.error("call_wf08_sns_upload failed job_id=%s: %s", body.job_id, e)
+            raise HTTPException(status_code=502, detail=f"WF-08 trigger failed: {e}")
 
         logger.info("[discord] video_action=approved job_id=%s", body.job_id)
         return {"job_id": body.job_id, "action": "approved"}
@@ -1661,6 +1685,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
         step = body.step or "draft"
 
         if step == "script":
+            # script 단계로 되돌리면 승인 버튼이 달린 컨펌 메시지를 다시 생성한다.
             await job_service.transition_status(body.job_id, "WAITING_APPROVAL")
             confirm_message_id = job.get("confirm_message_id")
             script_json = _as_script_json(job.get("script_json"))
@@ -1681,6 +1706,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
                 logger.error("[discord] re-send confirm failed job_id=%s: %s", body.job_id, e)
 
         elif step == "tts":
+            # tts 단계로 되돌리면 현재 저장된 tts_script_text로 바로 재생성을 시작한다.
             await job_service.transition_status(body.job_id, "APPROVED")
             script_json = _as_script_json(job.get("script_json"))
             script_text = _get_tts_script_text(script_json)
@@ -1697,6 +1723,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
                 logger.error("call_wf11 (tts retry) failed job_id=%s: %s", body.job_id, e)
 
         elif step == "draft":
+            # draft는 기존 산출물을 버리고 사용자가 /create로 처음부터 다시 시작하게 만든다.
             await job_service.transition_status(body.job_id, "DRAFT")
             try:
                 await _discord_adapter.send_text_message(channel_id, "🔄 처음부터 시작합니다. 새 콘셉트를 `/create`로 입력해주세요.")
@@ -1712,6 +1739,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
 @app.post("/internal/report-to-tts")
 async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
     """/report 결과의 'TTS만 제작' 버튼 클릭 처리 — WF-11(TTS)만 트리거."""
+    # 보고서가 이미 있으므로 WF-06을 다시 돌리지 않고 TTS 생성만 따로 시작한다.
     job = await job_service.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1749,6 +1777,7 @@ async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
 @app.post("/internal/report-to-video")
 async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
     """/report 결과의 '영상으로 제작' 버튼 클릭 처리 — WF-11 후 WF-12 자동 트리거."""
+    # 보고서 -> TTS -> WF-12를 사용자가 추가 승인 없이 한 번에 연결하는 경로.
     job = await job_service.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1830,12 +1859,10 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
 
 @app.post("/internal/heygen-smoke-test")
 async def heygen_smoke_test(_: AuthDep, body: HeygenSmokeTestRequest) -> dict:
-    """HeyGen 과금 없는 스모크 테스트 — 인증, quota, avatar 접근만 검증한다."""
+    """HeyGen 과금 없는 스모크 테스트 — 인증과 avatar 접근만 검증한다."""
     configured_avatar_id = (body.avatar_id or settings.heygen_avatar_id).strip()
-    quota_payload = await _heygen_get_json("/v1/user/remaining_quota")
     avatars_payload = await _heygen_get_json("/v2/avatars")
 
-    quota_data = quota_payload.get("data") if isinstance(quota_payload.get("data"), dict) else {}
     avatars_data = avatars_payload.get("data") if isinstance(avatars_payload.get("data"), dict) else {}
     avatars = avatars_data.get("avatars") if isinstance(avatars_data.get("avatars"), list) else []
 
@@ -1861,20 +1888,25 @@ async def heygen_smoke_test(_: AuthDep, body: HeygenSmokeTestRequest) -> dict:
             avatar_check["error"] = e.detail
 
     logger.info(
-        "[heygen-smoke] quota=%s avatars=%d configured_avatar=%s exists=%s",
-        quota_data.get("remaining_quota"),
+        "[heygen-smoke] avatars=%d configured_avatar=%s exists=%s",
         len(avatars),
         configured_avatar_id,
         avatar_check.get("exists"),
     )
     return {
         "status": "ok",
-        "quota": {
-            "remaining_quota": quota_data.get("remaining_quota"),
-            "quota": quota_data.get("quota"),
-        },
         "avatars_count": len(avatars),
         "configured_avatar": avatar_check,
+        "video_defaults": {
+            "width": settings.heygen_video_width,
+            "height": settings.heygen_video_height,
+            "caption_enabled": settings.heygen_caption_enabled,
+            "speed": settings.heygen_speed,
+            "poll_interval_seconds": settings.heygen_poll_interval_seconds,
+            "max_wait_seconds": settings.heygen_max_wait_seconds,
+            "mock_enabled": settings.heygen_mock_enabled,
+            "mock_video_url": settings.heygen_mock_video_url,
+        },
     }
 
 
@@ -1917,15 +1949,12 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
             logger.error("[storage] presign audio s3 uri failed job_id=%s: %s", resolved_job_id, e)
             raise HTTPException(status_code=500, detail=f"audio presign failed: {e}")
 
-    audio_file_path = audio_url if isinstance(audio_url, str) and audio_url.startswith("/") else ""
-    approved_audio_url = "" if audio_file_path else audio_url
     try:
         await n8n_service.call_wf12_heygen_generate(
             job_id=resolved_job_id,
             channel_id=channel_id,
             user_id=user_id,
-            audio_file_path=audio_file_path,
-            audio_url=approved_audio_url,
+            audio_url=audio_url,
             avatar_id=resolved_avatar_id,
         )
     except Exception as e:

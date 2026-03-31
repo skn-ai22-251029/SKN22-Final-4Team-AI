@@ -217,7 +217,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://n8n:5678/webhook/wf-12-heygen-generate",
+        "url": "={{ $env.N8N_WF12_WEBHOOK_URL }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -229,7 +229,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_file_path: '', audio_url: $('Send TTS Audio to Gateway').item.json.audio_url }) }}",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_url: $('Send TTS Audio to Gateway').item.json.audio_url }) }}",
         "options": {}
       },
       "id": "wf11-http-trigger-wf12",

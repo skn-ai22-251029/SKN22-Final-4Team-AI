@@ -242,6 +242,8 @@ def verify_secret(x_internal_secret: Optional[str] = None) -> None:
 # ─────────────────────────────────────────
 
 def _clean_notebook_url(url: str) -> str:
+    # library/sources_log에는 같은 노트북이 querystring만 다른 URL로 남을 수 있어
+    # 비교/집계 전에는 항상 정규화한다.
     from urllib.parse import urlparse, urlunparse
 
     parsed = urlparse(url or "")
@@ -249,6 +251,7 @@ def _clean_notebook_url(url: str) -> str:
 
 
 def _load_sources_by_notebook() -> dict[str, int]:
+    # sources_log.json을 읽어 "노트북별 현재 소스 개수"만 빠르게 집계한다.
     try:
         if not SOURCES_LOG_JSON.exists():
             return {}
@@ -278,10 +281,13 @@ def _get_notebook_url(channel_id: str) -> Optional[str]:
             source_counts = _load_sources_by_notebook()
             current_count = source_counts.get(current_clean, 0)
 
+            # 현재 active notebook이 실제 소스를 하나라도 갖고 있으면 그대로 사용한다.
             if current_count > 0 or "addSource=true" not in current_raw:
                 logger.info("[resolve] channel_id=%s → %s", channel_id, current_clean)
                 return current_clean
 
+            # 새로 만든 빈 노트북만 active로 잡힌 경우를 대비해,
+            # history에서 실제 소스가 들어 있는 이전 노트북을 역으로 찾는다.
             history = ch.get("history") or []
             for item in history:
                 candidate_clean = _clean_notebook_url(item.get("notebook_url", ""))
@@ -320,6 +326,8 @@ def _run_generate_report(
     if not notebook_url:
         return GenerateResponse(status="error", error="notebook_url이 필요합니다.")
 
+    # 실제 브라우저 자동화는 generate_report_cua.py에 있고,
+    # API 레이어는 subprocess 입출력과 timeout/로그 관리만 담당한다.
     cmd = [
         "python3",
         str(SCRIPTS_DIR / "generate_report_cua.py"),
@@ -350,7 +358,7 @@ def _run_generate_report(
     stderr = result.stderr or ""
     logger.info("[notebooklm] subprocess done job_id=%s returncode=%d", job_id, result.returncode)
 
-    # 서브프로세스 로그를 항상 출력 (로그인/CUA 흐름 추적용)
+    # Playwright/CUA 디버깅이 가능하도록 stdout/stderr를 그대로 서비스 로그에 남긴다.
     if stdout.strip():
         for line in stdout.strip().splitlines():
             logger.info("[script] %s", line)
@@ -363,7 +371,7 @@ def _run_generate_report(
         logger.error("[notebooklm] generate_report failed job_id=%s: %s", job_id, error_msg)
         return GenerateResponse(status="error", error=error_msg[:500])
 
-    # 출력 파일 읽기
+    # 성공 시 CUA 스크립트가 저장한 txt 파일을 다시 읽어 gateway가 쓰기 쉬운 형태로 감싼다.
     if not output_path.exists():
         logger.error("[notebooklm] output file not found job_id=%s path=%s", job_id, output_path)
         return GenerateResponse(status="error", error=f"output file not found: {output_path}")
@@ -398,6 +406,7 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
     ]
     logger.info("[notebooklm] list_reports subprocess: %s", cmd)
 
+    # 같은 명령을 재실행할 수 있도록 subprocess runner를 감싼다.
     env = _cua_subprocess_env()
 
     def _exec_list_once() -> subprocess.CompletedProcess:
@@ -412,6 +421,7 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
 
     raw_err_first = (result.stderr or result.stdout or "").strip()
     if result.returncode != 0 and _is_playwright_browser_missing(raw_err_first):
+        # 브라우저 런타임 누락은 1회 자동 복구를 시도한 뒤 재실행한다.
         if _install_playwright_chromium(env, "list-reports"):
             try:
                 result = _exec_list_once()
@@ -438,7 +448,7 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
             ):
                 concise_err = "Playwright browser runtime missing. Rebuild notebooklm-service image with Chromium."
                 error_tail = ""
-            # traceback 전체 대신 마지막 핵심 라인(예외 타입/메시지)을 우선 노출
+            # Discord에는 traceback 전체 대신 마지막 핵심 라인을 우선 노출한다.
             if not concise_err:
                 concise_err = lines[-1] if lines else raw_err
             if lines:
@@ -465,6 +475,7 @@ def _run_get_report(
     output_path: Path,
 ) -> GenerateResponse:
     """subprocess로 --mode get 실행 → 기존 보고서 추출."""
+    # list 모드로 제목만 본 뒤, 사용자가 고른 index의 실제 보고서 본문을 다시 추출한다.
     cmd = [
         "python3",
         str(SCRIPTS_DIR / "generate_report_cua.py"),
@@ -518,6 +529,7 @@ async def generate(
     """NotebookLM 보고서 생성. 실패 시에도 HTTP 200 + status="error" 반환."""
     verify_secret(x_internal_secret)
 
+    # channel_id 기반 호출이 기본이라 notebook_url은 library.json에서 후결정한다.
     notebook_url = body.notebook_url or (
         _get_notebook_url(body.channel_id) if body.channel_id else None
     )
@@ -531,6 +543,7 @@ async def generate(
     output_filename = _build_filename(body.job_id, "txt")
     output_path = REPORTS_DIR / output_filename
 
+    # subprocess는 blocking이므로 FastAPI event loop를 막지 않게 executor로 넘긴다.
     import asyncio
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -558,6 +571,7 @@ async def list_reports_endpoint(
     if not notebook_url:
         return ListReportsResponse(status="error", error="notebook_url을 결정할 수 없습니다.")
 
+    # 보고서 목록 조회도 동일하게 blocking subprocess를 executor에서 실행한다.
     import asyncio
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(_executor, _run_list_reports, notebook_url)
@@ -581,6 +595,7 @@ async def get_report_endpoint(
     output_filename = _build_filename(body.job_id, "txt")
     output_path = REPORTS_DIR / output_filename
 
+    # 기존 보고서 본문 추출 역시 브라우저 자동화라 executor 경유가 필요하다.
     import asyncio
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -596,6 +611,8 @@ async def get_report_endpoint(
 
 def _save_notebook_url_to_library(channel_id: str, channel_name: str, notebook_url: str) -> None:
     """library.json의 channels[channel_id]에 notebook_url + name을 저장 (history는 건드리지 않음)."""
+    # CUA fallback으로 찾은 notebook_url을 즉시 library.json에 반영해
+    # 다음 호출부터는 홈 화면 탐색 없이 바로 접근할 수 있게 한다.
     try:
         lib: dict = {}
         if LIBRARY_JSON.exists():
@@ -625,6 +642,7 @@ def _get_notebook_url_via_cua(channel_name: str, channel_id: str) -> Optional[st
         "--output", output_path,
         "--headless",
     ]
+    # library.json에 없을 때만 NotebookLM 홈 화면을 직접 뒤져 notebook_url을 찾는다.
     logger.info("[cua-fallback] FIND_NB 시작: channel_name=%r", channel_name)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=_cua_subprocess_env())
@@ -665,7 +683,7 @@ def _run_check_and_add_source(
     scripts_dir = SCRIPTS_DIR
     manage_script = scripts_dir / "manage_sources_cua.py"
 
-    # Step 0: notebook_url 미결정 시 CUA 폴백
+    # Step 0: notebook_url이 없으면 채널명 기반 CUA fallback으로 먼저 노트북을 찾는다.
     if not notebook_url:
         if not channel_name:
             return AddSourceResponse(status="error", error="notebook_url도 channel_name도 없음")
@@ -676,7 +694,7 @@ def _run_check_and_add_source(
                 error=f"CUA fallback 실패: channel_name={channel_name!r}",
             )
 
-    # Step 1: 중복 확인 (sources_log.json 직접 읽기)
+    # Step 1: sources_log.json을 읽어 같은 notebook_url 내 중복 URL은 미리 건너뛴다.
     sources_log_path = DATA_DIR / "sources_log.json"
     try:
         if sources_log_path.exists():
@@ -690,7 +708,7 @@ def _run_check_and_add_source(
     except Exception as e:
         logger.warning("[add-source] 중복 체크 실패: %s", e)
 
-    # Step 2: 소스 추가
+    # Step 2: 실제 add 모드 subprocess로 NotebookLM에 소스를 삽입한다.
     add_cmd = [
         "python3", str(manage_script),
         "--mode", "add",
@@ -716,7 +734,7 @@ def _run_check_and_add_source(
         err = (result.stderr or result.stdout or "").strip()[:400]
         return AddSourceResponse(status="error", error=err)
 
-    # Step 3: 슬라이딩 윈도우 정리
+    # Step 3: 최대 소스 수를 넘기면 cleanup 모드로 오래된 항목을 정리한다.
     cleaned_up = 0
     cleanup_cmd = [
         "python3", str(manage_script),
@@ -794,6 +812,7 @@ async def create_notebook_endpoint(
     """새 NotebookLM 노트북을 생성하고 library.json에 등록한다."""
     verify_secret(x_internal_secret)
 
+    # 노트북 생성도 브라우저 자동화라 executor로 분리한다.
     import asyncio
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -814,10 +833,12 @@ async def check_and_add_source(
     """YouTube URL 등을 NotebookLM 소스로 추가. 중복 체크 + 슬라이딩 윈도우 정리 포함."""
     verify_secret(x_internal_secret)
 
+    # 명시 notebook_url이 없으면 channel_id -> library.json 조회 결과를 우선 사용한다.
     notebook_url = body.notebook_url or (
         _get_notebook_url(body.channel_id) if body.channel_id else None
     ) or ""
 
+    # add-source 전체 흐름도 여러 subprocess를 사용하므로 executor에서 실행한다.
     import asyncio
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -857,6 +878,8 @@ async def all_channels_endpoint(
 async def health(
     x_internal_secret: Optional[str] = Header(default=None),
 ) -> dict:
+    # 내부 secret 유효성은 단순 true/false로만 보여 주고,
+    # active notebook 이름은 운영 상태를 빠르게 확인하는 용도다.
     auth_ok = x_internal_secret == settings.gateway_internal_secret
 
     active_notebook = None

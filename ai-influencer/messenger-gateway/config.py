@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/wf-05-confirm"
     n8n_wf06_webhook_url: str = "http://n8n:5678/webhook/wf-06-report"
     n8n_wf11_webhook_url: str = "http://n8n:5678/webhook/wf-11-tts-generate"
-    n8n_wf12_webhook_url: str = "http://n8n:5678/webhook/wf-12-heygen-generate"
+    n8n_wf12_webhook_url: str = "http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2"
     n8n_wf08_webhook_url: str = "http://n8n:5678/webhook/wf-08-sns-upload"
 
     notebooklm_service_url: str = "http://notebooklm-service:8090"
@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     heygen_avatar_id: str = ""
     heygen_api_base_url: str = "https://api.heygen.com"
     heygen_upload_base_url: str = "https://upload.heygen.com"
+    heygen_video_width: int = 1080
+    heygen_video_height: int = 1920
+    heygen_caption_enabled: bool = False
+    heygen_speed: float = 1.3
+    heygen_poll_interval_seconds: int = 10
+    heygen_max_wait_seconds: int = 900
+    heygen_mock_enabled: bool = False
+    heygen_mock_video_url: str = "https://samplelib.com/lib/preview/mp4/sample-5s.mp4"
 
     # Cross-account S3 (AssumeRole)
     media_s3_bucket: str = ""

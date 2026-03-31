@@ -134,6 +134,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 - HeyGen 실제 영상 생성 전에 인증/잔여 quota/avatar 접근만 검증
 - 영상 생성은 호출하지 않으므로 과금 없는 스모크 테스트 용도
 - 선택 body: `{ "avatar_id": "..." }`
+- 응답에 현재 WF-12 기본값(`width/height/caption/speed/poll/max_wait/mock`)도 포함
 
 ### `POST /internal/character-avatar`
 
@@ -492,7 +493,7 @@ Discord 사용자: /report
 | `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, 채널별 RSS 조회/재시도, 새 영상 필터 | source 추가 성공 시 gateway `/internal/auto-report` → WF-06 |
 | `WF-10-daily-notebook.json` | Schedule(매일 00:00) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
 | `WF-11_tts_generate.json` | Webhook | `POST /webhook/wf-11-tts-generate` | TTS 생성, WAV 저장, Discord 전송, `audio_url` 저장 | 승인 대기 또는 자동 WF-12 |
-| `WF-12_heygen_generate.json` | Webhook | `POST /webhook/wf-12-heygen-generate` | HeyGen 생성/폴링, 성공/실패 분기 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
+| `WF-12_heygen_generate.json` | Webhook | `POST /webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` | HeyGen 생성/폴링 또는 mock preview 생성 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
 
 참고:
 - 기존 단일 워크플로 `WF-07`은 삭제되었고, `WF-11`/`WF-12`로 완전 분리되었습니다.
@@ -590,12 +591,20 @@ nano .env   # 또는 vi .env
 | `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/wf-11-tts-generate` |
-| `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/wf-12-heygen-generate` |
+| `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
 | `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
 | `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
+| `HEYGEN_VIDEO_WIDTH` | WF-12 출력 영상 너비 | `1080` |
+| `HEYGEN_VIDEO_HEIGHT` | WF-12 출력 영상 높이 | `1920` |
+| `HEYGEN_CAPTION_ENABLED` | HeyGen caption 사용 여부 | `false` |
+| `HEYGEN_SPEED` | WF-12 audio voice speed | `1.3` |
+| `HEYGEN_POLL_INTERVAL_SECONDS` | HeyGen 상태 polling 간격(초) | `10` |
+| `HEYGEN_MAX_WAIT_SECONDS` | HeyGen 최대 대기 시간(초) | `900` |
+| `HEYGEN_MOCK_ENABLED` | WF-12 mock preview 모드 | `false` |
+| `HEYGEN_MOCK_VIDEO_URL` | mock 모드 샘플 mp4 URL | `https://samplelib.com/lib/preview/mp4/sample-5s.mp4` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
 | `OPENAI_API_KEY` | OpenAI API 키 | |

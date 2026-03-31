@@ -103,7 +103,6 @@ async def call_wf12_heygen_generate(
     job_id: str,
     channel_id: str,
     user_id: str,
-    audio_file_path: str = "",
     audio_url: str = "",
     avatar_id: str = "",
 ) -> None:
@@ -111,7 +110,6 @@ async def call_wf12_heygen_generate(
         "job_id": job_id,
         "channel_id": channel_id,
         "user_id": user_id,
-        "audio_file_path": audio_file_path,
         "audio_url": audio_url,
         "avatar_id": avatar_id,
     }

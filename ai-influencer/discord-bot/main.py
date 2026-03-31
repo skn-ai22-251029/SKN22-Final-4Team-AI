@@ -55,6 +55,8 @@ _gateway_client: Optional[httpx.AsyncClient] = None
 
 
 def get_gateway_client() -> httpx.AsyncClient:
+    # Discord bot은 모든 실제 비즈니스 처리를 gateway에 위임하므로
+    # base_url/secret 이 고정된 단일 HTTP 클라이언트를 재사용한다.
     global _gateway_client
     if _gateway_client is None:
         _gateway_client = httpx.AsyncClient(
@@ -79,6 +81,7 @@ def _error_detail_from_response(resp: httpx.Response) -> str:
 
 
 async def gateway_call(path: str, payload: dict) -> dict[str, Any]:
+    # slash command / 버튼 이벤트는 모두 이 헬퍼를 통해 gateway 내부 API로 전달된다.
     try:
         resp = await get_gateway_client().post(path, json=payload)
         if resp.status_code >= 400:
@@ -197,6 +200,8 @@ async def on_message(message: discord.Message) -> None:
 
     # 수정 지시 텍스트 대기 중인 경우에만 처리
     if user_id in revision_pending:
+        # 버튼으로 "수정 지시"를 누른 직후 사용자가 보내는 다음 메시지를
+        # revision_note로 간주해 confirm-action으로 전달한다.
         job_id = revision_pending.pop(user_id)
         try:
             await gateway_call(
@@ -225,6 +230,7 @@ async def create_command(interaction: discord.Interaction, concept: str) -> None
 
     await interaction.response.defer()
 
+    # Discord에서는 job_id만 만들고, 실제 job 생성과 WF-01 시작은 gateway가 맡는다.
     job_id = str(uuid.uuid4())
     image_url = interaction.message.attachments[0].url if interaction.message and interaction.message.attachments else None
 
@@ -282,6 +288,7 @@ async def report_command(
 
     await interaction.response.defer()
 
+    # /report는 사용자가 프롬프트를 비워도 동작하도록 기본 템플릿을 앞에 붙여 보낸다.
     job_id = str(uuid.uuid4())
     cleaned_prompt = (prompt or "").strip()
     merged_prompt = _REPORT_SYSTEM_PROMPT + cleaned_prompt
@@ -328,6 +335,7 @@ async def tts_command(interaction: discord.Interaction, job_id: str = "") -> Non
 
         await _safe_defer(interaction, ephemeral=True)
         normalized_job_id = (job_id or "").strip()
+        # job_id가 비어 있으면 gateway가 현재 사용자/채널의 최근 적합 job을 선택한다.
         result = await gateway_call(
             "/internal/tts-generate",
             {
@@ -370,6 +378,7 @@ async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> 
 
         await _safe_defer(interaction, ephemeral=True)
         normalized_job_id = (job_id or "").strip()
+        # /heygen도 /tts와 동일하게 "최근 job 자동 선택"을 gateway 쪽 규칙에 맡긴다.
         result = await gateway_call(
             "/internal/heygen-generate",
             {
@@ -465,6 +474,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("잘못된 요청입니다.", ephemeral=True)
         return
 
+    # custom_id 포맷만 보고 어떤 gateway endpoint를 칠지 결정한다.
     parts = custom_id.split(":")
     action = parts[0]
     # video_reject_step: video_reject_step:{job_id}:{step}
@@ -478,6 +488,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     step = None
     report_index = None
     channel_id_value = None
+    # 버튼 종류마다 인코딩된 파라미터 수가 달라서 여기서 먼저 분해한다.
     if action == "video_reject_step" and len(parts) >= 3:
         job_id = parts[1]
         step = parts[2]
@@ -504,10 +515,11 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
         return
 
-    # Discord 3초 응답 제한 — 먼저 defer
+    # Discord 컴포넌트는 3초 안에 응답해야 하므로 먼저 defer하고 실제 처리는 뒤에서 한다.
     await interaction.response.defer()
 
     if action == "approve":
+        # 스크립트 승인 -> gateway confirm-action -> WF-05 -> WF-11 경로로 이어진다.
         try:
             await gateway_call(
                 "/internal/confirm-action",
@@ -517,10 +529,12 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "revise":
+        # 수정 지시는 별도 모달 대신 "다음 일반 메시지 1개"를 revision_note로 받는다.
         revision_pending[user_id] = job_id
         await interaction.channel.send("✏️ 어떤 점을 수정할까요? 구체적으로 입력해주세요.")
 
     elif action == "video_approve":
+        # 영상 승인 -> gateway video-action -> WF-08(SNS 업로드) 호출.
         try:
             await gateway_call(
                 "/internal/video-action",
@@ -530,6 +544,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "video_reject":
+        # 즉시 반려하지 않고, 어느 단계(script/tts/draft)로 되돌릴지 한 번 더 묻는다.
         try:
             await gateway_call(
                 "/internal/video-action",
@@ -539,6 +554,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "video_reject_step":
+        # reject_step은 이미 선택된 되돌림 단계를 gateway에 그대로 전달한다.
         try:
             await gateway_call(
                 "/internal/video-action",
@@ -548,6 +564,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "tts_approve":
+        # TTS 승인 -> gateway tts-action -> WF-12(HeyGen) 호출.
         try:
             await gateway_call(
                 "/internal/tts-action",
@@ -558,6 +575,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "tts_reject":
+        # TTS 반려는 job을 대본 승인 상태로 되돌려 수동 재생성을 가능하게 한다.
         try:
             await gateway_call(
                 "/internal/tts-action",
@@ -568,6 +586,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "report_to_video":
+        # 보고서 결과에서 바로 영상 제작 모드로 진입하면 gateway가 TTS 후 WF-12까지 자동으로 잇는다.
         try:
             await gateway_call(
                 "/internal/report-to-video",
@@ -578,6 +597,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "report_to_tts":
+        # 보고서 결과에서 TTS만 제작하는 분기.
         try:
             await gateway_call(
                 "/internal/report-to-tts",
@@ -588,6 +608,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "select_report":
+        # 기존 보고서 선택 -> gateway가 get-report 또는 새 생성 fallback을 결정한다.
         try:
             await gateway_call(
                 "/internal/report-select",
@@ -603,6 +624,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "new_report":
+        # 새 보고서 생성 -> gateway가 WF-06을 새로 트리거한다.
         try:
             await gateway_call(
                 "/internal/report-select",
@@ -613,6 +635,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "select_channel":
+        # 채널 선택 -> gateway background task가 list-reports를 조회하고 버튼을 다시 내려준다.
         try:
             await gateway_call(
                 "/internal/channel-select",
