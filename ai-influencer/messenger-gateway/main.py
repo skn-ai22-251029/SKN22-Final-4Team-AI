@@ -404,6 +404,51 @@ def _extract_json_object(text: str) -> dict:
     return {}
 
 
+def _extract_topic_keywords(raw_report_text: str) -> list[str]:
+    header = (raw_report_text or "").strip().splitlines()
+    if not header:
+        return []
+    first_line = header[0]
+    normalized = re.sub(r"[\[\]\(\)\{\}:,./*\"'“”‘’\-–—]+", " ", first_line)
+    candidates = re.findall(r"[A-Za-z0-9.+#-]{2,}|[가-힣]{2,}", normalized)
+    blocked = {
+        "기술",
+        "보고서",
+        "분석",
+        "메커니즘",
+        "학문적",
+        "통찰",
+        "시대",
+        "서론",
+        "개념적",
+        "정의",
+        "전략적",
+        "시사점",
+        "글로벌",
+        "현대",
+        "차세대",
+    }
+    keywords: list[str] = []
+    for candidate in candidates:
+        token = candidate.strip()
+        if len(token) < 2 or token in blocked:
+            continue
+        if token not in keywords:
+            keywords.append(token)
+    return keywords[:5]
+
+
+def _validate_rewritten_scripts(raw_report_text: str, subtitle_script_text: str, tts_script_text: str) -> None:
+    keywords = _extract_topic_keywords(raw_report_text)
+    if not keywords:
+        return
+    subtitle_ok = any(keyword in subtitle_script_text for keyword in keywords)
+    tts_ok = any(keyword in tts_script_text for keyword in keywords)
+    if subtitle_ok and tts_ok:
+        return
+    raise RuntimeError(f"script rewrite topic drift detected; missing keywords={keywords}")
+
+
 async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> tuple[str, str]:
     # NotebookLM 원문 보고서를 한 번 더 정제해
     # 자막용/ TTS용 스크립트를 동시에 만든다.
@@ -415,6 +460,8 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
     try:
         response = await client.chat.completions.create(
             model=settings.script_rewrite_model,
+            temperature=0,
+            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system",
@@ -440,6 +487,7 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
     tts_script_text = str(payload.get("tts_script_text") or "").strip()
     if not subtitle_script_text or not tts_script_text:
         raise RuntimeError("script rewrite returned missing subtitle/tts content")
+    _validate_rewritten_scripts(raw_report_text, subtitle_script_text, tts_script_text)
     return subtitle_script_text, tts_script_text
 
 
