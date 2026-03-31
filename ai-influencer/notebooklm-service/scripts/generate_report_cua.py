@@ -593,6 +593,30 @@ def _focus_first_visible(page, selectors: list[str], *, timeout_ms: int = 1500) 
     return False
 
 
+def _is_prompt_input_visible(page, selectors: list[str], *, timeout_ms: int = 800) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            logger.info("[dom] prompt input visible selector=%s", selector)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _get_report_prompt_selectors() -> list[str]:
+    """Fast Research/검색 입력창과 구분되는 보고서 맞춤설정 대화상자 전용 입력창 셀렉터."""
+    return [
+        "mat-dialog-container textarea[aria-label*='만들려는 보고서']",
+        "mat-dialog-container textarea[placeholder*='새로운 웰니스 음료 출시']",
+        "report-customization-dialog textarea[aria-label*='만들려는 보고서']",
+        "report-customization-dialog textarea[placeholder*='새로운 웰니스 음료 출시']",
+        "textarea[aria-label*='만들려는 보고서']",
+        "textarea[placeholder*='새로운 웰니스 음료 출시']",
+    ]
+
+
 def _dismiss_blocking_dialogs(page) -> None:
     try:
         page.keyboard.press("Escape")
@@ -619,38 +643,74 @@ def _try_dom_prepare_report_prompt(page) -> bool:
     _ensure_studio_panel_visible(page)
 
     report_selectors = [
+        "div[role='button'][aria-label='보고서']",
+        "div[role='button'][aria-label*='보고서']",
         "button:has-text('보고서')",
         "[role='button']:has-text('보고서')",
         "[aria-label='보고서']",
+        "[aria-label*='보고서']",
         "button:has-text('Report')",
         "[role='button']:has-text('Report')",
         "[aria-label='Report']",
+        "[aria-label*='Report']",
     ]
     custom_selectors = [
+        "button[aria-label='직접 만들기']",
+        "button[aria-label*='직접 만들기']",
         "button:has-text('직접 만들기')",
         "[role='button']:has-text('직접 만들기')",
         "[aria-label='직접 만들기']",
+        "button:has-text('사용자 지정')",
+        "[role='button']:has-text('사용자 지정')",
+        "[aria-label*='사용자 지정']",
+        "button:has-text('맞춤')",
+        "[role='button']:has-text('맞춤')",
+        "button:has-text('직접 작성')",
+        "[role='button']:has-text('직접 작성')",
         "button:has-text('Custom')",
         "[role='button']:has-text('Custom')",
         "[aria-label='Custom']",
+        "[aria-label*='Custom']",
+        "button:has-text('Make your own')",
+        "[role='button']:has-text('Make your own')",
     ]
-    input_selectors = [
-        "textarea",
-        "[role='textbox']",
-        ".ProseMirror",
-        "[contenteditable='true']",
-    ]
+    input_selectors = _get_report_prompt_selectors()
+
+    # 최근 UI에서는 custom 입력창이 이미 열린 상태로 시작할 수 있어
+    # report/custom 카드 진입 전에 바로 포커스를 시도한다.
+    if _is_prompt_input_visible(page, input_selectors, timeout_ms=1200):
+        return _focus_first_visible(page, input_selectors, timeout_ms=1200)
 
     if not (
         _click_first_visible(page, report_selectors, timeout_ms=2500)
         or _click_first_text(page, ["보고서", "Report"], exact=True, timeout_ms=2500)
+        or _click_first_text(page, ["보고서", "Report"], exact=False, timeout_ms=2500)
     ):
         logger.info("[dom] report tile not found")
         return False
+
+    # 일부 UI에서는 보고서 카드 클릭 직후 곧바로 입력창이 열린다.
+    if _is_prompt_input_visible(page, input_selectors, timeout_ms=1500):
+        return _focus_first_visible(page, input_selectors, timeout_ms=1500)
+
     if not (
         _click_first_visible(page, custom_selectors, timeout_ms=2500)
-        or _click_first_text(page, ["직접 만들기", "Custom"], exact=True, timeout_ms=2500)
+        or _click_first_text(
+            page,
+            ["직접 만들기", "사용자 지정", "맞춤", "직접 작성", "Custom", "Make your own"],
+            exact=True,
+            timeout_ms=2500,
+        )
+        or _click_first_text(
+            page,
+            ["직접 만들기", "사용자 지정", "맞춤", "직접 작성", "Custom", "Make your own"],
+            exact=False,
+            timeout_ms=2500,
+        )
     ):
+        # custom 선택 버튼 문구가 바뀌었더라도 입력창이 이미 떴다면 성공으로 본다.
+        if _is_prompt_input_visible(page, input_selectors, timeout_ms=1500):
+            return _focus_first_visible(page, input_selectors, timeout_ms=1500)
         logger.info("[dom] custom option not found")
         return False
     if not _focus_first_visible(page, input_selectors, timeout_ms=2500):
@@ -662,8 +722,12 @@ def _try_dom_prepare_report_prompt(page) -> bool:
 def _try_dom_click_generate(page) -> bool:
     """생성 버튼을 DOM 셀렉터로 클릭 시도."""
     selectors = [
+        "mat-dialog-container button:has-text('생성')",
+        "report-customization-dialog button:has-text('생성')",
         "button:has-text('생성')",
         "[role='button']:has-text('생성')",
+        "mat-dialog-container button:has-text('Generate')",
+        "report-customization-dialog button:has-text('Generate')",
         "button:has-text('Generate')",
         "[role='button']:has-text('Generate')",
     ]
@@ -1343,10 +1407,17 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
         if _try_dom_prepare_report_prompt(page):
             logger.info("[CUA] Phase 1 완료: DOM 경로로 입력 필드 포커스됨")
         else:
-            if not _run_cua_loop(page, client, TASK_PHASE1, max_steps=15, phase="P1"):
-                context.close()
-                raise RuntimeError("Phase 1 실패: 입력 필드 포커스 불가 (15 스텝 초과)")
-            logger.info("[CUA] Phase 1 완료: CUA 경로로 입력 필드 포커스됨")
+            if not _run_cua_loop(page, client, TASK_PHASE1, max_steps=25, phase="P1"):
+                # CUA가 한 차례 실패한 뒤에도 DOM 경로가 다시 열릴 수 있어 재확인한다.
+                _dismiss_blocking_dialogs(page)
+                time.sleep(1)
+                if _try_dom_prepare_report_prompt(page):
+                    logger.info("[CUA] Phase 1 완료: CUA 실패 후 DOM 재시도로 입력 필드 포커스됨")
+                else:
+                    context.close()
+                    raise RuntimeError("Phase 1 실패: 입력 필드 포커스 불가 (DOM/CUA 재시도 후에도 실패)")
+            else:
+                logger.info("[CUA] Phase 1 완료: CUA 경로로 입력 필드 포커스됨")
 
         # Phase 2: Playwright로 직접 프롬프트 입력 (GPT에 프롬프트 텍스트 비노출)
         logger.info("[CUA] Phase 2: 프롬프트 직접 입력 (%d chars)", len(prompt))

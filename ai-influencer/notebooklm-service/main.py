@@ -41,6 +41,7 @@ DATA_DIR = Path(os.getenv("NOTEBOOKLM_DATA_DIR", "/app/data"))
 REPORTS_DIR = DATA_DIR / "reports"
 LIBRARY_JSON = DATA_DIR / "library.json"
 SOURCES_LOG_JSON = DATA_DIR / "sources_log.json"
+REPORTS_LOG_JSON = DATA_DIR / "reports_log.json"
 
 
 def _load_kst_timezone():
@@ -217,6 +218,10 @@ class NotebookStateResponse(BaseModel):
     notebook_url: str = ""
     active_source_count: int = 0
     has_sources: bool = False
+    active_report_count: int = 0
+    has_reports: bool = False
+    latest_source_url: str = ""
+    latest_source_title: str = ""
     error: Optional[str] = None
 
 
@@ -279,6 +284,72 @@ def _load_sources_by_notebook() -> dict[str, int]:
     except Exception as e:
         logger.warning("[resolve] sources_log.json 읽기 실패: %s", e)
         return {}
+
+
+def _get_latest_source_for_notebook(notebook_url: str) -> tuple[str, str]:
+    clean_target = _clean_notebook_url(notebook_url)
+    if not clean_target or not SOURCES_LOG_JSON.exists():
+        return "", ""
+    try:
+        data = json.loads(SOURCES_LOG_JSON.read_text(encoding="utf-8"))
+        latest_item = None
+        latest_added_at = ""
+        for item in data.get("sources", []):
+            item_url = _clean_notebook_url(item.get("notebook_url", ""))
+            if item_url != clean_target:
+                continue
+            added_at = str(item.get("added_at") or "")
+            if latest_item is None or added_at > latest_added_at:
+                latest_item = item
+                latest_added_at = added_at
+        if not latest_item:
+            return "", ""
+        return str(latest_item.get("url") or ""), str(latest_item.get("title") or "")
+    except Exception as e:
+        logger.warning("[resolve] latest source 조회 실패: %s", e)
+        return "", ""
+
+
+def _load_reports_by_notebook() -> dict[str, int]:
+    try:
+        if not REPORTS_LOG_JSON.exists():
+            return {}
+        data = json.loads(REPORTS_LOG_JSON.read_text(encoding="utf-8"))
+        counts: dict[str, int] = {}
+        for item in data.get("reports", []):
+            clean_url = _clean_notebook_url(item.get("notebook_url", ""))
+            if not clean_url:
+                continue
+            counts[clean_url] = counts.get(clean_url, 0) + 1
+        return counts
+    except Exception as e:
+        logger.warning("[resolve] reports_log.json 읽기 실패: %s", e)
+        return {}
+
+
+def _log_report_presence(notebook_url: str, *, source: str, job_id: str = "") -> None:
+    clean_url = _clean_notebook_url(notebook_url)
+    if not clean_url:
+        return
+    try:
+        log = {"reports": []}
+        if REPORTS_LOG_JSON.exists():
+            log = json.loads(REPORTS_LOG_JSON.read_text(encoding="utf-8"))
+        log.setdefault("reports", []).append(
+            {
+                "notebook_url": clean_url,
+                "job_id": job_id,
+                "source": source,
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        REPORTS_LOG_JSON.parent.mkdir(parents=True, exist_ok=True)
+        REPORTS_LOG_JSON.write_text(
+            json.dumps(log, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning("[resolve] report presence 기록 실패: %s", e)
 
 
 def _get_active_notebook_url(channel_id: str) -> Optional[str]:
@@ -352,12 +423,19 @@ def _get_notebook_state(channel_id: str) -> NotebookStateResponse:
 
     source_counts = _load_sources_by_notebook()
     active_source_count = source_counts.get(notebook_url, 0)
+    report_counts = _load_reports_by_notebook()
+    active_report_count = report_counts.get(notebook_url, 0)
+    latest_source_url, latest_source_title = _get_latest_source_for_notebook(notebook_url)
     return NotebookStateResponse(
         status="success",
         channel_id=channel_id,
         notebook_url=notebook_url,
         active_source_count=active_source_count,
         has_sources=active_source_count > 0,
+        active_report_count=active_report_count,
+        has_reports=active_report_count > 0,
+        latest_source_url=latest_source_url,
+        latest_source_title=latest_source_title,
     )
 
 
@@ -429,6 +507,7 @@ def _run_generate_report(
     file_b64 = base64.b64encode(file_bytes).decode("utf-8")
 
     logger.info("[notebooklm] report ready job_id=%s size=%d chars", job_id, len(report_content))
+    _log_report_presence(notebook_url, source="generate", job_id=job_id)
     return GenerateResponse(
         status="success",
         report_content=report_content,
@@ -509,6 +588,8 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
 
     try:
         titles = json.loads(Path(output_path).read_text(encoding="utf-8"))
+        if titles:
+            _log_report_presence(notebook_url, source="list")
         return ListReportsResponse(status="success", reports=titles)
     except Exception as e:
         return ListReportsResponse(status="error", error=f"JSON 파싱 실패: {e}")
@@ -557,6 +638,7 @@ def _run_get_report(
     report_content = output_path.read_text(encoding="utf-8")
     file_b64 = base64.b64encode(output_path.read_bytes()).decode("utf-8")
     logger.info("[notebooklm] get_report ready job_id=%s size=%d chars", job_id, len(report_content))
+    _log_report_presence(notebook_url, source="get", job_id=job_id)
     return GenerateResponse(
         status="success",
         report_content=report_content,
@@ -742,21 +824,8 @@ def _run_check_and_add_source(
                 error=f"CUA fallback 실패: channel_name={channel_name!r}",
             )
 
-    # Step 1: sources_log.json을 읽어 같은 notebook_url 내 중복 URL은 미리 건너뛴다.
-    sources_log_path = DATA_DIR / "sources_log.json"
-    try:
-        if sources_log_path.exists():
-            log = json.loads(sources_log_path.read_text(encoding="utf-8"))
-            if any(
-                s["url"] == source_url and s.get("notebook_url") == notebook_url
-                for s in log.get("sources", [])
-            ):
-                logger.info("[add-source] 중복 건너뜀: %s", source_url)
-                return AddSourceResponse(status="ok", duplicate=True)
-    except Exception as e:
-        logger.warning("[add-source] 중복 체크 실패: %s", e)
-
-    # Step 2: 실제 add 모드 subprocess로 NotebookLM에 소스를 삽입한다.
+    # Step 1: 실제 add 모드 subprocess로 NotebookLM에 소스를 삽입한다.
+    # sources_log.json은 보조 캐시일 뿐이라, 중복 판정은 subprocess 내부의 실제 UI 확인 결과를 따른다.
     add_cmd = [
         "python3", str(manage_script),
         "--mode", "add",
@@ -782,7 +851,12 @@ def _run_check_and_add_source(
         err = (result.stderr or result.stdout or "").strip()[:400]
         return AddSourceResponse(status="error", error=err)
 
-    # Step 3: 최대 소스 수를 넘기면 cleanup 모드로 오래된 항목을 정리한다.
+    stdout = result.stdout or ""
+    if "Duplicate skipped:" in stdout:
+        logger.info("[add-source] UI 기준 중복 건너뜀: %s", source_url)
+        return AddSourceResponse(status="ok", duplicate=True)
+
+    # Step 2: 최대 소스 수를 넘기면 cleanup 모드로 오래된 항목을 정리한다.
     cleaned_up = 0
     cleanup_cmd = [
         "python3", str(manage_script),

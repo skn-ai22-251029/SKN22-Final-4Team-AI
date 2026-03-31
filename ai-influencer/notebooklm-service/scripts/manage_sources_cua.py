@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 from playwright.sync_api import sync_playwright
 
@@ -75,6 +76,11 @@ def _is_duplicate(url: str, notebook_url: str) -> bool:
     )
 
 
+def _clean_notebook_url(notebook_url: str) -> str:
+    parsed = urlparse(notebook_url)
+    return urlunparse(parsed._replace(query="", fragment=""))
+
+
 def _log_add(url: str, title: str, notebook_url: str) -> None:
     log = _load_log()
     log.setdefault("sources", []).append({
@@ -93,6 +99,43 @@ def _log_delete(url: str, notebook_url: str) -> None:
         if not (s["url"] == url and s.get("notebook_url") == notebook_url)
     ]
     _save_log(log)
+
+
+def _source_exists_on_page(page, notebook_url: str, source_url: str, source_title: str) -> bool:
+    """실제 Sources 패널에 대상 소스가 보이는지 확인한다."""
+    page.goto(_clean_notebook_url(notebook_url), wait_until="domcontentloaded", timeout=90000)
+    _assert_allowed_url(page.url, "SRC_EXISTS_NAVIGATE")
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        pass
+    _ensure_logged_in(page)
+    time.sleep(2)
+
+    body_text = page.inner_text("body")
+    source_pos = body_text.find("소스")
+    if source_pos >= 0:
+        body_text = body_text[source_pos:source_pos + 6000]
+
+    candidates = []
+    title = (source_title or "").strip()
+    if title:
+        candidates.append(title)
+        if len(title) > 24:
+            candidates.append(title[:24])
+    if source_url:
+        candidates.append(source_url)
+        if "watch?v=" in source_url:
+            candidates.append(source_url.split("watch?v=", 1)[1][:11])
+        if "youtu.be/" in source_url:
+            candidates.append(source_url.rsplit("/", 1)[-1][:11])
+
+    for needle in candidates:
+        if needle and needle in body_text:
+            logger.info("[source_exists] UI 확인됨: %s", needle)
+            return True
+
+    return False
 
 
 def _get_oldest_sources(notebook_url: str, keep: int) -> list[dict]:
@@ -152,9 +195,7 @@ def _try_dom_add_youtube(page, source_url: str) -> bool:
 def add_source_cua(page, client, notebook_url: str, source_url: str, source_title: str) -> bool:
     """NotebookLM 소스 패널에 URL 추가. YouTube는 DOM 먼저, 실패 시 CUA 폴백."""
     # ?addSource=true 없는 깨끗한 URL로 이동
-    from urllib.parse import urlparse, urlunparse
-    parsed = urlparse(notebook_url)
-    clean_url = urlunparse(parsed._replace(query="", fragment=""))
+    clean_url = _clean_notebook_url(notebook_url)
 
     page.goto(clean_url, wait_until="domcontentloaded", timeout=90000)
     _assert_allowed_url(page.url, "ADD_SRC_NAVIGATE")
@@ -203,10 +244,15 @@ def add_source_cua(page, client, notebook_url: str, source_url: str, source_titl
             )
         success = _run_cua_loop(page, client, TASK, max_steps=15, phase="ADD_SRC")
     if success:
-        logger.info("[add_source] 성공: %s", source_url)
+        time.sleep(3)
+        if _source_exists_on_page(page, notebook_url, source_url, source_title):
+            logger.info("[add_source] 성공: %s", source_url)
+            return True
+        logger.error("[add_source] UI 검증 실패: %s", source_url)
+        return False
     else:
         logger.error("[add_source] 실패 (15 스텝 초과): %s", source_url)
-    return success
+    return False
 
 
 def delete_source_cua(page, client, notebook_url: str, source_url: str, source_title: str) -> bool:
@@ -371,10 +417,8 @@ def main():
                 parser.error("--source-url is required for --mode add")
 
             if _is_duplicate(args.source_url, args.notebook_url):
-                logger.info("[add] 중복 → 건너뜀: %s", args.source_url)
-                print(f"⏭️ Duplicate skipped: {args.source_url}")
-                context.close()
-                return
+                logger.warning("[add] sources_log 중복 기록 제거 후 재시도: %s", args.source_url)
+                _log_delete(args.source_url, args.notebook_url)
 
             success = add_source_cua(page, client, args.notebook_url, args.source_url, args.source_title)
             if success:

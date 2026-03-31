@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     discord_bot_token: str = ""
     discord_allowed_channel_ids: str = ""
     openai_api_key: str = ""
-    script_rewrite_model: str = "gpt-5.4-mini"
+    script_rewrite_model: str = "gpt-5.4"
 
     n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/wf-01-input"
     n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/wf-05-confirm"
