@@ -207,6 +207,19 @@ class AddSourceResponse(BaseModel):
     error: Optional[str] = None
 
 
+class NotebookStateRequest(BaseModel):
+    channel_id: str
+
+
+class NotebookStateResponse(BaseModel):
+    status: str
+    channel_id: str = ""
+    notebook_url: str = ""
+    active_source_count: int = 0
+    has_sources: bool = False
+    error: Optional[str] = None
+
+
 class CreateNotebookRequest(BaseModel):
     name: str                          # 노트북 표시 이름
     channel_id: str                    # YouTube 채널 ID (예: "UCUpJs89fSBXNolQGOYKn0YQ")
@@ -268,16 +281,31 @@ def _load_sources_by_notebook() -> dict[str, int]:
         return {}
 
 
-def _get_notebook_url(channel_id: str) -> Optional[str]:
-    """channel_id → notebook_url 조회. 최신 노트북이 비어 있으면 history의 유효 노트북으로 fallback."""
+def _get_active_notebook_url(channel_id: str) -> Optional[str]:
+    """channel_id → 현재 active notebook_url 조회. history fallback은 하지 않는다."""
     try:
         if not LIBRARY_JSON.exists():
             return None
         lib = json.loads(LIBRARY_JSON.read_text(encoding="utf-8"))
         ch = lib.get("channels", {}).get(channel_id)
         if ch and ch.get("notebook_url"):
-            current_raw = ch["notebook_url"]
-            current_clean = _clean_notebook_url(current_raw)
+            current_clean = _clean_notebook_url(ch["notebook_url"])
+            logger.info("[resolve:active] channel_id=%s → %s", channel_id, current_clean)
+            return current_clean
+        logger.warning("[resolve:active] channel_id=%r 에 해당하는 active 노트북 없음", channel_id)
+    except Exception as e:
+        logger.warning("[resolve:active] library.json 읽기 실패: %s", e)
+    return None
+
+
+def _get_notebook_url(channel_id: str) -> Optional[str]:
+    """channel_id → 보고서용 notebook_url 조회. 최신 노트북이 비어 있으면 history의 유효 노트북으로 fallback."""
+    try:
+        current_clean = _get_active_notebook_url(channel_id)
+        if current_clean:
+            lib = json.loads(LIBRARY_JSON.read_text(encoding="utf-8"))
+            ch = lib.get("channels", {}).get(channel_id)
+            current_raw = ch.get("notebook_url", "")
             source_counts = _load_sources_by_notebook()
             current_count = source_counts.get(current_clean, 0)
 
@@ -311,6 +339,26 @@ def _get_notebook_url(channel_id: str) -> Optional[str]:
     except Exception as e:
         logger.warning("library.json 읽기 실패: %s", e)
     return None
+
+
+def _get_notebook_state(channel_id: str) -> NotebookStateResponse:
+    notebook_url = _get_active_notebook_url(channel_id) or ""
+    if not notebook_url:
+        return NotebookStateResponse(
+            status="error",
+            channel_id=channel_id,
+            error="active notebook_url을 결정할 수 없습니다.",
+        )
+
+    source_counts = _load_sources_by_notebook()
+    active_source_count = source_counts.get(notebook_url, 0)
+    return NotebookStateResponse(
+        status="success",
+        channel_id=channel_id,
+        notebook_url=notebook_url,
+        active_source_count=active_source_count,
+        has_sources=active_source_count > 0,
+    )
 
 
 # ─────────────────────────────────────────
@@ -833,9 +881,9 @@ async def check_and_add_source(
     """YouTube URL 등을 NotebookLM 소스로 추가. 중복 체크 + 슬라이딩 윈도우 정리 포함."""
     verify_secret(x_internal_secret)
 
-    # 명시 notebook_url이 없으면 channel_id -> library.json 조회 결과를 우선 사용한다.
+    # 소스 추가는 history fallback 없이 "현재 active notebook"만 대상으로 삼는다.
     notebook_url = body.notebook_url or (
-        _get_notebook_url(body.channel_id) if body.channel_id else None
+        _get_active_notebook_url(body.channel_id) if body.channel_id else None
     ) or ""
 
     # add-source 전체 흐름도 여러 subprocess를 사용하므로 executor에서 실행한다.
@@ -852,6 +900,16 @@ async def check_and_add_source(
         body.channel_name,
     )
     return response
+
+
+@app.post("/notebook-state", response_model=NotebookStateResponse)
+async def notebook_state_endpoint(
+    body: NotebookStateRequest,
+    x_internal_secret: Optional[str] = Header(default=None),
+) -> NotebookStateResponse:
+    """채널의 현재 active notebook과 source 개수를 반환한다."""
+    verify_secret(x_internal_secret)
+    return _get_notebook_state(body.channel_id)
 
 
 @app.get("/all-channels", response_model=AllChannelsResponse)
