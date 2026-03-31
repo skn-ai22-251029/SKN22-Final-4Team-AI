@@ -13,12 +13,20 @@ from openai import AsyncOpenAI
 
 from adapters.discord_adapter import DiscordAdapter
 from config import settings
+from prompts import (
+    NOTEBOOKLM_REPORT_PROMPT,
+    SCRIPT_REWRITE_SYSTEM_PROMPT,
+    build_script_rewrite_user_prompt,
+    build_tts_script_rewrite_instruction,
+)
 from utils.file_naming import build_filename
 from services.storage_service import presign_s3_uri, put_bytes_and_presign
 from models.job import (
     AutoReportRequest,
     ChannelSelectRequest,
+    CharacterAvatarRequest,
     ConfirmActionRequest,
+    HeygenSmokeTestRequest,
     IncomingMessageRequest,
     ListJobsRequest,
     ManualGenerateRequest,
@@ -47,33 +55,7 @@ logger = logging.getLogger(__name__)
 _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
-
-_SCRIPT_REWRITE_PROMPT_BASE = (
-    """
-    당신은 20대 초반의 발랄한 성격을 가진 숏폼 인플루언서 '하리'입니다. 
-    팬덤명은 '보리'입니다.
-    규칙을 엄격하게 준수하여, [소스 내용]을 소개하는 "600자" 분량의 대본을 작성해 주세요.
-
-    1. 출력 형식 제한: 대본의 제목, 화자 이름(하리:), 지문(예: [오프닝], [본문]) 등 대사가 아닌 모든 글자 및 기호는 절대 작성하지 마세요. 오직 화면에서 읽을 '대사'만 텍스트로 출력해야 합니다.
-    2. 100% 한글 표기: 알파벳(영어)과 숫자는 절대 사용하지 마세요. 모두 한글 발음으로 변환하여 적어주세요. (예시: AI -> 에이아이, 600 -> 육백)
-    3. 마크다운 금지: 굵게(**), 기울임 등 어떠한 마크다운 문법도 사용하지 마세요.
-    4. TTS 최적화 (가장 중요):
-    - 사전에 없는 단어는 실제 한국어 발음대로 표기하세요. (예시: 역대급 -> 역대끕)
-    - 숫자 관련 발음은 붙여 표기하세요. (예시: 오 점 사 -> 오쩜사)
-    - 발랄한 억양을 살리기 위해 물음표(?)를 적극적으로 사용하세요.
-    - 오늘, 어제 등 상대적인 날짜를 표기하지 마세요.
-    - 매 문장이 끝날 때마다 반드시 "줄바꿈"(엔터)을 하세요.
-
-    [대본 구성]
-    오프닝(인사) - 본문(소스 내용 소개) - 마무리(엔딩)의 자연스러운 흐름으로 작성할 것.
-"""
-)
-_NOTEBOOKLM_REPORT_PROMPT = (
-    "삽입된 최신 소스를 바탕으로 사실 관계에 충실한 자세한 보고서를 작성한다. "
-    "핵심 주장, 배경, 사례, 수치, 맥락을 빠짐없이 정리한다. "
-    "원문 소스에 없는 내용은 추정하지 않는다. "
-    "대사체나 연출 지시 대신 설명형 보고서 문단으로만 작성한다."
-)
+_HEYGEN_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 def _extract_valid_basename(job_id: str, filename: object) -> Optional[str]:
@@ -141,6 +123,39 @@ def _normalize_video_filename(
     return _normalize_filename(job_id, "mp4", candidate, existing_script_json)
 
 
+def _heygen_api_headers() -> dict[str, str]:
+    api_key = settings.heygen_api_key.strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="HEYGEN_API_KEY is not configured")
+    return {"X-Api-Key": api_key}
+
+
+async def _heygen_get_json(path: str, *, base_url: Optional[str] = None) -> dict:
+    if _http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client is not initialized")
+    target_base = (base_url or settings.heygen_api_base_url).rstrip("/")
+    url = f"{target_base}/{path.lstrip('/')}"
+    try:
+        resp = await _http_client.get(
+            url,
+            headers=_heygen_api_headers(),
+            timeout=_HEYGEN_REQUEST_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text.strip() or str(e)
+        raise HTTPException(status_code=502, detail=f"HeyGen API request failed: {detail}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"HeyGen API request failed: {e}") from e
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="HeyGen API returned a non-JSON response")
+    return payload
+
+
 def _as_script_json(value: object) -> dict:
     if isinstance(value, dict):
         return dict(value)
@@ -158,24 +173,49 @@ def _merge_script_json_with_media_names(
     existing: object,
     *,
     report_filename: Optional[str] = None,
+    tts_script_filename: Optional[str] = None,
     audio_filename: Optional[str] = None,
     video_filename: Optional[str] = None,
     script_text: Optional[str] = None,
+    subtitle_script_text: Optional[str] = None,
+    tts_script_text: Optional[str] = None,
     notebooklm_report_text: Optional[str] = None,
+    tts_script_s3_uri: Optional[str] = None,
+    heygen_avatar_id: Optional[str] = None,
     script_rewrite_prompt: Optional[str] = None,
     script_rewrite_status: Optional[str] = None,
     script_rewrite_error: Optional[str] = None,
 ) -> dict:
     merged = _as_script_json(existing)
-    if script_text is not None:
-        merged["script_text"] = script_text
-        merged["script"] = script_text  # backward compatibility
-        merged["script_summary"] = script_text[:200]
+    resolved_subtitle_script_text = subtitle_script_text
+    if resolved_subtitle_script_text is None and script_text is not None:
+        resolved_subtitle_script_text = script_text
+    resolved_tts_script_text = tts_script_text
+    if resolved_tts_script_text is None and script_text is not None:
+        resolved_tts_script_text = script_text
+    if resolved_subtitle_script_text is not None:
+        merged["subtitle_script_text"] = resolved_subtitle_script_text
+        merged["script_text"] = resolved_subtitle_script_text
+        merged["script"] = resolved_subtitle_script_text  # backward compatibility
+        merged["script_summary"] = resolved_subtitle_script_text[:200]
+    if resolved_tts_script_text is not None:
+        merged["tts_script_text"] = resolved_tts_script_text
     if notebooklm_report_text is not None:
         if notebooklm_report_text:
             merged["notebooklm_report_text"] = notebooklm_report_text
         else:
             merged.pop("notebooklm_report_text", None)
+    if tts_script_s3_uri is not None:
+        if tts_script_s3_uri:
+            merged["tts_script_s3_uri"] = tts_script_s3_uri
+        else:
+            merged.pop("tts_script_s3_uri", None)
+    if heygen_avatar_id is not None:
+        normalized_avatar_id = (heygen_avatar_id or "").strip()
+        if normalized_avatar_id:
+            merged["heygen_avatar_id"] = normalized_avatar_id
+        else:
+            merged.pop("heygen_avatar_id", None)
     if script_rewrite_prompt is not None:
         if script_rewrite_prompt:
             merged["script_rewrite_prompt"] = script_rewrite_prompt
@@ -196,6 +236,8 @@ def _merge_script_json_with_media_names(
         media_names = {}
     if report_filename:
         media_names["report_filename"] = report_filename
+    if tts_script_filename:
+        media_names["tts_script_filename"] = tts_script_filename
     if audio_filename:
         media_names["audio_filename"] = audio_filename
     if video_filename:
@@ -253,11 +295,67 @@ def _default_tts_caption(*, auto_trigger_wf12: bool) -> str:
     return "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
 
 
-def _build_script_rewrite_instruction(custom_prompt: str) -> str:
-    custom_prompt = (custom_prompt or "").strip()
-    if not custom_prompt:
-        return _SCRIPT_REWRITE_PROMPT_BASE
-    return f"{_SCRIPT_REWRITE_PROMPT_BASE} {custom_prompt}"
+def _get_subtitle_script_text(script_json: dict) -> str:
+    return (
+        script_json.get("subtitle_script_text")
+        or script_json.get("script_text")
+        or script_json.get("script")
+        or ""
+    ).strip()
+
+
+def _get_tts_script_text(script_json: dict) -> str:
+    return (
+        script_json.get("tts_script_text")
+        or script_json.get("subtitle_script_text")
+        or script_json.get("script_text")
+        or script_json.get("script")
+        or ""
+    ).strip()
+
+
+def _get_job_avatar_override(script_json: dict) -> str:
+    return (
+        script_json.get("heygen_avatar_id")
+        or script_json.get("avatar_id")
+        or ""
+    ).strip()
+
+
+async def _persist_job_avatar_override(job_id: str, existing_script_json: object, avatar_id: str) -> dict:
+    merged_script = _merge_script_json_with_media_names(
+        existing_script_json,
+        heygen_avatar_id=avatar_id,
+    )
+    return await job_service.update_job(job_id, script_json=merged_script)
+
+
+async def _resolve_heygen_avatar_id(job: dict, *, requested_avatar_id: str = "") -> tuple[str, str]:
+    explicit_avatar_id = (requested_avatar_id or "").strip()
+    if explicit_avatar_id:
+        return explicit_avatar_id, "request"
+
+    script_json = _as_script_json(job.get("script_json"))
+    job_avatar_id = _get_job_avatar_override(script_json)
+    if job_avatar_id:
+        return job_avatar_id, "job"
+
+    character_id = str(job.get("character_id") or "").strip()
+    if character_id:
+        character = await job_service.get_character(character_id)
+        if character is not None:
+            character_avatar_id = str(character.get("heygen_avatar_id") or "").strip()
+            if character_avatar_id:
+                return character_avatar_id, "character"
+
+    env_avatar_id = settings.heygen_avatar_id.strip()
+    if env_avatar_id:
+        return env_avatar_id, "env"
+
+    raise HTTPException(
+        status_code=400,
+        detail="No HeyGen avatar configured. Provide avatar_id, set job override, or configure character default.",
+    )
 
 
 def _extract_completion_text(content: object) -> str:
@@ -279,7 +377,32 @@ def _extract_completion_text(content: object) -> str:
     return ""
 
 
-async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> str:
+def _extract_json_object(text: str) -> dict:
+    candidate = (text or "").strip()
+    if not candidate:
+        return {}
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
+        candidate = re.sub(r"\s*```$", "", candidate)
+        candidate = candidate.strip()
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> tuple[str, str]:
     api_key = settings.openai_api_key.strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured for script rewrite")
@@ -291,19 +414,13 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "너는 NotebookLM 원문 보고서를 최종 숏폼 대본으로 재작성하는 편집자다. "
-                        "원문 보고서의 사실만 사용하고, 원문에 없는 추측이나 설정을 추가하지 않는다. "
-                        "반드시 최종 대본 텍스트만 출력한다."
-                    ),
+                    "content": SCRIPT_REWRITE_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",
-                    "content": (
-                        "다음 원문 보고서를 바탕으로 최종 대본을 작성하라.\n"
-                        "제목, 메모, 불릿, 마크다운 설명 없이 최종 대사 본문만 출력한다.\n\n"
-                        f"[작성 지침]\n{rewrite_instruction}\n\n"
-                        f"[원문 보고서]\n{raw_report_text}"
+                    "content": build_script_rewrite_user_prompt(
+                        raw_report_text=raw_report_text,
+                        rewrite_instruction=rewrite_instruction,
                     ),
                 },
             ],
@@ -313,10 +430,13 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
 
     if not response.choices:
         raise RuntimeError("script rewrite returned no choices")
-    text = _extract_completion_text(response.choices[0].message.content)
-    if not text:
-        raise RuntimeError("script rewrite returned empty content")
-    return text
+    payload_text = _extract_completion_text(response.choices[0].message.content)
+    payload = _extract_json_object(payload_text)
+    subtitle_script_text = str(payload.get("subtitle_script_text") or "").strip()
+    tts_script_text = str(payload.get("tts_script_text") or "").strip()
+    if not subtitle_script_text or not tts_script_text:
+        raise RuntimeError("script rewrite returned missing subtitle/tts content")
+    return subtitle_script_text, tts_script_text
 
 
 async def _prepare_report_delivery(
@@ -326,16 +446,17 @@ async def _prepare_report_delivery(
     existing_script_json: object,
     filename: str,
     rewrite_prompt: str,
-) -> tuple[str, bytes, dict]:
+) -> tuple[str, bytes, str, dict]:
     raw_report_text = (raw_report_text or "").strip()
-    rewrite_instruction = _build_script_rewrite_instruction(rewrite_prompt)
-    final_script_text = raw_report_text
+    rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt)
+    subtitle_script_text = raw_report_text
+    tts_script_text = raw_report_text
     rewrite_status = "skipped_empty_report"
     rewrite_error = ""
 
     if raw_report_text:
         try:
-            final_script_text = await _rewrite_report_to_script(raw_report_text, rewrite_instruction)
+            subtitle_script_text, tts_script_text = await _rewrite_report_to_script(raw_report_text, rewrite_instruction)
             rewrite_status = "success"
         except Exception as e:
             rewrite_status = "fallback_raw"
@@ -344,14 +465,44 @@ async def _prepare_report_delivery(
 
     merged_script = _merge_script_json_with_media_names(
         existing_script_json,
-        script_text=final_script_text if final_script_text else None,
+        subtitle_script_text=subtitle_script_text if subtitle_script_text else None,
+        tts_script_text=tts_script_text if tts_script_text else None,
         report_filename=filename,
         notebooklm_report_text=raw_report_text,
         script_rewrite_prompt=rewrite_instruction,
         script_rewrite_status=rewrite_status,
         script_rewrite_error=rewrite_error,
     )
-    return final_script_text, final_script_text.encode("utf-8"), merged_script
+    return subtitle_script_text, subtitle_script_text.encode("utf-8"), tts_script_text, merged_script
+
+
+def _upload_tts_script_file(
+    *,
+    job_id: str,
+    filename: str,
+    tts_script_text: str,
+    existing_script_json: object,
+) -> tuple[object | None, dict]:
+    normalized_filename = _normalize_report_filename(job_id, filename, existing_script_json)
+    if not tts_script_text.strip():
+        return None, _merge_script_json_with_media_names(
+            existing_script_json,
+            tts_script_filename=normalized_filename,
+            tts_script_s3_uri="",
+        )
+    stored = put_bytes_and_presign(
+        prefix=settings.media_s3_prefix_scripts,
+        filename=normalized_filename,
+        content=tts_script_text.encode("utf-8"),
+        content_type="text/plain; charset=utf-8",
+    )
+    merged_script = _merge_script_json_with_media_names(
+        existing_script_json,
+        tts_script_filename=normalized_filename,
+        tts_script_s3_uri=stored.s3_uri,
+    )
+    logger.info("[storage] tts script uploaded job_id=%s filename=%s s3_uri=%s", job_id, normalized_filename, stored.s3_uri)
+    return stored, merged_script
 
 
 async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[str, str]:
@@ -421,6 +572,10 @@ async def _run_tts_generation(
         await job_service.update_job(job_id, error_message="")
 
         if auto_trigger_wf12:
+            job = await job_service.get_job(job_id)
+            if job is None:
+                raise RuntimeError(f"Job not found while resolving HeyGen avatar: {job_id}")
+            resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
             approved_audio_url = str(send_result.get("audio_url") or "").strip()
             if not approved_audio_url:
                 raise RuntimeError("Generated TTS audio_url is empty")
@@ -430,7 +585,9 @@ async def _run_tts_generation(
                 user_id,
                 audio_file_path="",
                 audio_url=approved_audio_url,
+                avatar_id=resolved_avatar_id,
             )
+            logger.info("[heygen-avatar] auto wf12 avatar source=%s job_id=%s", avatar_source, job_id)
     except Exception as e:
         logger.exception("[tts-direct] failed job_id=%s: %r", job_id, e)
         await job_service.transition_status(job_id, "FAILED")
@@ -992,7 +1149,7 @@ async def _call_wf06(body: ReportMessageRequest, *, raise_on_error: bool = False
             messenger_source=body.messenger_source.value,
             messenger_user_id=body.messenger_user_id,
             messenger_channel_id=body.messenger_channel_id,
-            prompt=_NOTEBOOKLM_REPORT_PROMPT,
+            prompt=NOTEBOOKLM_REPORT_PROMPT,
             notebook_id=body.notebook_id,
             channel_id=body.channel_id,
             character_id=body.character_id,
@@ -1088,13 +1245,22 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
 
         report_content = data["report_content"]
         filename = _normalize_report_filename(body.job_id, data.get("filename"), job.get("script_json"))
-        final_script_text, file_bytes, merged_script = await _prepare_report_delivery(
+        final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
             job_id=body.job_id,
             raw_report_text=report_content,
             existing_script_json=job.get("script_json"),
             filename=filename,
             rewrite_prompt=job.get("concept_text", ""),
         )
+        try:
+            _, merged_script = _upload_tts_script_file(
+                job_id=body.job_id,
+                filename=filename,
+                tts_script_text=tts_script_text,
+                existing_script_json=merged_script,
+            )
+        except Exception as e:
+            logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
         await job_service.update_job(
             body.job_id,
             script_json=merged_script,
@@ -1150,13 +1316,22 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
-    final_script_text, file_bytes, merged_script = await _prepare_report_delivery(
+    final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
         job_id=body.job_id,
         raw_report_text=body.report_content,
         existing_script_json=existing_job.get("script_json") if existing_job else None,
         filename=filename,
         rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
     )
+    try:
+        _, merged_script = _upload_tts_script_file(
+            job_id=body.job_id,
+            filename=filename,
+            tts_script_text=tts_script_text,
+            existing_script_json=merged_script,
+        )
+    except Exception as e:
+        logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
 
     stored = None
     upload_error = None
@@ -1335,6 +1510,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
     user_id = job["messenger_user_id"]
 
     if body.action == "approve":
+        resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
         audio_url = job.get("audio_url", "")
         if not audio_url:
             raise HTTPException(status_code=400, detail="No audio_url found in job")
@@ -1353,12 +1529,19 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
                 user_id=user_id,
                 audio_file_path=audio_file_path,
                 audio_url=approved_audio_url,
+                avatar_id=resolved_avatar_id,
             )
             await _discord_adapter.send_text_message(channel_id, "🎬 WF-12(HeyGen) 영상 생성을 시작합니다.")
         except Exception as e:
             logger.error("call_wf12 (tts approve) failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=500, detail=str(e))
-        return {"job_id": body.job_id, "action": "approve"}
+        logger.info("[discord] tts_action=approve trigger_wf12 job_id=%s avatar_source=%s", body.job_id, avatar_source)
+        return {
+            "job_id": body.job_id,
+            "action": "approve",
+            "avatar_id": resolved_avatar_id,
+            "avatar_source": avatar_source,
+        }
 
     if body.action == "reject":
         await job_service.transition_status(body.job_id, "APPROVED")
@@ -1482,7 +1665,8 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
             confirm_message_id = job.get("confirm_message_id")
             script_json = _as_script_json(job.get("script_json"))
             title = script_json.get("title", "대본")
-            script_summary = script_json.get("script_summary") or script_json.get("script", "")[:100]
+            subtitle_script_text = _get_subtitle_script_text(script_json)
+            script_summary = script_json.get("script_summary") or subtitle_script_text[:100]
             try:
                 new_msg_id = await _discord_adapter.send_confirm_message(
                     channel_id=channel_id,
@@ -1499,7 +1683,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
         elif step == "tts":
             await job_service.transition_status(body.job_id, "APPROVED")
             script_json = _as_script_json(job.get("script_json"))
-            script_text = script_json.get("script_text") or script_json.get("script", "")
+            script_text = _get_tts_script_text(script_json)
             try:
                 _spawn_tts_generation(
                     job_id=body.job_id,
@@ -1533,7 +1717,7 @@ async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
         raise HTTPException(status_code=404, detail="Job not found")
 
     script_json = _as_script_json(job.get("script_json"))
-    script_text = script_json.get("script_text") or script_json.get("script", "")
+    script_text = _get_tts_script_text(script_json)
     if not script_text:
         raise HTTPException(status_code=400, detail="No script found in job")
 
@@ -1568,9 +1752,12 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
     job = await job_service.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if (body.avatar_id or "").strip():
+        job = await _persist_job_avatar_override(body.job_id, job.get("script_json"), body.avatar_id)
+    resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job, requested_avatar_id=body.avatar_id)
 
     script_json = _as_script_json(job.get("script_json"))
-    script_text = script_json.get("script_text") or script_json.get("script", "")
+    script_text = _get_tts_script_text(script_json)
     if not script_text:
         raise HTTPException(status_code=400, detail="No script found in job")
 
@@ -1595,8 +1782,14 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
         logger.error("call_wf11 (report_to_video) failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info("[discord] report_to_video triggered job_id=%s", body.job_id)
-    return {"job_id": body.job_id, "status": "triggered", "mode": "video-auto"}
+    logger.info("[discord] report_to_video triggered job_id=%s avatar_source=%s", body.job_id, avatar_source)
+    return {
+        "job_id": body.job_id,
+        "status": "triggered",
+        "mode": "video-auto",
+        "avatar_id": resolved_avatar_id,
+        "avatar_source": avatar_source,
+    }
 
 
 @app.post("/internal/tts-generate")
@@ -1614,7 +1807,7 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
     script_json = _as_script_json(job.get("script_json"))
-    script_text = script_json.get("script_text") or script_json.get("script", "")
+    script_text = _get_tts_script_text(script_json)
     if not script_text:
         raise HTTPException(status_code=400, detail="No script_text found in resolved job")
 
@@ -1635,6 +1828,68 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-11"}
 
 
+@app.post("/internal/heygen-smoke-test")
+async def heygen_smoke_test(_: AuthDep, body: HeygenSmokeTestRequest) -> dict:
+    """HeyGen 과금 없는 스모크 테스트 — 인증, quota, avatar 접근만 검증한다."""
+    configured_avatar_id = (body.avatar_id or settings.heygen_avatar_id).strip()
+    quota_payload = await _heygen_get_json("/v1/user/remaining_quota")
+    avatars_payload = await _heygen_get_json("/v2/avatars")
+
+    quota_data = quota_payload.get("data") if isinstance(quota_payload.get("data"), dict) else {}
+    avatars_data = avatars_payload.get("data") if isinstance(avatars_payload.get("data"), dict) else {}
+    avatars = avatars_data.get("avatars") if isinstance(avatars_data.get("avatars"), list) else []
+
+    avatar_check: dict[str, object] = {
+        "avatar_id": configured_avatar_id,
+        "configured": bool(configured_avatar_id),
+        "exists": False,
+        "name": "",
+    }
+    if configured_avatar_id:
+        try:
+            avatar_payload = await _heygen_get_json(f"/v2/avatar/{configured_avatar_id}/details")
+            avatar_data = avatar_payload.get("data") if isinstance(avatar_payload.get("data"), dict) else {}
+            avatar = avatar_data.get("avatar") if isinstance(avatar_data.get("avatar"), dict) else avatar_data
+            if isinstance(avatar, dict):
+                avatar_check["exists"] = True
+                avatar_check["name"] = str(
+                    avatar.get("avatar_name")
+                    or avatar.get("name")
+                    or ""
+                ).strip()
+        except HTTPException as e:
+            avatar_check["error"] = e.detail
+
+    logger.info(
+        "[heygen-smoke] quota=%s avatars=%d configured_avatar=%s exists=%s",
+        quota_data.get("remaining_quota"),
+        len(avatars),
+        configured_avatar_id,
+        avatar_check.get("exists"),
+    )
+    return {
+        "status": "ok",
+        "quota": {
+            "remaining_quota": quota_data.get("remaining_quota"),
+            "quota": quota_data.get("quota"),
+        },
+        "avatars_count": len(avatars),
+        "configured_avatar": avatar_check,
+    }
+
+
+@app.post("/internal/character-avatar")
+async def set_character_avatar(_: AuthDep, body: CharacterAvatarRequest) -> dict:
+    """캐릭터 기본 HeyGen avatar_id를 DB 상태로 저장한다."""
+    updated = await job_service.update_character_avatar(body.character_id.strip(), body.avatar_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    return {
+        "character_id": updated["id"],
+        "heygen_avatar_id": str(updated.get("heygen_avatar_id") or ""),
+    }
+
+
 @app.post("/internal/heygen-generate")
 async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     """수동 /heygen 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-12 실행."""
@@ -1646,12 +1901,21 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     )
     job = await _resolve_manual_job(body, require_audio=True)
     resolved_job_id = job["id"]
+    if (body.avatar_id or "").strip():
+        job = await _persist_job_avatar_override(resolved_job_id, job.get("script_json"), body.avatar_id)
 
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
+    resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job, requested_avatar_id=body.avatar_id)
     audio_url = job.get("audio_url", "")
     if not audio_url:
         raise HTTPException(status_code=400, detail="No audio_url found in resolved job")
+    if isinstance(audio_url, str) and audio_url.startswith("s3://"):
+        try:
+            audio_url = presign_s3_uri(audio_url)
+        except Exception as e:
+            logger.error("[storage] presign audio s3 uri failed job_id=%s: %s", resolved_job_id, e)
+            raise HTTPException(status_code=500, detail=f"audio presign failed: {e}")
 
     audio_file_path = audio_url if isinstance(audio_url, str) and audio_url.startswith("/") else ""
     approved_audio_url = "" if audio_file_path else audio_url
@@ -1662,13 +1926,20 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
             user_id=user_id,
             audio_file_path=audio_file_path,
             audio_url=approved_audio_url,
+            avatar_id=resolved_avatar_id,
         )
     except Exception as e:
         logger.error("call_wf12 (manual /heygen) failed job_id=%s: %s", resolved_job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info("[manual /heygen] triggered job_id=%s", resolved_job_id)
-    return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-12"}
+    logger.info("[manual /heygen] triggered job_id=%s avatar_source=%s", resolved_job_id, avatar_source)
+    return {
+        "job_id": resolved_job_id,
+        "status": "triggered",
+        "workflow": "WF-12",
+        "avatar_id": resolved_avatar_id,
+        "avatar_source": avatar_source,
+    }
 
 
 @app.post("/internal/jobs")

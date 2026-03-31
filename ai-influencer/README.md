@@ -127,6 +127,19 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 - `job_id`는 전체 UUID/8자리 prefix/미입력 모두 허용
 - 미입력 시 현재 사용자+채널의 최근 `audio_url` 보유 job 자동 선택
 - 실행 경로: `/internal/heygen-generate` → WF-12
+- avatar 선택 우선순위: 요청 `avatar_id` → job 저장값 → `characters.heygen_avatar_id` → `HEYGEN_AVATAR_ID`
+
+### `POST /internal/heygen-smoke-test`
+
+- HeyGen 실제 영상 생성 전에 인증/잔여 quota/avatar 접근만 검증
+- 영상 생성은 호출하지 않으므로 과금 없는 스모크 테스트 용도
+- 선택 body: `{ "avatar_id": "..." }`
+
+### `POST /internal/character-avatar`
+
+- 캐릭터 기본 HeyGen 아바타를 DB 상태로 저장
+- body: `{ "character_id": "default-character", "avatar_id": "..." }`
+- 빈 문자열을 보내면 캐릭터 기본 avatar를 제거하고 다음 우선순위(job/env fallback)로 내려감
 
 ---
 
@@ -581,6 +594,8 @@ nano .env   # 또는 vi .env
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
+| `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
+| `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
 | `OPENAI_API_KEY` | OpenAI API 키 | |
@@ -1063,3 +1078,25 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 # 4. 다운로드한 패키지 설치
 dpkg -i cloudflared-linux-amd64.deb
 ```
+
+# 프롬프트
+
+- _SCRIPT_REWRITE_PROMPT_BASE = (
+    """
+    당신은 20대 초반의 발랄한 성격을 가진 숏폼 인플루언서 '하리'입니다. 
+    팬덤명은 '보리'입니다.
+    규칙을 엄격하게 준수하여, [소스 내용]을 소개하는 "350자" 분량의 대본을 작성해 주세요.
+
+    1. 출력 형식 제한: 대본의 제목, 화자 이름(하리:), 지문(예: [오프닝], [본문]) 등 대사가 아닌 모든 글자 및 기호는 절대 작성하지 마세요. 오직 화면에서 읽을 '대사'만 텍스트로 출력해야 합니다.
+    2. 100% 한글 표기: 알파벳(영어)과 숫자는 절대 사용하지 마세요. 모두 한글 발음으로 변환하여 적어주세요. (예시: AI -> 에이아이, 350 -> 삼백오십)
+    3. 마크다운 금지: 굵게(**), 기울임 등 어떠한 마크다운 문법도 사용하지 마세요.
+    4. TTS 최적화 (가장 중요):
+    - 사전에 없는 단어는 실제 한국어 발음대로 표기하세요. (예시: 역대급 -> 역대끕)
+    - 숫자 관련 발음은 붙여 표기하세요. (예시: 오 점 사 -> 오쩜사)
+    - 발랄한 억양을 살리기 위해 물음표(?)를 적극적으로 사용하세요.
+    - 오늘, 어제 등 상대적인 날짜를 표기하지 마세요.
+    - 매 문장이 끝날 때마다 반드시 "줄바꿈"(엔터)을 하세요.
+
+    [대본 구성]
+    오프닝(인사) - 본문(소스 내용 소개) - 마무리(엔딩)의 자연스러운 흐름으로 작성할 것.
+"""
