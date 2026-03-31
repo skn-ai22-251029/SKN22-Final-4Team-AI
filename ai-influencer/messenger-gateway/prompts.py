@@ -42,13 +42,6 @@ def build_script_rewrite_user_prompt(*, raw_report_text: str, rewrite_instructio
     return (
         "다음 원문 보고서를 바탕으로 최종 대본 2종을 작성하라.\n"
         "출력은 반드시 JSON 객체 하나만 사용하고, 키는 subtitle_script_text 와 tts_script_text 두 개만 사용한다.\n"
-        "생성 순서는 반드시 다음과 같이 따른다.\n"
-        "1. 먼저 tts_script_text를 완성한다.\n"
-        "2. 그 다음 subtitle_script_text는 tts_script_text를 기준으로 만든다.\n"
-        "3. subtitle_script_text는 tts_script_text와 내용, 문장 순서, 줄 순서, 정보량이 완전히 같아야 한다.\n"
-        "4. subtitle_script_text에서는 문법, 띄어쓰기, 맞춤법, 표준 표기만 보정할 수 있다.\n"
-        "5. subtitle_script_text를 만들 때 문장을 추가, 삭제, 요약, 확장, 재배열, 재해석하면 안 된다.\n"
-        "6. tts_script_text의 표현을 자막용 표기로 바꿀 때에도 의미와 분량은 유지해야 한다.\n\n"
         "[tts_script_text 작성 지침]\n"
         f"{rewrite_instruction}\n\n"
         "[subtitle_script_text 작성 지침]\n"
