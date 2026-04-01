@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     media_presign_expires_seconds: int = 86400
     media_max_discord_file_bytes: int = 10 * 1024 * 1024
     media_s3_prefix_reports: str = "subtitle"
+    media_s3_prefix_logs: str = "logs"
     media_s3_prefix_scripts: str = "scripts"
     media_s3_prefix_tts: str = "tts"
     media_s3_prefix_videos: str = "videos"

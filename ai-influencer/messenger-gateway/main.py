@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Awaitable, Optional
 
 import httpx
@@ -16,6 +17,7 @@ from config import settings
 from prompts import (
     NOTEBOOKLM_REPORT_PROMPT,
     SCRIPT_REWRITE_SYSTEM_PROMPT,
+    TTS_SCRIPT_REWRITE_PROMPT_BASE,
     build_subtitle_retry_prompt,
     build_tts_retry_prompt,
     build_tts_script_rewrite_instruction,
@@ -126,6 +128,14 @@ def _normalize_video_filename(
     return _normalize_filename(job_id, "mp4", candidate, existing_script_json)
 
 
+def _normalize_log_filename(
+    job_id: str,
+    candidate: Optional[str],
+    existing_script_json: object = None,
+) -> str:
+    return _normalize_filename(job_id, "json", candidate, existing_script_json)
+
+
 def _heygen_api_headers() -> dict[str, str]:
     api_key = settings.heygen_api_key.strip()
     if not api_key:
@@ -176,6 +186,7 @@ def _merge_script_json_with_media_names(
     existing: object,
     *,
     report_filename: Optional[str] = None,
+    log_filename: Optional[str] = None,
     tts_script_filename: Optional[str] = None,
     audio_filename: Optional[str] = None,
     video_filename: Optional[str] = None,
@@ -183,6 +194,7 @@ def _merge_script_json_with_media_names(
     subtitle_script_text: Optional[str] = None,
     tts_script_text: Optional[str] = None,
     notebooklm_report_text: Optional[str] = None,
+    log_s3_uri: Optional[str] = None,
     tts_script_s3_uri: Optional[str] = None,
     heygen_avatar_id: Optional[str] = None,
     script_rewrite_prompt: Optional[str] = None,
@@ -208,6 +220,11 @@ def _merge_script_json_with_media_names(
             merged["notebooklm_report_text"] = notebooklm_report_text
         else:
             merged.pop("notebooklm_report_text", None)
+    if log_s3_uri is not None:
+        if log_s3_uri:
+            merged["log_s3_uri"] = log_s3_uri
+        else:
+            merged.pop("log_s3_uri", None)
     if tts_script_s3_uri is not None:
         if tts_script_s3_uri:
             merged["tts_script_s3_uri"] = tts_script_s3_uri
@@ -239,6 +256,8 @@ def _merge_script_json_with_media_names(
         media_names = {}
     if report_filename:
         media_names["report_filename"] = report_filename
+    if log_filename:
+        media_names["log_filename"] = log_filename
     if tts_script_filename:
         media_names["tts_script_filename"] = tts_script_filename
     if audio_filename:
@@ -248,6 +267,12 @@ def _merge_script_json_with_media_names(
     if media_names:
         merged["media_names"] = media_names
     return merged
+
+
+class ReportPreparationError(RuntimeError):
+    def __init__(self, message: str, *, script_json: Optional[dict] = None):
+        super().__init__(message)
+        self.script_json = script_json or {}
 
 
 def _discord_attachment_limit_bytes() -> int:
@@ -523,6 +548,75 @@ def _non_empty_line_count(script_text: str) -> int:
     return len([line for line in (script_text or "").splitlines() if line.strip()])
 
 
+def _build_job_prompt_log(
+    *,
+    job_id: str,
+    existing_job: Optional[dict],
+    notebooklm_prompt: str,
+    raw_report_text: str,
+    rewrite_prompt: str,
+    rewrite_instruction: str,
+) -> dict:
+    return {
+        "job_id": job_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "messenger_user_id": str((existing_job or {}).get("messenger_user_id") or ""),
+        "messenger_channel_id": str((existing_job or {}).get("messenger_channel_id") or ""),
+        "character_id": str((existing_job or {}).get("character_id") or ""),
+        "notebooklm": {
+            "prompt_final": notebooklm_prompt,
+            "report_raw": raw_report_text,
+        },
+        "rewrite": {
+            "instruction_base": TTS_SCRIPT_REWRITE_PROMPT_BASE,
+            "instruction_custom": rewrite_prompt,
+            "instruction_final": rewrite_instruction,
+            "tts_attempts": [],
+            "subtitle_attempts": [],
+            "final": {
+                "status": "pending",
+                "error": "",
+                "tts_script_text": "",
+                "subtitle_script_text": "",
+                "tts_prompt_final": "",
+                "subtitle_prompt_final": "",
+            },
+        },
+    }
+
+
+def _upload_prompt_log_file(
+    *,
+    job_id: str,
+    log_payload: dict,
+    existing_script_json: object,
+) -> tuple[object | None, dict]:
+    normalized_filename = _normalize_log_filename(job_id, None, existing_script_json)
+    try:
+        content = json.dumps(log_payload, ensure_ascii=False, indent=2).encode("utf-8")
+        stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_logs,
+            filename=normalized_filename,
+            content=content,
+            content_type="application/json; charset=utf-8",
+        )
+        merged_script = _merge_script_json_with_media_names(
+            existing_script_json,
+            log_filename=normalized_filename,
+            log_s3_uri=stored.s3_uri,
+        )
+        logger.info("[storage] prompt log uploaded job_id=%s filename=%s s3_uri=%s", job_id, normalized_filename, stored.s3_uri)
+        return stored, merged_script
+    except Exception as e:
+        logger.error("[storage] prompt log upload failed job_id=%s: %s", job_id, e)
+        merged_script = _merge_script_json_with_media_names(
+            existing_script_json,
+            log_filename=normalized_filename,
+            log_s3_uri="",
+        )
+        return None, merged_script
+
+
 def _validate_subtitle_script(tts_script_text: str, subtitle_script_text: str) -> None:
     subtitle_len = _script_char_count(subtitle_script_text)
     if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
@@ -552,7 +646,12 @@ def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> None:
         )
 
 
-async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> tuple[str, str]:
+async def _rewrite_report_to_script(
+    raw_report_text: str,
+    rewrite_instruction: str,
+    *,
+    prompt_log: dict,
+) -> tuple[str, str]:
     # NotebookLM 원문 보고서를 한 번 더 정제해
     # 자막용/ TTS용 스크립트를 동시에 만든다.
     api_key = settings.openai_api_key.strip()
@@ -581,6 +680,13 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
                 )
             )
             tts_prompt = _sanitize_prompt_text(tts_prompt)
+            attempt_record = {
+                "attempt": attempt + 1,
+                "prompt": tts_prompt,
+                "response_text": "",
+                "char_count": 0,
+                "validation_error": "",
+            }
             response = await client.chat.completions.create(
                 model=settings.script_rewrite_model,
                 temperature=0,
@@ -597,18 +703,29 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
             )
             if not response.choices:
                 last_error = RuntimeError("tts rewrite returned no choices")
+                attempt_record["validation_error"] = str(last_error)
+                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
                 continue
             tts_script_text = _sanitize_prompt_text(
                 _extract_completion_text(response.choices[0].message.content).strip()
             )
+            attempt_record["response_text"] = tts_script_text
+            attempt_record["char_count"] = _script_char_count(tts_script_text)
             if not tts_script_text:
                 last_error = RuntimeError("tts rewrite returned empty content")
+                attempt_record["validation_error"] = str(last_error)
+                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
                 continue
             try:
                 _validate_tts_script(raw_report_text, tts_script_text)
+                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
+                prompt_log["rewrite"]["final"]["tts_script_text"] = tts_script_text
+                prompt_log["rewrite"]["final"]["tts_prompt_final"] = attempt_record["prompt"]
                 break
             except Exception as e:
                 last_error = e
+                attempt_record["validation_error"] = str(e)
+                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
         else:
             raise RuntimeError(str(last_error or "tts rewrite failed after retries"))
 
@@ -624,6 +741,13 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
                 )
             )
             subtitle_prompt = _sanitize_prompt_text(subtitle_prompt)
+            attempt_record = {
+                "attempt": attempt + 1,
+                "prompt": subtitle_prompt,
+                "response_text": "",
+                "char_count": 0,
+                "validation_error": "",
+            }
             response = await client.chat.completions.create(
                 model=settings.script_rewrite_model,
                 temperature=0,
@@ -640,18 +764,35 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
             )
             if not response.choices:
                 last_error = RuntimeError("subtitle rewrite returned no choices")
+                attempt_record["validation_error"] = str(last_error)
+                prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
             subtitle_script_text = _sanitize_prompt_text(
                 _extract_completion_text(response.choices[0].message.content).strip()
             )
+            attempt_record["response_text"] = subtitle_script_text
+            attempt_record["char_count"] = _script_char_count(subtitle_script_text)
             if not subtitle_script_text:
                 last_error = RuntimeError("subtitle rewrite returned empty content")
+                attempt_record["validation_error"] = str(last_error)
+                prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
             try:
                 _validate_subtitle_script(tts_script_text, subtitle_script_text)
+                prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
+                prompt_log["rewrite"]["final"] = {
+                    "status": "success",
+                    "error": "",
+                    "tts_script_text": tts_script_text,
+                    "subtitle_script_text": subtitle_script_text,
+                    "tts_prompt_final": prompt_log["rewrite"]["tts_attempts"][-1]["prompt"] if prompt_log["rewrite"]["tts_attempts"] else "",
+                    "subtitle_prompt_final": attempt_record["prompt"],
+                }
                 return subtitle_script_text, tts_script_text
             except Exception as e:
                 last_error = e
+                attempt_record["validation_error"] = str(e)
+                prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
     finally:
         await client.close()
 
@@ -662,22 +803,66 @@ async def _prepare_report_delivery(
     *,
     job_id: str,
     raw_report_text: str,
+    notebooklm_prompt: str,
+    existing_job: Optional[dict],
     existing_script_json: object,
     filename: str,
     rewrite_prompt: str,
 ) -> tuple[str, bytes, str, dict]:
     raw_report_text = (raw_report_text or "").strip()
+    rewrite_prompt = (rewrite_prompt or "").strip()
     rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt)
+    prompt_log = _build_job_prompt_log(
+        job_id=job_id,
+        existing_job=existing_job,
+        notebooklm_prompt=notebooklm_prompt,
+        raw_report_text=raw_report_text,
+        rewrite_prompt=rewrite_prompt,
+        rewrite_instruction=rewrite_instruction,
+    )
     if not raw_report_text:
-        raise RuntimeError("raw report is empty")
+        prompt_log["rewrite"]["final"]["status"] = "failed"
+        prompt_log["rewrite"]["final"]["error"] = "raw report is empty"
+        _, merged_script = _upload_prompt_log_file(
+            job_id=job_id,
+            log_payload=prompt_log,
+            existing_script_json=_merge_script_json_with_media_names(
+                existing_script_json,
+                report_filename=filename,
+                notebooklm_report_text="",
+                script_rewrite_prompt=rewrite_instruction,
+                script_rewrite_status="failed",
+                script_rewrite_error="raw report is empty",
+            ),
+        )
+        raise ReportPreparationError("raw report is empty", script_json=merged_script)
 
     try:
-        subtitle_script_text, tts_script_text = await _rewrite_report_to_script(raw_report_text, rewrite_instruction)
+        subtitle_script_text, tts_script_text = await _rewrite_report_to_script(
+            raw_report_text,
+            rewrite_instruction,
+            prompt_log=prompt_log,
+        )
         rewrite_status = "success"
         rewrite_error = ""
     except Exception as e:
         logger.exception("[script-rewrite] failed job_id=%s", job_id)
-        raise RuntimeError(f"script rewrite failed: {e}") from e
+        prompt_log["rewrite"]["final"]["status"] = "failed"
+        prompt_log["rewrite"]["final"]["error"] = str(e)
+        failure_script = _merge_script_json_with_media_names(
+            existing_script_json,
+            report_filename=filename,
+            notebooklm_report_text=raw_report_text,
+            script_rewrite_prompt=rewrite_instruction,
+            script_rewrite_status="failed",
+            script_rewrite_error=str(e),
+        )
+        _, failure_script = _upload_prompt_log_file(
+            job_id=job_id,
+            log_payload=prompt_log,
+            existing_script_json=failure_script,
+        )
+        raise ReportPreparationError(f"script rewrite failed: {e}", script_json=failure_script) from e
 
     merged_script = _merge_script_json_with_media_names(
         existing_script_json,
@@ -688,6 +873,11 @@ async def _prepare_report_delivery(
         script_rewrite_prompt=rewrite_instruction,
         script_rewrite_status=rewrite_status,
         script_rewrite_error=rewrite_error,
+    )
+    _, merged_script = _upload_prompt_log_file(
+        job_id=job_id,
+        log_payload=prompt_log,
+        existing_script_json=merged_script,
     )
     return subtitle_script_text, subtitle_script_text.encode("utf-8"), tts_script_text, merged_script
 
@@ -1554,10 +1744,19 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
                 job_id=body.job_id,
                 raw_report_text=report_content,
+                notebooklm_prompt="",
+                existing_job=job,
                 existing_script_json=job.get("script_json"),
                 filename=filename,
                 rewrite_prompt=job.get("concept_text", ""),
             )
+        except ReportPreparationError as e:
+            update_kwargs = {"error_message": str(e)}
+            if e.script_json:
+                update_kwargs["script_json"] = e.script_json
+            await job_service.update_job(body.job_id, **update_kwargs)
+            await _discord_adapter.send_text_message(channel_id, f"❌ 대본 생성 실패: {str(e)[:180]}")
+            return
         except Exception as e:
             await job_service.update_job(body.job_id, error_message=str(e))
             await _discord_adapter.send_text_message(channel_id, f"❌ 대본 생성 실패: {str(e)[:180]}")
@@ -1631,10 +1830,18 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
             job_id=body.job_id,
             raw_report_text=body.report_content,
+            notebooklm_prompt=NOTEBOOKLM_REPORT_PROMPT,
+            existing_job=existing_job,
             existing_script_json=existing_job.get("script_json") if existing_job else None,
             filename=filename,
             rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
         )
+    except ReportPreparationError as e:
+        update_kwargs = {"error_message": str(e)}
+        if e.script_json:
+            update_kwargs["script_json"] = e.script_json
+        await job_service.update_job(body.job_id, **update_kwargs)
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         await job_service.update_job(body.job_id, error_message=str(e))
         raise HTTPException(status_code=500, detail=str(e))
