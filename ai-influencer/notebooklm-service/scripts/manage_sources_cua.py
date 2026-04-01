@@ -101,7 +101,7 @@ def _log_delete(url: str, notebook_url: str) -> None:
     _save_log(log)
 
 
-def _source_exists_on_page(page, notebook_url: str, source_url: str, source_title: str) -> bool:
+def _source_exists_on_page(page, notebook_url: str, source_url: str, source_title: str, client=None) -> bool:
     """실제 Sources 패널에 대상 소스가 보이는지 확인한다."""
     page.goto(_clean_notebook_url(notebook_url), wait_until="domcontentloaded", timeout=90000)
     _assert_allowed_url(page.url, "SRC_EXISTS_NAVIGATE")
@@ -109,7 +109,7 @@ def _source_exists_on_page(page, notebook_url: str, source_url: str, source_titl
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
 
     body_text = page.inner_text("body")
@@ -203,7 +203,7 @@ def add_source_cua(page, client, notebook_url: str, source_url: str, source_titl
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
 
     is_youtube = "youtube.com/watch" in source_url or "youtu.be/" in source_url
@@ -245,7 +245,7 @@ def add_source_cua(page, client, notebook_url: str, source_url: str, source_titl
         success = _run_cua_loop(page, client, TASK, max_steps=15, phase="ADD_SRC")
     if success:
         time.sleep(3)
-        if _source_exists_on_page(page, notebook_url, source_url, source_title):
+        if _source_exists_on_page(page, notebook_url, source_url, source_title, client=client):
             logger.info("[add_source] 성공: %s", source_url)
             return True
         logger.error("[add_source] UI 검증 실패: %s", source_url)
@@ -263,7 +263,7 @@ def delete_source_cua(page, client, notebook_url: str, source_url: str, source_t
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
 
     identify = source_title[:60] if source_title else source_url[:80]
@@ -287,7 +287,7 @@ def delete_source_cua(page, client, notebook_url: str, source_url: str, source_t
     return success
 
 
-def list_sources_from_page(page, notebook_url: str) -> list[str]:
+def list_sources_from_page(page, notebook_url: str, client=None) -> list[str]:
     """DOM에서 소스 패널 제목 목록 파싱 (GPT 불필요)."""
     page.goto(notebook_url, wait_until="domcontentloaded", timeout=90000)
     _assert_allowed_url(page.url, "LIST_SRC_NAVIGATE")
@@ -295,7 +295,7 @@ def list_sources_from_page(page, notebook_url: str) -> list[str]:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
 
     body_text = page.inner_text("body")
@@ -328,7 +328,7 @@ def find_notebook_url_by_name_cua(page, client, channel_name: str) -> str:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
 
     TASK = (
@@ -402,7 +402,7 @@ def main():
             return
 
         elif args.mode == "list":
-            sources = list_sources_from_page(page, args.notebook_url)
+            sources = list_sources_from_page(page, args.notebook_url, client=client)
             result = {"sources": sources, "count": len(sources)}
             if args.output:
                 Path(args.output).parent.mkdir(parents=True, exist_ok=True)

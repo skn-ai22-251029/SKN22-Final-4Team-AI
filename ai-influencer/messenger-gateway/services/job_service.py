@@ -247,3 +247,26 @@ async def get_latest_job(
     if not rows:
         return None
     return rows[0]
+
+
+async def find_existing_auto_report_job(
+    *,
+    channel_id: str,
+    notebook_url: str,
+) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT *
+        FROM jobs
+        WHERE messenger_user_id = 'system:auto-report'
+          AND COALESCE(script_json->>'auto_report_channel_id', '') = $1
+          AND COALESCE(script_json->>'auto_report_notebook_url', '') = $2
+          AND status <> 'FAILED'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        channel_id,
+        notebook_url,
+    )
+    return _normalize_job_row(row)

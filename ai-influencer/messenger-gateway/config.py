@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     discord_bot_token: str = ""
     discord_allowed_channel_ids: str = ""
+    auto_report_discord_delivery_enabled: bool = False
     openai_api_key: str = ""
     script_rewrite_model: str = "gpt-5.4"
 

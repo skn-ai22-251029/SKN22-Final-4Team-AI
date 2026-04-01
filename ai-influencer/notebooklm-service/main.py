@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 SCRIPTS_DIR = Path(os.getenv("NOTEBOOKLM_SCRIPTS_DIR", "/app/scripts"))
+XVFB_RUN = os.getenv("NOTEBOOKLM_XVFB_RUN", "xvfb-run")
 DATA_DIR = Path(os.getenv("NOTEBOOKLM_DATA_DIR", "/app/data"))
 REPORTS_DIR = DATA_DIR / "reports"
 LIBRARY_JSON = DATA_DIR / "library.json"
@@ -103,6 +104,18 @@ def _cua_subprocess_env() -> dict:
         if value is not None:
             env[key] = value
     return env
+
+
+def _cua_cmd(script_path: Path, *args: str) -> list[str]:
+    # Google sign-in이 headless에서 rejected 되는 패턴이 있어,
+    # NotebookLM 브라우저 자동화는 xvfb 위의 headed Chromium으로 실행한다.
+    return [
+        XVFB_RUN,
+        "-a",
+        "python3",
+        str(script_path),
+        *args,
+    ]
 
 
 def _is_playwright_browser_missing(text: str) -> bool:
@@ -454,14 +467,12 @@ def _run_generate_report(
 
     # 실제 브라우저 자동화는 generate_report_cua.py에 있고,
     # API 레이어는 subprocess 입출력과 timeout/로그 관리만 담당한다.
-    cmd = [
-        "python3",
-        str(SCRIPTS_DIR / "generate_report_cua.py"),
+    cmd = _cua_cmd(
+        SCRIPTS_DIR / "generate_report_cua.py",
         "--prompt", prompt,
         "--notebook-url", notebook_url,
         "--output", str(output_path),
-        "--headless",
-    ]
+    )
 
     logger.info("[notebooklm] starting subprocess job_id=%s cmd=%s", job_id, cmd)
 
@@ -523,14 +534,12 @@ def _run_list_reports(notebook_url: str) -> ListReportsResponse:
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         output_path = tmp.name
 
-    cmd = [
-        "python3",
-        str(SCRIPTS_DIR / "generate_report_cua.py"),
+    cmd = _cua_cmd(
+        SCRIPTS_DIR / "generate_report_cua.py",
         "--mode", "list",
         "--notebook-url", notebook_url,
         "--output", output_path,
-        "--headless",
-    ]
+    )
     logger.info("[notebooklm] list_reports subprocess: %s", cmd)
 
     # 같은 명령을 재실행할 수 있도록 subprocess runner를 감싼다.
@@ -605,15 +614,13 @@ def _run_get_report(
 ) -> GenerateResponse:
     """subprocess로 --mode get 실행 → 기존 보고서 추출."""
     # list 모드로 제목만 본 뒤, 사용자가 고른 index의 실제 보고서 본문을 다시 추출한다.
-    cmd = [
-        "python3",
-        str(SCRIPTS_DIR / "generate_report_cua.py"),
+    cmd = _cua_cmd(
+        SCRIPTS_DIR / "generate_report_cua.py",
         "--mode", "get",
         "--notebook-url", notebook_url,
         "--report-index", str(report_index),
         "--output", str(output_path),
-        "--headless",
-    ]
+    )
     logger.info("[notebooklm] get_report subprocess job_id=%s: %s", job_id, cmd)
 
     try:
@@ -764,14 +771,12 @@ def _get_notebook_url_via_cua(channel_name: str, channel_id: str) -> Optional[st
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         output_path = tmp.name
 
-    cmd = [
-        "python3",
-        str(SCRIPTS_DIR / "manage_sources_cua.py"),
+    cmd = _cua_cmd(
+        SCRIPTS_DIR / "manage_sources_cua.py",
         "--mode", "find",
         "--channel-name", channel_name,
         "--output", output_path,
-        "--headless",
-    ]
+    )
     # library.json에 없을 때만 NotebookLM 홈 화면을 직접 뒤져 notebook_url을 찾는다.
     logger.info("[cua-fallback] FIND_NB 시작: channel_name=%r", channel_name)
     try:
@@ -826,14 +831,13 @@ def _run_check_and_add_source(
 
     # Step 1: 실제 add 모드 subprocess로 NotebookLM에 소스를 삽입한다.
     # sources_log.json은 보조 캐시일 뿐이라, 중복 판정은 subprocess 내부의 실제 UI 확인 결과를 따른다.
-    add_cmd = [
-        "python3", str(manage_script),
+    add_cmd = _cua_cmd(
+        manage_script,
         "--mode", "add",
         "--notebook-url", notebook_url,
         "--source-url", source_url,
         "--source-title", source_title or source_url[:80],
-        "--headless",
-    ]
+    )
     logger.info("[add-source] subprocess 시작: %s", source_url)
     try:
         result = subprocess.run(add_cmd, capture_output=True, text=True, timeout=300, env=_cua_subprocess_env())
@@ -858,13 +862,12 @@ def _run_check_and_add_source(
 
     # Step 2: 최대 소스 수를 넘기면 cleanup 모드로 오래된 항목을 정리한다.
     cleaned_up = 0
-    cleanup_cmd = [
-        "python3", str(manage_script),
+    cleanup_cmd = _cua_cmd(
+        manage_script,
         "--mode", "cleanup",
         "--notebook-url", notebook_url,
         "--max-sources", str(max_sources),
-        "--headless",
-    ]
+    )
     try:
         cr = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=600, env=_cua_subprocess_env())
         for line in (cr.stdout or "").strip().splitlines():
@@ -887,15 +890,13 @@ def _run_create_notebook(name: str, channel_id: str, channel_name: str) -> Creat
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         output_path = tmp.name
 
-    cmd = [
-        "python3",
-        str(SCRIPTS_DIR / "create_notebook_cua.py"),
+    cmd = _cua_cmd(
+        SCRIPTS_DIR / "create_notebook_cua.py",
         "--name", name,
         "--channel-id", channel_id,
         "--channel-name", channel_name,
         "--output", output_path,
-        "--headless",
-    ]
+    )
     logger.info("[create-notebook] subprocess 시작: name=%r channel_id=%r", name, channel_id)
 
     try:

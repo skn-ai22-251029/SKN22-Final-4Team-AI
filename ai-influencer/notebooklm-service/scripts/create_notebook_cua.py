@@ -121,7 +121,7 @@ def create_notebook(page, client, notebook_name: str) -> str:
         page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
 
     TASK = (

@@ -16,8 +16,11 @@ from config import settings
 from prompts import (
     NOTEBOOKLM_REPORT_PROMPT,
     SCRIPT_REWRITE_SYSTEM_PROMPT,
-    build_script_rewrite_user_prompt,
+    build_subtitle_retry_prompt,
+    build_tts_retry_prompt,
     build_tts_script_rewrite_instruction,
+    build_tts_script_prompt,
+    build_subtitle_from_tts_prompt,
 )
 from utils.file_naming import build_filename
 from services.storage_service import presign_s3_uri, put_bytes_and_presign
@@ -405,11 +408,44 @@ def _extract_json_object(text: str) -> dict:
 
 
 def _extract_topic_keywords(raw_report_text: str) -> list[str]:
-    header = (raw_report_text or "").strip().splitlines()
-    if not header:
+    lines = [line.strip() for line in (raw_report_text or "").strip().splitlines() if line.strip()]
+    if not lines:
         return []
-    first_line = header[0]
-    normalized = re.sub(r"[\[\]\(\)\{\}:,./*\"'“”‘’\-–—]+", " ", first_line)
+
+    blocked_lines = {
+        "신고",
+        "메모 추가",
+        "공유",
+        "share",
+        "content_copy",
+        "thumb_up",
+        "thumb_down",
+        "collapse_content",
+        "more_horiz",
+        "스튜디오",
+    }
+    blocked_line_patterns = (
+        r"^소스 \d+개 기반$",
+        r"^기반:소스.*$",
+        r"^소스 \d+개$",
+        r"^NotebookLM이 부정확한 정보를 표시할 수 있으므로.*$",
+    )
+
+    title_line = ""
+    for line in lines[:8]:
+        if line in blocked_lines:
+            continue
+        if any(re.fullmatch(pattern, line) for pattern in blocked_line_patterns):
+            continue
+        if re.fullmatch(r"[a-z_]+", line):
+            continue
+        title_line = line
+        break
+
+    if not title_line:
+        return []
+
+    normalized = re.sub(r"[\[\]\(\)\{\}:,./*\"'“”‘’\-–—]+", " ", title_line)
     candidates = re.findall(r"[A-Za-z0-9.+#-]{2,}|[가-힣]{2,}", normalized)
     blocked = {
         "기술",
@@ -427,6 +463,16 @@ def _extract_topic_keywords(raw_report_text: str) -> list[str]:
         "글로벌",
         "현대",
         "차세대",
+        "소스",
+        "기반",
+        "개",
+        "NotebookLM",
+        "부정확한",
+        "표시할",
+        "있으므로",
+        "대답을",
+        "다시",
+        "확인하세요",
     }
     keywords: list[str] = []
     for candidate in candidates:
@@ -438,15 +484,72 @@ def _extract_topic_keywords(raw_report_text: str) -> list[str]:
     return keywords[:5]
 
 
-def _validate_rewritten_scripts(raw_report_text: str, subtitle_script_text: str, tts_script_text: str) -> None:
+def _extract_supporting_facts(raw_report_text: str) -> list[str]:
+    body = (raw_report_text or "").strip()
+    if not body:
+        return []
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if len(lines) > 1:
+        body = "\n".join(lines[1:])
+    sentences = re.split(r"(?<=[.!?다요])\s+|\n+", body)
+    facts: list[str] = []
+    for sentence in sentences:
+        fact = sentence.strip(" -\t")
+        if len(fact) < 18:
+            continue
+        if fact not in facts:
+            facts.append(fact)
+        if len(facts) >= 5:
+            break
+    return facts
+
+
+_SCRIPT_MIN_CHARS = 350
+_SCRIPT_MAX_CHARS = 400
+_SCRIPT_REWRITE_MAX_ATTEMPTS = 5
+
+
+def _script_char_count(script_text: str) -> int:
+    # 줄바꿈은 포맷 요소라 길이 계산에서 제외하고, 실제 문장 길이만 본다.
+    return len((script_text or "").replace("\r", "").replace("\n", ""))
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    sanitized = (text or "").replace("\x00", "")
+    return sanitized.encode("utf-8", "ignore").decode("utf-8")
+
+
+def _non_empty_line_count(script_text: str) -> int:
+    return len([line for line in (script_text or "").splitlines() if line.strip()])
+
+
+def _validate_subtitle_script(tts_script_text: str, subtitle_script_text: str) -> None:
+    subtitle_len = _script_char_count(subtitle_script_text)
+    if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
+        raise RuntimeError(
+            f"subtitle_script_text length out of range: {subtitle_len} (expected {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
+        )
+    subtitle_lines = [line.strip() for line in subtitle_script_text.splitlines() if line.strip()]
+    tts_lines = [line.strip() for line in tts_script_text.splitlines() if line.strip()]
+    if len(subtitle_lines) != len(tts_lines):
+        raise RuntimeError(
+            f"subtitle_script_text line count mismatch: tts={len(tts_lines)} subtitle={len(subtitle_lines)}"
+        )
+    if tts_lines and "보리" in tts_lines[0] and "보리" not in subtitle_lines[0]:
+        raise RuntimeError("subtitle_script_text dropped opening vocative from first line")
+
+
+def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> None:
     keywords = _extract_topic_keywords(raw_report_text)
-    if not keywords:
-        return
-    subtitle_ok = any(keyword in subtitle_script_text for keyword in keywords)
-    tts_ok = any(keyword in tts_script_text for keyword in keywords)
-    if subtitle_ok and tts_ok:
-        return
-    raise RuntimeError(f"script rewrite topic drift detected; missing keywords={keywords}")
+    if keywords:
+        tts_ok = any(keyword in tts_script_text for keyword in keywords)
+        if not tts_ok:
+            raise RuntimeError(f"script rewrite topic drift detected; missing keywords={keywords}")
+    tts_len = _script_char_count(tts_script_text)
+    if not (_SCRIPT_MIN_CHARS <= tts_len <= _SCRIPT_MAX_CHARS):
+        raise RuntimeError(
+            f"tts_script_text length out of range: {tts_len} (expected {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
+        )
 
 
 async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: str) -> tuple[str, str]:
@@ -458,37 +561,101 @@ async def _rewrite_report_to_script(raw_report_text: str, rewrite_instruction: s
 
     client = AsyncOpenAI(api_key=api_key)
     try:
-        response = await client.chat.completions.create(
-            model=settings.script_rewrite_model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": SCRIPT_REWRITE_SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": build_script_rewrite_user_prompt(
-                        raw_report_text=raw_report_text,
-                        rewrite_instruction=rewrite_instruction,
-                    ),
-                },
-            ],
-        )
+        last_error: Exception | None = None
+        fact_lines = "\n".join(f"- {fact}" for fact in _extract_supporting_facts(raw_report_text)) or "- 원문 보고서의 핵심 사실을 그대로 사용한다."
+        tts_script_text = ""
+        for attempt in range(_SCRIPT_REWRITE_MAX_ATTEMPTS):
+            tts_prompt = (
+                build_tts_script_prompt(
+                    raw_report_text=raw_report_text,
+                    fact_lines=fact_lines,
+                    rewrite_instruction=rewrite_instruction,
+                )
+                if attempt == 0
+                else build_tts_retry_prompt(
+                    raw_report_text=raw_report_text,
+                    rewrite_instruction=rewrite_instruction,
+                    previous_script_text=tts_script_text,
+                    char_count=_script_char_count(tts_script_text),
+                    fact_lines=fact_lines,
+                )
+            )
+            tts_prompt = _sanitize_prompt_text(tts_prompt)
+            response = await client.chat.completions.create(
+                model=settings.script_rewrite_model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": SCRIPT_REWRITE_SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": tts_prompt,
+                    },
+                ],
+            )
+            if not response.choices:
+                last_error = RuntimeError("tts rewrite returned no choices")
+                continue
+            tts_script_text = _sanitize_prompt_text(
+                _extract_completion_text(response.choices[0].message.content).strip()
+            )
+            if not tts_script_text:
+                last_error = RuntimeError("tts rewrite returned empty content")
+                continue
+            try:
+                _validate_tts_script(raw_report_text, tts_script_text)
+                break
+            except Exception as e:
+                last_error = e
+        else:
+            raise RuntimeError(str(last_error or "tts rewrite failed after retries"))
+
+        subtitle_script_text = ""
+        for attempt in range(_SCRIPT_REWRITE_MAX_ATTEMPTS):
+            subtitle_prompt = (
+                build_subtitle_from_tts_prompt(tts_script_text=tts_script_text)
+                if attempt == 0
+                else build_subtitle_retry_prompt(
+                    tts_script_text=tts_script_text,
+                    previous_script_text=subtitle_script_text,
+                    char_count=_script_char_count(subtitle_script_text),
+                )
+            )
+            subtitle_prompt = _sanitize_prompt_text(subtitle_prompt)
+            response = await client.chat.completions.create(
+                model=settings.script_rewrite_model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": SCRIPT_REWRITE_SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": subtitle_prompt,
+                    },
+                ],
+            )
+            if not response.choices:
+                last_error = RuntimeError("subtitle rewrite returned no choices")
+                continue
+            subtitle_script_text = _sanitize_prompt_text(
+                _extract_completion_text(response.choices[0].message.content).strip()
+            )
+            if not subtitle_script_text:
+                last_error = RuntimeError("subtitle rewrite returned empty content")
+                continue
+            try:
+                _validate_subtitle_script(tts_script_text, subtitle_script_text)
+                return subtitle_script_text, tts_script_text
+            except Exception as e:
+                last_error = e
     finally:
         await client.close()
 
-    if not response.choices:
-        raise RuntimeError("script rewrite returned no choices")
-    payload_text = _extract_completion_text(response.choices[0].message.content)
-    payload = _extract_json_object(payload_text)
-    subtitle_script_text = str(payload.get("subtitle_script_text") or "").strip()
-    tts_script_text = str(payload.get("tts_script_text") or "").strip()
-    if not subtitle_script_text or not tts_script_text:
-        raise RuntimeError("script rewrite returned missing subtitle/tts content")
-    _validate_rewritten_scripts(raw_report_text, subtitle_script_text, tts_script_text)
-    return subtitle_script_text, tts_script_text
+    raise RuntimeError(str(last_error or "subtitle rewrite failed after retries"))
 
 
 async def _prepare_report_delivery(
@@ -499,28 +666,23 @@ async def _prepare_report_delivery(
     filename: str,
     rewrite_prompt: str,
 ) -> tuple[str, bytes, str, dict]:
-    # 기본값은 "원문 보고서를 그대로 사용"이고,
-    # rewrite 성공 시에만 subtitle/tts 스크립트를 교체한다.
     raw_report_text = (raw_report_text or "").strip()
     rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt)
-    subtitle_script_text = raw_report_text
-    tts_script_text = raw_report_text
-    rewrite_status = "skipped_empty_report"
-    rewrite_error = ""
+    if not raw_report_text:
+        raise RuntimeError("raw report is empty")
 
-    if raw_report_text:
-        try:
-            subtitle_script_text, tts_script_text = await _rewrite_report_to_script(raw_report_text, rewrite_instruction)
-            rewrite_status = "success"
-        except Exception as e:
-            rewrite_status = "fallback_raw"
-            rewrite_error = str(e)
-            logger.exception("[script-rewrite] failed job_id=%s", job_id)
+    try:
+        subtitle_script_text, tts_script_text = await _rewrite_report_to_script(raw_report_text, rewrite_instruction)
+        rewrite_status = "success"
+        rewrite_error = ""
+    except Exception as e:
+        logger.exception("[script-rewrite] failed job_id=%s", job_id)
+        raise RuntimeError(f"script rewrite failed: {e}") from e
 
     merged_script = _merge_script_json_with_media_names(
         existing_script_json,
-        subtitle_script_text=subtitle_script_text if subtitle_script_text else None,
-        tts_script_text=tts_script_text if tts_script_text else None,
+        subtitle_script_text=subtitle_script_text,
+        tts_script_text=tts_script_text,
         report_filename=filename,
         notebooklm_report_text=raw_report_text,
         script_rewrite_prompt=rewrite_instruction,
@@ -720,6 +882,30 @@ async def _post_notebooklm_with_retry(
     raise RuntimeError(f"unexpected notebooklm request failure: {endpoint}")
 
 
+async def _get_notebook_state_payload(channel_id: str) -> dict:
+    resp = await _post_notebooklm_with_retry(
+        "/notebook-state",
+        {"channel_id": channel_id},
+        timeout_seconds=30.0,
+        max_attempts=3,
+        backoff_seconds=1.5,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Notebook state request failed: HTTP {resp.status_code}",
+        )
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Notebook state returned invalid payload")
+    if payload.get("status") != "success":
+        raise HTTPException(
+            status_code=502,
+            detail=f"Notebook state error: {payload.get('error') or 'unknown'}",
+        )
+    return payload
+
+
 async def _resolve_manual_job(
     body: ManualGenerateRequest,
     *,
@@ -835,6 +1021,16 @@ def _build_auto_report_prompt(body: AutoReportRequest) -> str:
         segments.append(f"최신 참고 영상 URL: {body.source_url}.")
     segments.append("위 최신 소스를 참고해 오늘 업로드 흐름에 맞는 대사를 작성한다.")
     return " ".join(segments)
+
+
+def _should_skip_auto_report_discord_delivery(job: dict | None) -> bool:
+    # 시간별 자동 보고서는 S3/DB 적재까지만 두고,
+    # Discord 노출은 설정으로 별도 제어한다.
+    if settings.auto_report_discord_delivery_enabled:
+        return False
+    if not job:
+        return False
+    return (job.get("messenger_user_id") or "").strip() == "system:auto-report"
 
 
 def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> None:
@@ -1031,6 +1227,43 @@ async def report_message(_: AuthDep, body: ReportMessageRequest) -> dict:
 async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
     """WF-09 소스 추가 성공 후 자동으로 WF-06 보고서 생성을 트리거한다."""
     # 자동 수집 경로는 Discord 사용자 대신 system:auto-report 계정으로 job을 만든다.
+    notebook_state = await _get_notebook_state_payload(body.channel_id)
+    notebook_url = str(notebook_state.get("notebook_url") or "").strip()
+    has_reports = bool(notebook_state.get("has_reports"))
+    if not notebook_url:
+        raise HTTPException(status_code=502, detail="Notebook state returned empty notebook_url")
+    if has_reports:
+        logger.info(
+            "[auto-report] skip channel=%s notebook=%s reason=existing-report",
+            body.channel_id,
+            notebook_url,
+        )
+        return {
+            "status": "skipped",
+            "reason": "existing-report",
+            "notebook_url": notebook_url,
+        }
+
+    existing_auto_job = await job_service.find_existing_auto_report_job(
+        channel_id=body.channel_id,
+        notebook_url=notebook_url,
+    )
+    if existing_auto_job is not None:
+        logger.info(
+            "[auto-report] skip channel=%s notebook=%s reason=existing-job job_id=%s status=%s",
+            body.channel_id,
+            notebook_url,
+            existing_auto_job["id"],
+            existing_auto_job.get("status", ""),
+        )
+        return {
+            "status": "skipped",
+            "reason": "existing-job",
+            "job_id": existing_auto_job["id"],
+            "job_status": existing_auto_job.get("status", ""),
+            "notebook_url": notebook_url,
+        }
+
     target_channel_id = _get_primary_discord_channel_id()
     prompt = _build_auto_report_prompt(body)
     job_id = str(uuid.uuid4())
@@ -1047,6 +1280,15 @@ async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
     )
 
     await job_service.create_job(report_body)
+    await job_service.update_job(
+        job_id,
+        script_json={
+            "auto_report_channel_id": body.channel_id,
+            "auto_report_notebook_url": notebook_url,
+            "auto_report_source_url": body.source_url,
+            "auto_report_source_title": body.source_title,
+        },
+    )
     wf06_ok = await _call_wf06(report_body, raise_on_error=True)
     if not wf06_ok:
         raise HTTPException(status_code=500, detail="WF-06 trigger failed")
@@ -1308,13 +1550,18 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
 
         report_content = data["report_content"]
         filename = _normalize_report_filename(body.job_id, data.get("filename"), job.get("script_json"))
-        final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
-            job_id=body.job_id,
-            raw_report_text=report_content,
-            existing_script_json=job.get("script_json"),
-            filename=filename,
-            rewrite_prompt=job.get("concept_text", ""),
-        )
+        try:
+            final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
+                job_id=body.job_id,
+                raw_report_text=report_content,
+                existing_script_json=job.get("script_json"),
+                filename=filename,
+                rewrite_prompt=job.get("concept_text", ""),
+            )
+        except Exception as e:
+            await job_service.update_job(body.job_id, error_message=str(e))
+            await _discord_adapter.send_text_message(channel_id, f"❌ 대본 생성 실패: {str(e)[:180]}")
+            return
         try:
             _, merged_script = _upload_tts_script_file(
                 job_id=body.job_id,
@@ -1380,13 +1627,17 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
-    final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
-        job_id=body.job_id,
-        raw_report_text=body.report_content,
-        existing_script_json=existing_job.get("script_json") if existing_job else None,
-        filename=filename,
-        rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
-    )
+    try:
+        final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
+            job_id=body.job_id,
+            raw_report_text=body.report_content,
+            existing_script_json=existing_job.get("script_json") if existing_job else None,
+            filename=filename,
+            rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
+        )
+    except Exception as e:
+        await job_service.update_job(body.job_id, error_message=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
     try:
         # TTS용 파일 업로드 실패는 사용자 보고서 전송을 막지 않도록 분리 처리한다.
         _, merged_script = _upload_tts_script_file(
@@ -1432,6 +1683,19 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         final_url=report_storage_url or None,
         script_json=merged_script,
     )
+
+    if _should_skip_auto_report_discord_delivery(existing_job):
+        logger.info(
+            "[discord] send_report skipped for auto-report job_id=%s filename=%s",
+            body.job_id,
+            filename,
+        )
+        return {
+            "status": "stored_only",
+            "filename": filename,
+            "file_url": stored.presigned_url if stored else "",
+            "s3_uri": report_storage_url,
+        }
 
     if is_link_only_report:
         try:

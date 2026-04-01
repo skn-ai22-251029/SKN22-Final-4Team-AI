@@ -136,6 +136,13 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 - 선택 body: `{ "avatar_id": "..." }`
 - 응답에 현재 WF-12 기본값(`width/height/caption/speed/poll/max_wait/mock`)도 포함
 
+### 시간별 자동 보고서 Discord 전송
+
+- `WF-09 -> /internal/auto-report -> WF-06` 경로는 계속 동작
+- 다만 Discord 전송은 `AUTO_REPORT_DISCORD_DELIVERY_ENABLED=false` 이면 생략
+- 기본값은 `false`
+- 이때도 대본 rewrite, S3 저장, DB 업데이트는 그대로 수행
+
 ### `POST /internal/character-avatar`
 
 - 캐릭터 기본 HeyGen 아바타를 DB 상태로 저장
