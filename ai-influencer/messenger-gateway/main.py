@@ -1088,6 +1088,37 @@ def _spawn_tts_generation(
     )
 
 
+async def _create_prompt_tts_job(body: ManualGenerateRequest) -> dict:
+    normalized_prompt = (body.prompt or "").strip()
+    messenger_user_id = (body.messenger_user_id or "").strip()
+    messenger_channel_id = (body.messenger_channel_id or "").strip()
+    if not normalized_prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if not messenger_user_id or not messenger_channel_id:
+        raise HTTPException(
+            status_code=400,
+            detail="messenger_user_id and messenger_channel_id are required when prompt is provided",
+        )
+
+    job_id = _normalize_manual_job_id(body.job_id) or str(uuid.uuid4())
+    request = IncomingMessageRequest(
+        job_id=job_id,
+        messenger_source=MessengerSource.DISCORD,
+        messenger_user_id=messenger_user_id,
+        messenger_channel_id=messenger_channel_id,
+        concept_text=normalized_prompt,
+        character_id="default-character",
+    )
+    created_job = await job_service.create_job(request)
+    script_json = _merge_script_json_with_media_names(
+        created_job.get("script_json"),
+        script_text=normalized_prompt,
+        subtitle_script_text=normalized_prompt,
+        tts_script_text=normalized_prompt,
+    )
+    return await job_service.update_job(job_id, script_json=script_json)
+
+
 async def _post_notebooklm_with_retry(
     endpoint: str,
     payload: dict,
@@ -2426,14 +2457,23 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
 @app.post("/internal/tts-generate")
 async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
     """수동 /tts 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-11 실행."""
+    normalized_prompt = (body.prompt or "").strip()
     logger.info(
-        "[manual /tts] request job_id=%s user=%s channel=%s",
+        "[manual /tts] request job_id=%s user=%s channel=%s prompt_len=%d",
         (body.job_id or "").strip(),
         (body.messenger_user_id or "").strip(),
         (body.messenger_channel_id or "").strip(),
+        len(normalized_prompt),
     )
-    job = await _resolve_manual_job(body, require_script=True)
-    resolved_job_id = job["id"]
+    if normalized_prompt and (body.job_id or "").strip():
+        raise HTTPException(status_code=400, detail="job_id and prompt cannot be used together")
+
+    if normalized_prompt:
+        job = await _create_prompt_tts_job(body)
+        resolved_job_id = job["id"]
+    else:
+        job = await _resolve_manual_job(body, require_script=True)
+        resolved_job_id = job["id"]
 
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
@@ -2455,8 +2495,17 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
         logger.error("call_wf11 (manual /tts) failed job_id=%s: %s", resolved_job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info("[manual /tts] triggered job_id=%s", resolved_job_id)
-    return {"job_id": resolved_job_id, "status": "triggered", "workflow": "WF-11"}
+    logger.info(
+        "[manual /tts] triggered job_id=%s source=%s",
+        resolved_job_id,
+        "prompt" if normalized_prompt else "existing-job",
+    )
+    return {
+        "job_id": resolved_job_id,
+        "status": "triggered",
+        "workflow": "WF-11",
+        "source": "prompt" if normalized_prompt else "existing-job",
+    }
 
 
 @app.post("/internal/heygen-smoke-test")

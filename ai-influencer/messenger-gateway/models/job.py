@@ -124,6 +124,7 @@ class ManualGenerateRequest(BaseModel):
     messenger_channel_id: str = ""
     avatar_id: str = ""
     use_avatar_iv_model: bool = False
+    prompt: str = ""
 
 
 class HeygenSmokeTestRequest(BaseModel):
