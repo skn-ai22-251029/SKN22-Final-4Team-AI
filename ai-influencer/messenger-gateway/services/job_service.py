@@ -12,6 +12,21 @@ logger = logging.getLogger(__name__)
 _pool: Optional[asyncpg.Pool] = None
 
 
+def _normalize_job_row(row: asyncpg.Record | None) -> Optional[dict[str, Any]]:
+    if row is None:
+        return None
+    result = dict(row)
+    job_id = result.get("id")
+    if job_id is not None:
+        result["id"] = str(job_id)
+    return result
+
+
+async def _ensure_schema(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS heygen_avatar_id TEXT")
+
+
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
@@ -24,6 +39,7 @@ async def get_db_pool() -> asyncpg.Pool:
             min_size=2,
             max_size=10,
         )
+        await _ensure_schema(_pool)
         logger.info("DB pool created")
     return _pool
 
@@ -61,7 +77,7 @@ async def create_job(data: Union[IncomingMessageRequest, ReportMessageRequest]) 
         data.messenger_user_id,
         data.messenger_channel_id,
     )
-    result = dict(row)
+    result = _normalize_job_row(row)
     logger.info("[%s] create_job job_id=%s", data.messenger_source.value, data.job_id)
     return result
 
@@ -69,8 +85,26 @@ async def create_job(data: Union[IncomingMessageRequest, ReportMessageRequest]) 
 async def get_job(job_id: str) -> Optional[dict[str, Any]]:
     pool = await get_db_pool()
     row = await pool.fetchrow("SELECT * FROM jobs WHERE id::text = $1", job_id)
+    return _normalize_job_row(row)
+
+
+async def get_character(character_id: str) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow("SELECT * FROM characters WHERE id = $1", character_id)
+    return dict(row) if row is not None else None
+
+
+async def update_character_avatar(character_id: str, avatar_id: str) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    normalized_avatar_id = (avatar_id or "").strip() or None
+    row = await pool.fetchrow(
+        "UPDATE characters SET heygen_avatar_id = $1 WHERE id = $2 RETURNING *",
+        normalized_avatar_id,
+        character_id,
+    )
     if row is None:
         return None
+    logger.info("update_character_avatar character_id=%s avatar_id=%s", character_id, normalized_avatar_id or "")
     return dict(row)
 
 
@@ -95,7 +129,7 @@ async def update_job(job_id: str, **kwargs: Any) -> dict[str, Any]:
     pool = await get_db_pool()
     row = await pool.fetchrow(query, *values)
     logger.info("update_job job_id=%s fields=%s", job_id, list(kwargs.keys()))
-    return dict(row)
+    return _normalize_job_row(row)
 
 
 async def transition_status(
@@ -109,7 +143,7 @@ async def transition_status(
         new_status,
         job_id,
     )
-    result = dict(row)
+    result = _normalize_job_row(row)
     logger.info("transition_status job_id=%s -> %s", job_id, new_status)
     return result
 
@@ -213,3 +247,26 @@ async def get_latest_job(
     if not rows:
         return None
     return rows[0]
+
+
+async def find_existing_auto_report_job(
+    *,
+    channel_id: str,
+    notebook_url: str,
+) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT *
+        FROM jobs
+        WHERE messenger_user_id = 'system:auto-report'
+          AND COALESCE(script_json->>'auto_report_channel_id', '') = $1
+          AND COALESCE(script_json->>'auto_report_notebook_url', '') = $2
+          AND status <> 'FAILED'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        channel_id,
+        notebook_url,
+    )
+    return _normalize_job_row(row)

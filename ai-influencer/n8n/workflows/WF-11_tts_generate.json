@@ -87,7 +87,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const fs = require('fs');\nconst path = require('path');\n\nconst jobId = $('Extract Fields').item.json.job_id;\nconst scriptText = $('Extract Fields').item.json.script_text;\nconst channelId = $('Extract Fields').item.json.channel_id;\nconst userId = $('Extract Fields').item.json.user_id;\nconst autoTrigger = !!$('Extract Fields').item.json.auto_trigger_wf12;\n\nif (!scriptText || !scriptText.trim()) {\n  return {\n    json: {\n      ok: false,\n      error: 'script_text is required',\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}\n\ntry {\n  const ttsBody = {\n    text: scriptText,\n    text_lang: $env.TTS_TEXT_LANG || 'ko',\n    media_type: 'wav',\n    streaming_mode: false,\n  };\n\n  const hasRefAudio = !!($env.TTS_REF_AUDIO_PATH || '').trim();\n  const hasRefText = !!($env.TTS_PROMPT_TEXT || '').trim();\n\n  // 음색 클론을 쓸 때만 ref 오디오/텍스트를 함께 전달한다.\n  if (hasRefAudio || hasRefText) {\n    if (!(hasRefAudio && hasRefText)) {\n      throw new Error('TTS_REF_AUDIO_PATH와 TTS_PROMPT_TEXT는 함께 설정해야 합니다.');\n    }\n    ttsBody.ref_audio_path = $env.TTS_REF_AUDIO_PATH;\n    ttsBody.prompt_text = $env.TTS_PROMPT_TEXT;\n    ttsBody.prompt_lang = $env.TTS_PROMPT_LANG || 'ko';\n  }\n\n  const ttsResp = await fetch(`${$env.TTS_API_URL}/tts`, {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify(ttsBody),\n  });\n\n  if (!ttsResp.ok) {\n    throw new Error(`TTS API failed: ${ttsResp.status} ${await ttsResp.text()}`);\n  }\n\n  const audioBuffer = await ttsResp.arrayBuffer();\n  const audioBytes = Buffer.from(audioBuffer);\n  const audioB64 = audioBytes.toString('base64');\n\n  const kstDate = new Intl.DateTimeFormat('en-CA', {\n    timeZone: 'Asia/Seoul',\n    year: 'numeric',\n    month: '2-digit',\n    day: '2-digit',\n  }).format(new Date()).replace(/-/g, '');\n  const filename = `${kstDate}-${jobId}.wav`;\n\n  const dir = '/home/node/.n8n/audio';\n  fs.mkdirSync(dir, { recursive: true });\n  const filePath = path.join(dir, filename);\n  fs.writeFileSync(filePath, audioBytes);\n\n  return {\n    json: {\n      ok: true,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n      script_text: scriptText,\n      audio_file_path: filePath,\n      filename,\n      audio_content_b64: audioB64,\n      auto_trigger_wf12: autoTrigger,\n    },\n  };\n} catch (e) {\n  const message = e && e.message ? e.message : String(e);\n  return {\n    json: {\n      ok: false,\n      error: message,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}",
+        "jsCode": "const jobId = $('Extract Fields').item.json.job_id;\nconst scriptText = $('Extract Fields').item.json.script_text;\nconst channelId = $('Extract Fields').item.json.channel_id;\nconst userId = $('Extract Fields').item.json.user_id;\nconst autoTrigger = !!$('Extract Fields').item.json.auto_trigger_wf12;\n\nif (!scriptText || !scriptText.trim()) {\n  return {\n    json: {\n      ok: false,\n      error: 'script_text is required',\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}\n\ntry {\n  const ttsApiUrl = ($env.TTS_API_URL || '').trim();\n  if (!ttsApiUrl) {\n    throw new Error('TTS_API_URL is not configured');\n  }\n\n  const ttsBody = {\n    text: scriptText,\n    text_lang: $env.TTS_TEXT_LANG || 'ko',\n    media_type: 'wav',\n    streaming_mode: false,\n  };\n\n  const hasRefAudio = !!($env.TTS_REF_AUDIO_PATH || '').trim();\n  const hasRefText = !!($env.TTS_PROMPT_TEXT || '').trim();\n\n  if (hasRefAudio || hasRefText) {\n    if (!(hasRefAudio && hasRefText)) {\n      throw new Error('TTS_REF_AUDIO_PATH와 TTS_PROMPT_TEXT는 함께 설정해야 합니다.');\n    }\n    ttsBody.ref_audio_path = $env.TTS_REF_AUDIO_PATH;\n    ttsBody.prompt_text = $env.TTS_PROMPT_TEXT;\n    ttsBody.prompt_lang = $env.TTS_PROMPT_LANG || 'ko';\n  }\n\n  const ttsResp = await fetch(`${ttsApiUrl}/tts`, {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify(ttsBody),\n  });\n\n  if (!ttsResp.ok) {\n    throw new Error(`TTS API failed: ${ttsResp.status} ${await ttsResp.text()}`);\n  }\n\n  const audioBuffer = await ttsResp.arrayBuffer();\n  const audioBytes = Buffer.from(audioBuffer);\n  const audioB64 = audioBytes.toString('base64');\n\n  const kstDate = new Intl.DateTimeFormat('en-CA', {\n    timeZone: 'Asia/Seoul',\n    year: 'numeric',\n    month: '2-digit',\n    day: '2-digit',\n  }).format(new Date()).replace(/-/g, '');\n  const filename = `${kstDate}-${jobId}.wav`;\n\n  return {\n    json: {\n      ok: true,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n      script_text: scriptText,\n      audio_file_path: '',\n      filename,\n      audio_content_b64: audioB64,\n      auto_trigger_wf12: autoTrigger,\n    },\n  };\n} catch (e) {\n  const message = e && e.message ? e.message : String(e);\n  return {\n    json: {\n      ok: false,\n      error: message,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}",
         "options": {},
         "mode": "runOnceForEachItem"
       },
@@ -148,7 +148,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, job_id: $('RunPod TTS + Save WAV').item.json.job_id, audio_content_b64: $('RunPod TTS + Save WAV').item.json.audio_content_b64, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, filename: $('RunPod TTS + Save WAV').item.json.filename, caption: '🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행됩니다.', include_wf12_button: true }) }}",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, job_id: $('RunPod TTS + Save WAV').item.json.job_id, audio_content_b64: $('RunPod TTS + Save WAV').item.json.audio_content_b64, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, filename: $('RunPod TTS + Save WAV').item.json.filename, caption: ($('RunPod TTS + Save WAV').item.json.auto_trigger_wf12 ? '🔊 TTS 완료. 영상 제작 모드로 WF-12(HeyGen)를 자동 실행합니다.' : '🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행됩니다.'), include_wf12_button: (!$('RunPod TTS + Save WAV').item.json.auto_trigger_wf12) }) }}",
         "options": {}
       },
       "id": "wf11-http-send-audio",
@@ -163,7 +163,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='APPROVED', audio_url='{{ $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('audio_filename', '{{ $('RunPod TTS + Save WAV').item.json.filename }}')), updated_at=NOW() WHERE id='{{ $('RunPod TTS + Save WAV').item.json.job_id }}'",
+        "query": "UPDATE jobs SET status='APPROVED', audio_url='{{ $('Send TTS Audio to Gateway').item.json.s3_uri || $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('audio_filename', '{{ $('RunPod TTS + Save WAV').item.json.filename }}')), updated_at=NOW() WHERE id='{{ $('RunPod TTS + Save WAV').item.json.job_id }}'",
         "options": {}
       },
       "id": "wf11-pg-save-audio",
@@ -217,7 +217,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://n8n:5678/webhook/wf-12-heygen-generate",
+        "url": "={{ $env.N8N_WF12_WEBHOOK_URL }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -229,7 +229,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_file_path: $('RunPod TTS + Save WAV').item.json.audio_file_path, audio_url: $('Send TTS Audio to Gateway').item.json.audio_url || $('RunPod TTS + Save WAV').item.json.audio_file_path }) }}",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('RunPod TTS + Save WAV').item.json.job_id, channel_id: $('RunPod TTS + Save WAV').item.json.channel_id, user_id: $('RunPod TTS + Save WAV').item.json.user_id, audio_url: $('Send TTS Audio to Gateway').item.json.audio_url }) }}",
         "options": {}
       },
       "id": "wf11-http-trigger-wf12",

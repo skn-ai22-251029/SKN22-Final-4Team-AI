@@ -23,6 +23,7 @@ logger = logging.getLogger("generate_report_cua")
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 BROWSER_PROFILE_DIR = DATA_DIR / "browser_state" / "browser_profile"
+STORAGE_STATE_PATH = DATA_DIR / "browser_state" / "storage_state.json"
 CHROMIUM_LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -77,6 +78,25 @@ Rules:
 - Output only JSON and nothing else.
 """
 
+LOGIN_SYSTEM_PROMPT = """You are a browser automation assistant controlling a Chromium browser via Playwright for Google sign-in.
+Given a screenshot of the current browser state and a task, output a JSON action to perform.
+
+Output ONLY valid JSON in one of these formats:
+
+1. Click: {"action": "click", "x": <int>, "y": <int>, "reason": "<why>"}
+2. Key: {"action": "key", "key": "<key name e.g. Enter, Tab>"}
+3. Scroll: {"action": "scroll", "x": <int>, "y": <int>, "delta_y": <int>}
+4. Wait: {"action": "wait", "ms": <milliseconds>}
+5. Done: {"action": "done"}
+
+Rules:
+- Output ONLY the JSON object, no explanation.
+- Never type credentials yourself.
+- Use "done" only when the requested login milestone is clearly reached on screen.
+- You may click Google sign-in controls such as Next, Continue, Use another account, Try again, Skip, Not now.
+- Stay within visible Google/NotebookLM controls only.
+"""
+
 ALLOWED_CUA_HOSTS = {
     "notebooklm.google.com",
     "accounts.google.com",
@@ -96,7 +116,56 @@ _REPORT_SELECTORS = [
 ]
 
 
-def _ensure_logged_in(page: Page) -> None:
+def _is_notebooklm_ready_url(url: str) -> bool:
+    return "notebooklm.google.com" in (url or "") and "accounts.google.com" not in (url or "")
+
+
+def _is_visible(page: Page, selector: str, timeout: int = 1200) -> bool:
+    try:
+        page.locator(selector).first.wait_for(state="visible", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _page_contains_text(page: Page, needles: list[str]) -> bool:
+    try:
+        body = page.locator("body").inner_text(timeout=1500)
+    except Exception:
+        return False
+    lowered = body.lower()
+    return any(needle.lower() in lowered for needle in needles)
+
+
+def _get_login_state(page: Page) -> str:
+    if _is_notebooklm_ready_url(page.url):
+        return "logged_in"
+    if "signin/challenge/pwd" in (page.url or "") or "/challenge/pwd" in (page.url or ""):
+        return "password"
+    if _page_contains_text(page, ["패스키", "passkey", "다른 방법 선택", "try another way", "비밀번호 입력", "enter your password"]):
+        return "passkey"
+    if _is_visible(page, "input[type='password']"):
+        return "password"
+    if _is_visible(page, "input[type='email']"):
+        return "email"
+    return "unknown"
+
+
+def _run_login_cua_step(page: Page, client: OpenAI, task: str, phase: str, max_steps: int = 12) -> None:
+    success = _run_cua_loop(
+        page,
+        client,
+        task,
+        max_steps=max_steps,
+        phase=phase,
+        allowed_actions={"click", "key", "scroll", "wait", "done"},
+        system_prompt=LOGIN_SYSTEM_PROMPT,
+    )
+    if not success:
+        raise RuntimeError(f"Google 로그인 CUA 실패 ({phase}, {max_steps} 스텝 초과)")
+
+
+def _ensure_logged_in(page: Page, client: Optional[OpenAI] = None) -> None:
     """Google 로그인이 필요한 경우 자동으로 로그인한다.
     GOOGLE_EMAIL / GOOGLE_PASSWORD 환경변수가 설정된 경우에만 동작."""
     email = os.environ.get("GOOGLE_EMAIL", "")
@@ -112,22 +181,110 @@ def _ensure_logged_in(page: Page) -> None:
         return
 
     logger.info("[login] 로그인 페이지 감지 — 자동 로그인 시작")
+    client = client or _build_openai_client()
 
     try:
-        # 이메일 입력
-        page.wait_for_selector("input[type='email']", timeout=15000)
-        page.fill("input[type='email']", email)
-        page.click("button:has-text('다음'), button:has-text('Next'), #identifierNext")
-        logger.info("[login] 이메일 입력 완료")
+        state = _get_login_state(page)
+        if state not in {"email", "password", "logged_in"}:
+            _run_login_cua_step(
+                page,
+                client,
+                (
+                    "Task: Navigate the current Google sign-in flow until one of these is true:\n"
+                    "1. the email input is visible and focused, or\n"
+                    "2. the password input is visible and focused, or\n"
+                    "3. the NotebookLM page is open.\n"
+                    "If account chooser, rejected, or interstitial pages appear, use controls like "
+                    "'Use another account', '다른 계정 사용', 'Try again', 'Continue', 'Next', '다음' "
+                    "to return to the normal sign-in flow.\n"
+                    'Output {"action":"done"} only when one of the three milestones above is reached.\n'
+                    "Never type any credentials."
+                ),
+                phase="LOGIN_PREPARE",
+                max_steps=16,
+            )
 
-        # 비밀번호 입력
+        state = _get_login_state(page)
+        if state == "logged_in":
+            logger.info("[login] 이미 NotebookLM 진입 완료 — url=%s", page.url)
+            return
+
+        if state == "email":
+            for attempt in range(3):
+                page.locator("input[type='email']").first.fill(email)
+                logger.info("[login] 이메일 입력 완료 (attempt=%d/3)", attempt + 1)
+                _run_login_cua_step(
+                    page,
+                    client,
+                    (
+                        "Task: The Google email address has already been typed into the email field.\n"
+                        "Continue the sign-in flow until one of these is true:\n"
+                        "1. the password input is visible and focused,\n"
+                        "2. a passkey / '다른 방법 선택' / '비밀번호 입력' screen is visible, or\n"
+                        "3. the NotebookLM page is open.\n"
+                        "Important passkey handling:\n"
+                        "- If a passkey screen appears, click '취소' or 'Cancel' first.\n"
+                        "- Then click '다른 방법 선택' or 'Try another way'.\n"
+                        "- Then click '비밀번호 입력' or 'Enter your password'.\n"
+                        "- If a rejected or interstitial page appears, use 'Try again', 'Continue', 'Next', or "
+                        "'Use another account' only when needed to return to the normal sign-in flow.\n"
+                        'Output {"action":"done"} only when one of the three milestones above is reached.\n'
+                        "Never type any credentials."
+                    ),
+                    phase="LOGIN_EMAIL_NEXT",
+                    max_steps=12,
+                )
+                state = _get_login_state(page)
+                if state in {"password", "passkey", "logged_in"}:
+                    break
+                logger.warning("[login] 이메일 단계 후 다시 email 상태로 복귀 — 이메일 재주입 후 재시도")
+
+        state = _get_login_state(page)
+        if state == "logged_in":
+            logger.info("[login] 이메일 단계 후 NotebookLM 진입 완료 — url=%s", page.url)
+            return
+        if state != "password":
+            _run_login_cua_step(
+                page,
+                client,
+                (
+                    "Task: Reach the Google password input field.\n"
+                    "Important passkey handling:\n"
+                    "1. If a passkey screen appears, click '취소' or 'Cancel'.\n"
+                    "2. Click '다른 방법 선택' or 'Try another way'.\n"
+                    "3. Click '비밀번호 입력' or 'Enter your password'.\n"
+                    "4. If you are on a rejected/interstitial page, use 'Try again', 'Continue', 'Next', or "
+                    "'Use another account' only to get back into the sign-in flow.\n"
+                    'Output {"action":"done"} only when the password input field is visible and focused.\n'
+                    "Never type any credentials."
+                ),
+                phase="LOGIN_PASSWORD_PREPARE",
+                max_steps=24,
+            )
+
+        state = _get_login_state(page)
+        if state != "password":
+            raise RuntimeError(f"비밀번호 입력 화면 도달 실패 (state={state}, url={page.url})")
+
         page.wait_for_selector("input[type='password']", timeout=15000)
         time.sleep(0.5)
-        page.fill("input[type='password']", password)
-        page.click("button:has-text('다음'), button:has-text('Next'), #passwordNext")
+        page.locator("input[type='password']").first.fill(password)
         logger.info("[login] 비밀번호 입력 완료")
+        _run_login_cua_step(
+            page,
+            client,
+            (
+                "Task: The Google password has already been typed into the password field.\n"
+                "Complete sign-in and continue through any post-password Google prompts until NotebookLM is open.\n"
+                "If additional prompts appear, prefer the safest option that continues sign-in without extra setup, "
+                "such as Next, Continue, Skip, or Not now.\n"
+                'Output {"action":"done"} only when the NotebookLM page is open.\n'
+                "Never type any credentials."
+            ),
+            phase="LOGIN_PASSWORD_SUBMIT",
+            max_steps=20,
+        )
 
-        # NotebookLM 리디렉션 대기 (최대 30초)
         page.wait_for_url("**/notebooklm.google.com/**", timeout=30000)
         logger.info("[login] 로그인 성공 — url=%s", page.url)
 
@@ -206,12 +363,23 @@ def _launch_context_with_retry(playwright, headless: bool, phase: str, max_attem
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return playwright.chromium.launch_persistent_context(
+            # 다른 머신/이전 Chromium 실행에서 남긴 singleton lock 파일은
+            # 프로필을 새 세션에서 여는 것 자체를 막으므로 선제적으로 제거한다.
+            for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                lock_path = BROWSER_PROFILE_DIR / lock_name
+                if lock_path.exists() or lock_path.is_symlink():
+                    try:
+                        lock_path.unlink()
+                    except Exception:
+                        pass
+            context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(BROWSER_PROFILE_DIR),
                 headless=headless,
                 args=CHROMIUM_LAUNCH_ARGS,
                 viewport=DEFAULT_VIEWPORT,
             )
+            _apply_storage_state(context)
+            return context
         except Exception as e:
             last_error = e
             if _is_browser_missing_error(e):
@@ -226,6 +394,50 @@ def _launch_context_with_retry(playwright, headless: bool, phase: str, max_attem
             )
             time.sleep(wait_sec)
     raise RuntimeError(f"[{phase}] 브라우저 프로필 잠금 해제 대기 실패: {last_error}")
+
+
+def _apply_storage_state(context) -> None:
+    """로컬에서 추출한 Playwright storage_state를 빈 Linux 프로필에 주입한다."""
+    if not STORAGE_STATE_PATH.exists():
+        return
+
+    try:
+        state = json.loads(STORAGE_STATE_PATH.read_text())
+    except Exception as e:
+        logger.warning("[storage_state] JSON 로드 실패: %s", e)
+        return
+
+    cookies = state.get("cookies") or []
+    if cookies:
+        try:
+            context.add_cookies(cookies)
+            logger.info("[storage_state] cookies %d개 적용", len(cookies))
+        except Exception as e:
+            logger.warning("[storage_state] cookie 적용 실패: %s", e)
+
+    origins = state.get("origins") or []
+    if not origins:
+        return
+
+    page = context.pages[0] if context.pages else context.new_page()
+    for origin_entry in origins:
+        origin = (origin_entry or {}).get("origin")
+        local_storage = (origin_entry or {}).get("localStorage") or []
+        if not origin or not local_storage:
+            continue
+        try:
+            page.goto(origin, wait_until="domcontentloaded", timeout=20000)
+            page.evaluate(
+                """entries => {
+                    for (const item of entries) {
+                        window.localStorage.setItem(item.name, item.value);
+                    }
+                }""",
+                local_storage,
+            )
+            logger.info("[storage_state] localStorage %d개 적용 origin=%s", len(local_storage), origin)
+        except Exception as e:
+            logger.warning("[storage_state] localStorage 적용 실패 origin=%s err=%s", origin, e)
 
 
 def _parse_action_json(raw: str) -> dict:
@@ -338,6 +550,113 @@ def _extract_studio_report(page) -> str:
         return ""
 
 
+def _clean_extracted_report_text(text: str) -> str:
+    """NotebookLM UI 잔여 줄을 제거하고 실제 보고서 본문만 남긴다."""
+    if not text:
+        return ""
+
+    stop_prefixes = (
+        "NotebookLM이 부정확한 정보를 표시할 수 있으므로",
+    )
+    blocked_exact = {
+        "신고",
+        "collapse_content",
+        "more_horiz",
+        "content_copy",
+        "thumb_up",
+        "thumb_down",
+        "sticky_note_2",
+        "메모 추가",
+        "share",
+        "공유",
+        "keyboard_arrow_down",
+        "chevron_right",
+        "chevron_forward",
+        "arrow_forward",
+        "스튜디오",
+        "소스 1개",
+    }
+    blocked_patterns = (
+        r"^소스 \d+개 기반$",
+        r"^기반:소스.*$",
+        r"^소스 \d+개$",
+    )
+
+    cleaned_lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if any(line.startswith(prefix) for prefix in stop_prefixes):
+            break
+        if line in blocked_exact:
+            continue
+        if re.fullmatch(r"[a-z_]+", line):
+            continue
+        if any(re.fullmatch(pattern, line) for pattern in blocked_patterns):
+            continue
+        cleaned_lines.append(line)
+
+    result = "\n".join(cleaned_lines).strip()
+    if result != (text or "").strip():
+        logger.info("[CUA] 보고서 정화 적용: before=%d after=%d chars", len(text.strip()), len(result))
+    return result
+
+
+def _extract_report_from_copy_toolbar(body_text: str) -> str:
+    """새 보고서 뷰의 toolbar(content_copy) 기준으로 본문을 추출한다."""
+    marker = "content_copy"
+    marker_pos = body_text.find(marker)
+    if marker_pos < 0:
+        return ""
+
+    text = body_text[marker_pos + len(marker):].lstrip()
+    end_markers = [
+        "\nthumb_up",
+        "\nthumb_down",
+        "\nNotebookLM이 부정확한 정보를 표시할 수 있으므로",
+        "\nsticky_note_2",
+        "\n메모 추가",
+        "\n공유",
+        "\nshare",
+    ]
+    end_positions = [text.find(m) for m in end_markers if text.find(m) > 0]
+    if end_positions:
+        text = text[:min(end_positions)]
+
+    blocked_lines = {
+        "신고",
+        "collapse_content",
+        "more_horiz",
+        "content_copy",
+        "thumb_up",
+        "thumb_down",
+        "sticky_note_2",
+        "메모 추가",
+        "share",
+        "공유",
+        "keyboard_arrow_down",
+        "chevron_right",
+        "chevron_forward",
+        "arrow_forward",
+    }
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line in blocked_lines:
+            continue
+        if re.fullmatch(r"[a-z_]+", line):
+            continue
+        lines.append(line)
+
+    result = "\n".join(lines).strip()
+    if len(result) > 100:
+        result = _clean_extracted_report_text(result)
+        logger.info("[CUA] content_copy fallback 추출 성공: %d chars", len(result))
+        return result
+    return ""
+
+
 def _extract_report_from_dom(page) -> str:
     """DOM에서 보고서 텍스트를 직접 추출. GPT OCR 대신 Playwright 사용."""
     # 1단계: 특정 CSS 셀렉터 시도
@@ -358,26 +677,30 @@ def _extract_report_from_dom(page) -> str:
     try:
         result = page.evaluate(js, _REPORT_SELECTORS)
         if result and len(result.strip()) > 100:
+            result = _clean_extracted_report_text(result.strip())
             logger.info("[CUA] DOM 셀렉터 추출 성공: %d chars", len(result))
-            return result.strip()
+            return result
     except Exception as e:
         logger.warning("[CUA] DOM 셀렉터 추출 실패: %s", e)
 
     # 2단계: 스튜디오 패널 전용 추출
     report = _extract_studio_report(page)
     if report:
-        return report
+        return _clean_extracted_report_text(report)
 
     # 3단계: 구버전 NotebookLM 구조 호환
     try:
         body_text = page.inner_text("body")
+        copy_toolbar_result = _extract_report_from_copy_toolbar(body_text)
+        if copy_toolbar_result:
+            return copy_toolbar_result
         match = re.search(
             r'소스 \d+개 기반\n(.+?)(?=\nthumb_up|\nNotebookLM이)',
             body_text,
             re.DOTALL,
         )
         if match:
-            result = match.group(1).strip()
+            result = _clean_extracted_report_text(match.group(1).strip())
             logger.info("[CUA] 구버전 regex 추출 성공: %d chars", len(result))
             return result
     except Exception as e:
@@ -385,6 +708,14 @@ def _extract_report_from_dom(page) -> str:
 
     logger.warning("[CUA] 모든 패턴 실패 — 빈 문자열 반환")
     return ""
+
+
+def _body_contains_text(page, needle: str) -> bool:
+    try:
+        return needle in page.inner_text("body")
+    except Exception as e:
+        logger.warning("[CUA] body text 확인 실패 needle=%r err=%s", needle, e)
+        return False
 
 
 def execute_action(page, action: dict) -> bool:
@@ -466,6 +797,342 @@ def _get_studio_panel_anchor(page) -> dict:
     return fallback
 
 
+def _ensure_studio_panel_visible(page) -> None:
+    """Studio 패널/탭이 닫혀 있으면 가능한 셀렉터로 열기를 시도한다."""
+    try:
+        body_text = page.inner_text("body")
+        existing_titles = _parse_report_titles(body_text)
+        if existing_titles:
+            logger.info("[list_reports] Studio 패널 내 제목이 이미 보임: %d개", len(existing_titles))
+            return
+        if "Studio" in body_text or "스튜디오" in body_text:
+            logger.info("[list_reports] body text에 Studio 섹션 존재")
+            return
+    except Exception as e:
+        logger.warning("[list_reports] Studio 패널 사전 확인 실패: %s", e)
+
+    selectors = [
+        "[role='tab'][aria-label*='Studio']",
+        "[role='tab'][aria-label*='스튜디오']",
+        "button[aria-label*='Studio']",
+        "button[aria-label*='스튜디오']",
+        "text=Studio",
+        "text=스튜디오",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if not locator.is_visible(timeout=1000):
+                continue
+            locator.click(timeout=2000)
+            logger.info("[list_reports] Studio 탭 열기 시도: %s", selector)
+            time.sleep(1.0)
+            return
+        except Exception:
+            continue
+
+
+def _collect_titles_via_dom_scan(page, max_rounds: int = 4) -> list[str]:
+    """Studio 패널을 몇 차례 스캔하며 body text parser로 제목을 수집한다."""
+    panel_anchor = _get_studio_panel_anchor(page)
+    seen = set()
+    collected: list[str] = []
+    no_new_rounds = 0
+
+    for round_idx in range(max_rounds):
+        try:
+            body_text = page.inner_text("body")
+        except Exception as e:
+            logger.warning("[list_reports] DOM 스캔 body 읽기 실패(round=%d): %s", round_idx + 1, e)
+            break
+
+        titles = _parse_report_titles(body_text)
+        before = len(collected)
+        for title in titles:
+            if title not in seen:
+                seen.add(title)
+                collected.append(title)
+
+        added = len(collected) - before
+        logger.info(
+            "[list_reports] DOM 스캔 round=%d/%d added=%d total=%d",
+            round_idx + 1,
+            max_rounds,
+            added,
+            len(collected),
+        )
+        if added == 0:
+            no_new_rounds += 1
+        else:
+            no_new_rounds = 0
+
+        if no_new_rounds >= 2:
+            break
+        if round_idx < max_rounds - 1:
+            _execute_list_action(page, {"action": "scroll", "delta_y": 640}, panel_anchor)
+
+    return collected
+
+
+def _click_first_visible(page, selectors: list[str], *, timeout_ms: int = 1500) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.click(timeout=timeout_ms)
+            logger.info("[dom] click selector=%s", selector)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_first_text(page, texts: list[str], *, exact: bool = True, timeout_ms: int = 1500) -> bool:
+    for text in texts:
+        try:
+            locator = page.get_by_text(text, exact=exact).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.click(timeout=timeout_ms)
+            logger.info("[dom] click text=%r", text)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _focus_first_visible(page, selectors: list[str], *, timeout_ms: int = 1500) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.click(timeout=timeout_ms)
+            logger.info("[dom] focus selector=%s", selector)
+            time.sleep(0.5)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_prompt_input_visible(page, selectors: list[str], *, timeout_ms: int = 800) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            logger.info("[dom] prompt input visible selector=%s", selector)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _get_report_prompt_selectors() -> list[str]:
+    """Fast Research/검색 입력창과 구분되는 보고서 맞춤설정 대화상자 전용 입력창 셀렉터."""
+    return [
+        "mat-dialog-container textarea[aria-label*='만들려는 보고서']",
+        "mat-dialog-container textarea[placeholder*='새로운 웰니스 음료 출시']",
+        "report-customization-dialog textarea[aria-label*='만들려는 보고서']",
+        "report-customization-dialog textarea[placeholder*='새로운 웰니스 음료 출시']",
+        "textarea[aria-label*='만들려는 보고서']",
+        "textarea[placeholder*='새로운 웰니스 음료 출시']",
+    ]
+
+
+def _dismiss_blocking_dialogs(page) -> None:
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    close_selectors = [
+        "button[aria-label*='닫기']",
+        "[role='button'][aria-label*='닫기']",
+        "button[aria-label*='Close']",
+        "[role='button'][aria-label*='Close']",
+        "button:has-text('닫기')",
+        "[role='button']:has-text('닫기')",
+        "button:has-text('Close')",
+        "[role='button']:has-text('Close')",
+    ]
+    _click_first_visible(page, close_selectors, timeout_ms=800)
+
+
+def _try_dom_prepare_report_prompt(page) -> bool:
+    """보고서 생성 입력창까지 DOM 셀렉터로 진입 시도."""
+    _dismiss_blocking_dialogs(page)
+    _ensure_studio_panel_visible(page)
+
+    report_selectors = [
+        "div[role='button'][aria-label='보고서']",
+        "div[role='button'][aria-label*='보고서']",
+        "button:has-text('보고서')",
+        "[role='button']:has-text('보고서')",
+        "[aria-label='보고서']",
+        "[aria-label*='보고서']",
+        "button:has-text('Report')",
+        "[role='button']:has-text('Report')",
+        "[aria-label='Report']",
+        "[aria-label*='Report']",
+    ]
+    custom_selectors = [
+        "button[aria-label='직접 만들기']",
+        "button[aria-label*='직접 만들기']",
+        "button:has-text('직접 만들기')",
+        "[role='button']:has-text('직접 만들기')",
+        "[aria-label='직접 만들기']",
+        "button:has-text('사용자 지정')",
+        "[role='button']:has-text('사용자 지정')",
+        "[aria-label*='사용자 지정']",
+        "button:has-text('맞춤')",
+        "[role='button']:has-text('맞춤')",
+        "button:has-text('직접 작성')",
+        "[role='button']:has-text('직접 작성')",
+        "button:has-text('Custom')",
+        "[role='button']:has-text('Custom')",
+        "[aria-label='Custom']",
+        "[aria-label*='Custom']",
+        "button:has-text('Make your own')",
+        "[role='button']:has-text('Make your own')",
+    ]
+    input_selectors = _get_report_prompt_selectors()
+
+    # 최근 UI에서는 custom 입력창이 이미 열린 상태로 시작할 수 있어
+    # report/custom 카드 진입 전에 바로 포커스를 시도한다.
+    if _is_prompt_input_visible(page, input_selectors, timeout_ms=1200):
+        return _focus_first_visible(page, input_selectors, timeout_ms=1200)
+
+    if not (
+        _click_first_visible(page, report_selectors, timeout_ms=2500)
+        or _click_first_text(page, ["보고서", "Report"], exact=True, timeout_ms=2500)
+        or _click_first_text(page, ["보고서", "Report"], exact=False, timeout_ms=2500)
+    ):
+        logger.info("[dom] report tile not found")
+        return False
+
+    # 일부 UI에서는 보고서 카드 클릭 직후 곧바로 입력창이 열린다.
+    if _is_prompt_input_visible(page, input_selectors, timeout_ms=1500):
+        return _focus_first_visible(page, input_selectors, timeout_ms=1500)
+
+    if not (
+        _click_first_visible(page, custom_selectors, timeout_ms=2500)
+        or _click_first_text(
+            page,
+            ["직접 만들기", "사용자 지정", "맞춤", "직접 작성", "Custom", "Make your own"],
+            exact=True,
+            timeout_ms=2500,
+        )
+        or _click_first_text(
+            page,
+            ["직접 만들기", "사용자 지정", "맞춤", "직접 작성", "Custom", "Make your own"],
+            exact=False,
+            timeout_ms=2500,
+        )
+    ):
+        # custom 선택 버튼 문구가 바뀌었더라도 입력창이 이미 떴다면 성공으로 본다.
+        if _is_prompt_input_visible(page, input_selectors, timeout_ms=1500):
+            return _focus_first_visible(page, input_selectors, timeout_ms=1500)
+        logger.info("[dom] custom option not found")
+        return False
+    if not _focus_first_visible(page, input_selectors, timeout_ms=2500):
+        logger.info("[dom] prompt input not found")
+        return False
+    return True
+
+
+def _try_dom_click_generate(page) -> bool:
+    """생성 버튼을 DOM 셀렉터로 클릭 시도."""
+    selectors = [
+        "mat-dialog-container button:has-text('생성')",
+        "report-customization-dialog button:has-text('생성')",
+        "button:has-text('생성')",
+        "[role='button']:has-text('생성')",
+        "mat-dialog-container button:has-text('Generate')",
+        "report-customization-dialog button:has-text('Generate')",
+        "button:has-text('Generate')",
+        "[role='button']:has-text('Generate')",
+    ]
+    return _click_first_visible(page, selectors, timeout_ms=2500)
+
+
+def _sanitize_report_titles(titles: list[str]) -> list[str]:
+    blocked = {
+        "auto_tab_group",
+        "chevron_forward",
+        "chevron_right",
+        "arrow_forward",
+        "more_vert",
+        "more_horiz",
+        "보고서",
+        "직접 만들기",
+        "스튜디오",
+        "Studio",
+    }
+    cleaned: list[str] = []
+    seen = set()
+    for title in titles:
+        normalized = (title or "").strip()
+        if not normalized or normalized in blocked or len(normalized) < 2:
+            continue
+        if re.fullmatch(r"[a-z_]+", normalized):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return cleaned
+
+
+def _choose_generated_report_title(previous_titles: list[str], current_titles: list[str]) -> str:
+    previous_set = set(_sanitize_report_titles(previous_titles))
+    current_cleaned = _sanitize_report_titles(current_titles)
+    for title in current_cleaned:
+        if title not in previous_set:
+            return title
+    return current_cleaned[0] if current_cleaned else ""
+
+
+def _try_dom_open_report_tile(page, target_title: str) -> bool:
+    if not target_title:
+        return False
+    candidates = [
+        page.get_by_text(target_title, exact=True).first,
+        page.locator(f"[aria-label={json.dumps(target_title)}]").first,
+    ]
+    for locator in candidates:
+        try:
+            locator.wait_for(state="visible", timeout=2500)
+            locator.click(timeout=2500)
+            logger.info("[dom] report tile opened title=%r", target_title)
+            time.sleep(1.0)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _open_report_tile(page, client, target_title: str, report_index: int = 0) -> None:
+    if _try_dom_open_report_tile(page, target_title):
+        return
+
+    task_open_tile = (
+        "Task: In the NotebookLM Studio panel, open the saved report tile that was just generated.\n"
+        f"Target title: '{target_title[:80]}'\n"
+        f"It is report number {report_index + 1} in the visible list.\n"
+        "Steps:\n"
+        "1. If the Studio panel is not open on the right, click the Studio tab.\n"
+        "2. Find the target saved report tile.\n"
+        "3. Click the tile to open its content.\n"
+        '4. Output {"action":"done"} only when the report content view is open.\n'
+        "Do NOT click the '보고서' generator card."
+    )
+    if not _run_cua_loop(page, client, task_open_tile, max_steps=12, phase="OPEN_TILE"):
+        raise RuntimeError(f"생성된 보고서 타일 열기 실패: {target_title[:80]}")
+    time.sleep(2)
+
+
 def _run_cua_loop(
     page,
     client,
@@ -473,10 +1140,11 @@ def _run_cua_loop(
     max_steps: int,
     phase: str,
     allowed_actions: set = None,
+    system_prompt: str = SYSTEM_PROMPT,
 ) -> bool:
     """CUA 루프 실행 (모듈 레벨). done이면 True 반환."""
     HISTORY_WINDOW = 3
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs = [{"role": "system", "content": system_prompt}]
     for step in range(max_steps):
         _assert_allowed_url(page.url, phase)
         screenshot_b64 = base64.b64encode(page.screenshot()).decode()
@@ -766,6 +1434,12 @@ def _parse_report_titles(body_text: str) -> list[str]:
             "Studio",
             "보고서",
             "직접 만들기",
+            "auto_tab_group",
+            "chevron_forward",
+            "chevron_right",
+            "arrow_forward",
+            "more_vert",
+            "more_horiz",
             "소스",
             "채팅",
             "공유",
@@ -834,10 +1508,16 @@ def list_reports(page, notebook_url: str) -> list[str]:
     except Exception as e:
         logger.warning("[list_reports] networkidle 타임아웃: %s", e)
 
-    _ensure_logged_in(page)
-    time.sleep(2)
-
     client = _build_openai_client()
+    _ensure_logged_in(page, client)
+    time.sleep(2)
+    _ensure_studio_panel_visible(page)
+
+    dom_titles = _collect_titles_via_dom_scan(page, max_rounds=4)
+    if dom_titles:
+        logger.info("[list_reports] DOM 스캔 목록 수집 성공: %d개", len(dom_titles))
+        return dom_titles
+
     task = (
         "Task: In NotebookLM Studio, collect titles of saved reports already listed in the Studio panel.\n"
         "Steps:\n"
@@ -901,6 +1581,11 @@ def list_reports(page, notebook_url: str) -> list[str]:
         cua_loop_error[:120],
     )
     try:
+        _ensure_studio_panel_visible(page)
+        dom_titles = _collect_titles_via_dom_scan(page, max_rounds=3)
+        if dom_titles:
+            logger.warning("[list_reports] CUA 이후 DOM 스캔 경로로 목록 반환됨")
+            return dom_titles
         body_text = page.inner_text("body")
         fallback_titles = _parse_report_titles(body_text)
         logger.info("[list_reports] fallback 목록 수집 결과: %d개", len(fallback_titles))
@@ -908,6 +1593,9 @@ def list_reports(page, notebook_url: str) -> list[str]:
             logger.warning("[list_reports] fallback parser 경로로 목록 반환됨")
             return fallback_titles
         if cua_loop_error:
+            if "step limit" in cua_loop_error.lower():
+                logger.warning("[list_reports] step limit 도달 + DOM/Fallback 빈결과 — 빈 목록으로 처리")
+                return []
             raise RuntimeError(f"CUA list loop failed: {cua_loop_error}")
         if bool(cua_meta.get("empty_result_accepted")):
             logger.info("[list_reports] CUA 빈목록 승인 조건 충족 — 빈 배열 반환")
@@ -919,7 +1607,8 @@ def list_reports(page, notebook_url: str) -> list[str]:
         if int(cua_meta.get("model_errors") or 0) >= 4:
             raise RuntimeError("CUA list loop failed: repeated model call errors")
         if not bool(cua_meta.get("done")) and int(cua_meta.get("steps") or 0) >= list_max_steps:
-            raise RuntimeError("CUA list loop reached step limit without stable result")
+            logger.warning("[list_reports] max_steps 종료 + DOM/Fallback 빈결과 — 빈 목록으로 처리")
+            return []
         raise RuntimeError(
             "CUA list loop did not gather titles and empty-result acceptance criteria were not met"
         )
@@ -939,11 +1628,14 @@ def get_existing_report(page, notebook_url: str, report_index: int, output_path:
     except Exception as e:
         logger.warning("[get_existing_report] networkidle 타임아웃: %s", e)
 
-    _ensure_logged_in(page)
+    _ensure_logged_in(page, client)
     time.sleep(2)
+    _ensure_studio_panel_visible(page)
 
     # 타일 목록 파싱 (제목 확인용, navigate 없음)
-    titles = _parse_report_titles(page.inner_text("body"))
+    titles = _collect_titles_via_dom_scan(page, max_rounds=3)
+    if not titles:
+        titles = _parse_report_titles(page.inner_text("body"))
     if not titles:
         raise RuntimeError("보고서 목록이 비어 있습니다.")
     if report_index >= len(titles):
@@ -1029,15 +1721,27 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
         _assert_allowed_url(page.url, "NAVIGATE")
         logger.info("[CUA] 페이지 로드 완료: %s / url=%s", page.title(), page.url)
 
-        _ensure_logged_in(page)
+        _ensure_logged_in(page, client)
         time.sleep(2)
+        existing_titles_before = _sanitize_report_titles(_collect_titles_via_dom_scan(page, max_rounds=2))
+        logger.info("[CUA] 생성 전 보고서 목록: %d개", len(existing_titles_before))
 
         # Phase 1: 입력 필드까지 내비게이션 (프롬프트 텍스트 GPT에 노출 안 함)
         logger.info("[CUA] Phase 1 시작: 보고서 입력 필드로 내비게이션")
-        if not _run_cua_loop(page, client, TASK_PHASE1, max_steps=15, phase="P1"):
-            context.close()
-            raise RuntimeError("Phase 1 실패: 입력 필드 포커스 불가 (15 스텝 초과)")
-        logger.info("[CUA] Phase 1 완료: 입력 필드 포커스됨")
+        if _try_dom_prepare_report_prompt(page):
+            logger.info("[CUA] Phase 1 완료: DOM 경로로 입력 필드 포커스됨")
+        else:
+            if not _run_cua_loop(page, client, TASK_PHASE1, max_steps=25, phase="P1"):
+                # CUA가 한 차례 실패한 뒤에도 DOM 경로가 다시 열릴 수 있어 재확인한다.
+                _dismiss_blocking_dialogs(page)
+                time.sleep(1)
+                if _try_dom_prepare_report_prompt(page):
+                    logger.info("[CUA] Phase 1 완료: CUA 실패 후 DOM 재시도로 입력 필드 포커스됨")
+                else:
+                    context.close()
+                    raise RuntimeError("Phase 1 실패: 입력 필드 포커스 불가 (DOM/CUA 재시도 후에도 실패)")
+            else:
+                logger.info("[CUA] Phase 1 완료: CUA 경로로 입력 필드 포커스됨")
 
         # Phase 2: Playwright로 직접 프롬프트 입력 (GPT에 프롬프트 텍스트 비노출)
         logger.info("[CUA] Phase 2: 프롬프트 직접 입력 (%d chars)", len(prompt))
@@ -1047,51 +1751,64 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
 
         # Phase 3a: Generate 버튼 클릭
         logger.info("[CUA] Phase 3a 시작: Generate 버튼 클릭")
-        if not _run_cua_loop(page, client, TASK_PHASE3_CLICK, max_steps=5, phase="P3a"):
-            context.close()
-            raise RuntimeError("Phase 3a 실패: Generate 버튼 클릭 불가 (5 스텝 초과)")
-        logger.info("[CUA] Phase 3a 완료: Generate 버튼 클릭됨")
+        if _try_dom_click_generate(page):
+            logger.info("[CUA] Phase 3a 완료: DOM 경로로 Generate 버튼 클릭됨")
+        else:
+            if not _run_cua_loop(page, client, TASK_PHASE3_CLICK, max_steps=5, phase="P3a"):
+                context.close()
+                raise RuntimeError("Phase 3a 실패: Generate 버튼 클릭 불가 (5 스텝 초과)")
+            logger.info("[CUA] Phase 3a 완료: CUA 경로로 Generate 버튼 클릭됨")
         time.sleep(3)  # 생성 시작 대기
 
         # Phase 3b: Playwright 네이티브 대기 (2단계)
         # Step 1: "보고서 생성 중" 나타날 때까지 기다림 (생성이 시작됐는지 확인)
         logger.info("[CUA] Phase 3b-1: '보고서 생성 중' 나타날 때까지 대기 (최대 30초)")
-        try:
-            page.wait_for_function(
-                "() => document.body.innerText.includes('보고서 생성 중')",
-                timeout=30000,
-            )
+        loading_seen = False
+        for _ in range(30):
+            if _body_contains_text(page, "보고서 생성 중"):
+                loading_seen = True
+                break
+            time.sleep(1)
+        if loading_seen:
             logger.info("[CUA] Phase 3b-1: '보고서 생성 중' 감지됨 — 생성 시작 확인")
-        except Exception as e:
-            logger.warning("[CUA] Phase 3b-1: '보고서 생성 중' 30초 내 미감지 (%s) — 이미 완료됐거나 다른 상태", e)
+        else:
+            logger.warning("[CUA] Phase 3b-1: '보고서 생성 중' 30초 내 미감지 — 이미 완료됐거나 다른 상태")
 
         # Step 2: "보고서 생성 중" 사라질 때까지 기다림 (생성 완료 확인)
         logger.info("[CUA] Phase 3b-2: '보고서 생성 중' 사라질 때까지 대기 (최대 %dms)", PHASE3B_WAIT_MS)
-        try:
-            page.wait_for_function(
-                "() => !document.body.innerText.includes('보고서 생성 중')",
-                timeout=PHASE3B_WAIT_MS,
-            )
+        loading_cleared = not loading_seen
+        deadline = time.monotonic() + (PHASE3B_WAIT_MS / 1000)
+        while time.monotonic() < deadline:
+            if not _body_contains_text(page, "보고서 생성 중"):
+                loading_cleared = True
+                break
+            time.sleep(2)
+        if loading_cleared:
             logger.info("[CUA] Phase 3b-2 완료: '보고서 생성 중' 사라짐")
-        except Exception as e:
-            logger.warning("[CUA] Phase 3b-2 타임아웃 (%dms): %s — 강제 추출 시도", PHASE3B_WAIT_MS, e)
+        else:
+            logger.warning("[CUA] Phase 3b-2 타임아웃 (%dms) — 강제 추출 시도", PHASE3B_WAIT_MS)
 
         time.sleep(3)  # 렌더링 안정화
+        current_titles = _sanitize_report_titles(_collect_titles_via_dom_scan(page, max_rounds=2))
+        target_title = _choose_generated_report_title(existing_titles_before, current_titles)
+        logger.info(
+            "[CUA] 생성 후 보고서 목록: before=%d after=%d target=%r",
+            len(existing_titles_before),
+            len(current_titles),
+            target_title,
+        )
+        if target_title:
+            _open_report_tile(page, client, target_title, report_index=0)
 
-        # 스튜디오 보고서 폴링 (최대 120초, 5초 간격)
-        # _extract_studio_report는 생성 중이면 "" 반환 → 실제 내용이 나올 때까지 재시도
+        # 보고서 DOM 폴링 (최대 120초, 5초 간격)
         report_text = ""
         for attempt in range(24):
-            report_text = _extract_studio_report(page)
-            if report_text:
-                logger.info("[CUA] 스튜디오 보고서 확인됨 (시도 %d/%d)", attempt + 1, 24)
-                break
-            logger.info("[CUA] 추출 재시도 %d/24 — 스튜디오 콘텐츠 대기 중...", attempt + 1)
-            time.sleep(5)
-
-        if not report_text:
-            logger.warning("[CUA] 스튜디오 폴링 실패 — CSS 셀렉터 폴백 시도")
             report_text = _extract_report_from_dom(page)
+            if report_text:
+                logger.info("[CUA] 보고서 DOM 확인됨 (시도 %d/%d)", attempt + 1, 24)
+                break
+            logger.info("[CUA] 추출 재시도 %d/24 — 보고서 DOM 대기 중...", attempt + 1)
+            time.sleep(5)
 
         context.close()
 

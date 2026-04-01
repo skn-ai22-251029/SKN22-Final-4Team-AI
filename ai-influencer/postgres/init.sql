@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS characters (
     concept_summary     TEXT,
     comfyui_workflow_id TEXT,
     voice_profile       TEXT,
+    heygen_avatar_id    TEXT,
     created_at          TIMESTAMPTZ DEFAULT NOW()
 );
 

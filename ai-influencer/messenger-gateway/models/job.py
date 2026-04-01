@@ -72,7 +72,9 @@ class SendReportRequest(BaseModel):
     report_content: str
     file_content_b64: str
     filename: str
+    include_tts_button: bool = False
     include_video_button: bool = False
+    file_url: str = ""
 
 
 class SendVideoPreviewRequest(BaseModel):
@@ -92,6 +94,7 @@ class SendAudioRequest(BaseModel):
     filename: str
     caption: str = ""
     include_wf12_button: bool = True
+    audio_url: str = ""
 
 
 class TtsActionRequest(BaseModel):
@@ -107,12 +110,27 @@ class VideoActionRequest(BaseModel):
 
 class ReportToVideoRequest(BaseModel):
     job_id: str
+    avatar_id: str = ""
+
+
+class ReportToTtsRequest(BaseModel):
+    job_id: str
 
 
 class ManualGenerateRequest(BaseModel):
     job_id: str = ""
     messenger_user_id: str = ""
     messenger_channel_id: str = ""
+    avatar_id: str = ""
+
+
+class HeygenSmokeTestRequest(BaseModel):
+    avatar_id: str = ""
+
+
+class CharacterAvatarRequest(BaseModel):
+    character_id: str
+    avatar_id: str = ""
 
 
 class ListJobsRequest(BaseModel):

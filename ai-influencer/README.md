@@ -102,8 +102,13 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
           → notebooklm-service /generate
           → /internal/send-report
           → Discord 전송 + jobs.script_json.script_text 저장
-  → [🎬 영상 제작] 버튼 클릭
-  → /internal/report-to-video → WF-11
+  → 보고서 메시지 버튼 분기
+      ├─ [🔊 TTS만 제작]
+      │   → /internal/report-to-tts
+      │   → WF-11 (auto_trigger_wf12=false, TTS 승인/반려 버튼 유지)
+      └─ [🎬 영상으로 제작]
+          → /internal/report-to-video
+          → WF-11 (auto_trigger_wf12=true) → WF-12 자동 진행
 ```
 
 ### `/jobs [purpose]`
@@ -122,6 +127,27 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 - `job_id`는 전체 UUID/8자리 prefix/미입력 모두 허용
 - 미입력 시 현재 사용자+채널의 최근 `audio_url` 보유 job 자동 선택
 - 실행 경로: `/internal/heygen-generate` → WF-12
+- avatar 선택 우선순위: 요청 `avatar_id` → job 저장값 → `characters.heygen_avatar_id` → `HEYGEN_AVATAR_ID`
+
+### `POST /internal/heygen-smoke-test`
+
+- HeyGen 실제 영상 생성 전에 인증/잔여 quota/avatar 접근만 검증
+- 영상 생성은 호출하지 않으므로 과금 없는 스모크 테스트 용도
+- 선택 body: `{ "avatar_id": "..." }`
+- 응답에 현재 WF-12 기본값(`width/height/caption/speed/poll/max_wait/mock`)도 포함
+
+### 시간별 자동 보고서 Discord 전송
+
+- `WF-09 -> /internal/auto-report -> WF-06` 경로는 계속 동작
+- 다만 Discord 전송은 `AUTO_REPORT_DISCORD_DELIVERY_ENABLED=false` 이면 생략
+- 기본값은 `false`
+- 이때도 대본 rewrite, S3 저장, DB 업데이트는 그대로 수행
+
+### `POST /internal/character-avatar`
+
+- 캐릭터 기본 HeyGen 아바타를 DB 상태로 저장
+- body: `{ "character_id": "default-character", "avatar_id": "..." }`
+- 빈 문자열을 보내면 캐릭터 기본 avatar를 제거하고 다음 우선순위(job/env fallback)로 내려감
 
 ---
 
@@ -139,6 +165,45 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 - `20260326-550e8400-e29b-41d4-a716-446655440000.txt`
 - `20260326-550e8400-e29b-41d4-a716-446655440000.wav`
 - `20260326-550e8400-e29b-41d4-a716-446655440000.mp4`
+
+---
+
+## 교차 계정 S3 저장 전략
+
+- 저장 대상: 대본(`.txt`), TTS(`.wav`), 영상(`.mp4`)
+- 저장 위치: **다른 AWS 계정의 S3 버킷**
+- 접근 방식: **AssumeRole + 비공개 버킷 + Presigned URL**
+- 객체 키: `reports/`, `tts/`, `videos/` prefix + `YYYYMMDD-{job_id}.{ext}`
+
+### Discord 전송 정책
+
+- 파일 크기 ≤ 10MB: Discord 파일 첨부 전송
+- 파일 크기 > 10MB: Discord 텍스트 메시지로 Presigned URL 전송(기본 24시간)
+- 링크 전송 메시지에서도 기존 버튼 UX를 유지
+  - 보고서: `[🔊 TTS만 제작]`, `[🎬 영상으로 제작]`
+  - TTS: `[✅ 승인 (WF-12 진행)] [❌ 반려]`
+
+### 필수 환경변수
+
+| 변수 | 설명 |
+|------|------|
+| `MEDIA_S3_BUCKET` | 타겟 S3 버킷명(타 AWS 계정) |
+| `MEDIA_S3_REGION` | S3 리전 |
+| `MEDIA_S3_ROLE_ARN` | 타겟 계정에서 AssumeRole 할 IAM Role ARN |
+| `MEDIA_S3_EXTERNAL_ID` | (선택) 외부 ID |
+| `MEDIA_S3_ROLE_SESSION_NAME` | STS 세션명 |
+| `MEDIA_PRESIGN_EXPIRES_SECONDS` | Presigned URL 만료(기본 86400) |
+| `MEDIA_MAX_DISCORD_FILE_BYTES` | 첨부 임계치(기본 10485760, 10MB) |
+| `MEDIA_S3_PREFIX_REPORTS` | 대본 prefix (기본 `reports`) |
+| `MEDIA_S3_PREFIX_TTS` | TTS prefix (기본 `tts`) |
+| `MEDIA_S3_PREFIX_VIDEOS` | 영상 prefix (기본 `videos`) |
+
+### AWS IAM 설정 요약 (교차 계정)
+
+1. **타겟 계정(S3 보유)**에 업로드 전용 Role 생성 (예: `AiInfluencerMediaWriterRole`)
+2. Trust policy에서 소스 계정의 실행 Role(EC2/ECS)을 Principal로 허용
+3. 권한은 버킷 전체가 아닌 `reports/*`, `tts/*`, `videos/*` prefix로 최소권한 부여
+4. 소스 계정 실행 Role에 `sts:AssumeRole` 권한 추가
 
 ---
 
@@ -220,7 +285,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 [notebooklm-service /generate 호출]
       │
       ├─[성공]──→ [gateway /internal/send-report 호출]
-      │           → Discord에 보고서 텍스트 + [🎬 영상 제작] 버튼 전송
+      │           → Discord에 보고서 텍스트 + [🔊 TTS만 제작] [🎬 영상으로 제작] 버튼 전송
       │
       └─[실패]──→ [gateway /internal/send-text 호출]
                   → Discord에 오류 메시지 전송
@@ -231,7 +296,7 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 ### WF-11: TTS 생성 + Discord 공유
 
 ```
-[Webhook 수신] ← WF-05 승인 / report_to_video / 재생성
+[Webhook 수신] ← WF-05 승인 / report_to_tts / report_to_video / 재생성
       │
       ▼
 [요청 파싱] job_id, script_text, auto_trigger_wf12
@@ -244,7 +309,9 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
       │
       ▼
 [gateway /internal/send-audio 호출]
-→ Discord에 WAV + [✅ 승인(WF-12)] [❌ 반려] 버튼 전송
+→ Discord에 WAV 전송
+    ├─ auto_trigger_wf12=false: [✅ 승인(WF-12)] [❌ 반려] 버튼 전송
+    └─ auto_trigger_wf12=true : 승인 버튼 없이 안내 후 WF-12 자동 진행
       │
       ▼
 [DB 업데이트] status=APPROVED, audio_url 저장
@@ -433,7 +500,7 @@ Discord 사용자: /report
 | `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, 채널별 RSS 조회/재시도, 새 영상 필터 | source 추가 성공 시 gateway `/internal/auto-report` → WF-06 |
 | `WF-10-daily-notebook.json` | Schedule(매일 00:00) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
 | `WF-11_tts_generate.json` | Webhook | `POST /webhook/wf-11-tts-generate` | TTS 생성, WAV 저장, Discord 전송, `audio_url` 저장 | 승인 대기 또는 자동 WF-12 |
-| `WF-12_heygen_generate.json` | Webhook | `POST /webhook/wf-12-heygen-generate` | HeyGen 생성/폴링, 성공/실패 분기 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
+| `WF-12_heygen_generate.json` | Webhook | `POST /webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` | HeyGen 생성/폴링 또는 mock preview 생성 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
 
 참고:
 - 기존 단일 워크플로 `WF-07`은 삭제되었고, `WF-11`/`WF-12`로 완전 분리되었습니다.
@@ -531,10 +598,20 @@ nano .env   # 또는 vi .env
 | `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/wf-11-tts-generate` |
-| `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/wf-12-heygen-generate` |
+| `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
+| `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
+| `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
+| `HEYGEN_VIDEO_WIDTH` | WF-12 출력 영상 너비 | `1080` |
+| `HEYGEN_VIDEO_HEIGHT` | WF-12 출력 영상 높이 | `1920` |
+| `HEYGEN_CAPTION_ENABLED` | HeyGen caption 사용 여부 | `false` |
+| `HEYGEN_SPEED` | WF-12 audio voice speed | `1.3` |
+| `HEYGEN_POLL_INTERVAL_SECONDS` | HeyGen 상태 polling 간격(초) | `10` |
+| `HEYGEN_MAX_WAIT_SECONDS` | HeyGen 최대 대기 시간(초) | `900` |
+| `HEYGEN_MOCK_ENABLED` | WF-12 mock preview 모드 | `false` |
+| `HEYGEN_MOCK_VIDEO_URL` | mock 모드 샘플 mp4 URL | `https://samplelib.com/lib/preview/mp4/sample-5s.mp4` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
 | `OPENAI_API_KEY` | OpenAI API 키 | |
@@ -831,6 +908,7 @@ python register_command.py \
 | `POST` | `/internal/report-select` | discord-bot | 보고서 선택 또는 새로 생성 |
 | `POST` | `/internal/send-report` | n8n WF-06 | 보고서 텍스트 전송 |
 | `POST` | `/internal/auto-report` | n8n WF-09 | 소스 추가 성공 시 자동 WF-06 생성/전송 트리거 |
+| `POST` | `/internal/report-to-tts` | discord-bot | 보고서 → TTS만 제작 요청 |
 | `POST` | `/internal/report-to-video` | discord-bot | 보고서 → 영상 제작 요청 |
 | `POST` | `/internal/tts-generate` | discord-bot | `/tts [job_id]` 수동 WF-11 실행 (미입력 시 최근 job 자동 선택) |
 | `POST` | `/internal/heygen-generate` | discord-bot | `/heygen [job_id]` 수동 WF-12 실행 (미입력 시 최근 job 자동 선택) |
@@ -865,7 +943,8 @@ python register_command.py \
 2. 채널 버튼 클릭 → 해당 채널의 보고서 목록 표시
    (목록 조회 실패/지연 시 `[🔄 다시 조회] / [🆕 새로 생성]` 버튼 표시)
 3. 보고서 선택 또는 [새로 생성] → 보고서 텍스트 수신
-4. `[🎬 영상 제작]` 버튼 클릭 → WF-11 실행 (승인 후 WF-12, 최종 승인 시 WF-08)
+4. `[🔊 TTS만 제작]` 버튼 클릭 → WF-11 실행 (TTS 승인/반려 버튼 노출)
+5. `[🎬 영상으로 제작]` 버튼 클릭 → WF-11 실행 후 WF-12 자동 진행
 
 ### 수동 TTS / HeyGen 실행
 
@@ -884,6 +963,30 @@ python register_command.py \
 
 > Discord에서 옵션이 여전히 `필수`로 보이면, 봇 재배포 후 슬래시 명령 재동기화가 필요합니다.  
 > `DISCORD_GUILD_ID`를 설정하면 길드 단위로 즉시 동기화됩니다.
+
+### 대본→TTS→S3 저장 검증 (운영 E2E)
+
+아래 스크립트로 특정 `job_id`의 WF-11 경로를 한 번에 검증할 수 있습니다.
+
+```bash
+cd ai-influencer
+./scripts/verify_tts_to_s3.sh <job_id> --since 60m
+```
+
+검증 항목:
+- gateway 로그에서 `/internal/send-audio` 완료 여부
+- DB `jobs`에서 `script_text` 길이, `audio_url(s3://...)`, `media_names.audio_filename`
+- `audio_url`이 가리키는 S3 객체 `HEAD` 성공(크기 > 0)
+
+PASS 기준:
+- `send_audio done job_id=<job_id>`
+- `audio_url = s3://<bucket>/tts/YYYYMMDD-<job_id>.wav`
+- S3 HEAD 성공
+
+실패 시 우선 점검:
+- `MEDIA_S3_ROLE_ARN`, `MEDIA_S3_BUCKET`, `MEDIA_S3_REGION`, `MEDIA_S3_EXTERNAL_ID`
+- 타겟 계정 IAM Trust/Permission(`sts:AssumeRole`, `s3:PutObject/GetObject`)
+- n8n WF-11 최신 워크플로 재임포트/재기동 여부
 
 ### 자동 수집 확인
 
@@ -923,6 +1026,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | `/report` 채널 버튼에 삭제된 채널이 계속 보임 | 버튼 소스는 `TOPIC_CHANNELS` 기준. `.env` 수정 후 `docker-compose up -d --force-recreate messenger-gateway` 적용 |
 | `/report` 버튼 클릭 반응 없음 | discord-bot/gateway 최신 빌드 반영 확인: `docker-compose up -d --build discord-bot messenger-gateway` |
 | `/report` 채널 선택 후 목록이 안 뜨고 멈춘 것처럼 보임 | gateway 로그 `[channel-select:bg]`에서 list-reports 응답 여부 확인. 최신 버전은 최대 180초 대기 후 실패 시 `다시 조회/새로 생성` 버튼을 노출 |
+| `/report` 채널 선택 직후 `Temporary failure in name resolution` | 최신 gateway는 일시 DNS 오류를 자동 재시도(최대 3회)합니다. 계속 실패하면 1) `.env`의 `NOTEBOOKLM_SERVICE_URL=http://notebooklm-service:8090` 확인 2) `docker-compose exec messenger-gateway getent hosts notebooklm-service`로 DNS 확인 3) `docker-compose up -d --force-recreate messenger-gateway notebooklm-service` 재생성 |
 | `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST] 종료 요약`(`elapsed/scroll/collect/premature_done/termination_reason`)을 먼저 확인. 조기 `done`은 무시되고 최소 탐색 게이트(시간/스크롤/스텝) 미충족이면 빈목록 성공으로 처리하지 않으며, 이 경우 `다시 조회` 버튼으로 재시도 |
 | `/report`에서 `Looks like Playwright ... install` 또는 브라우저 실행 Traceback | `notebooklm-service` 이미지를 최신으로 재빌드해 Chromium 포함 여부를 반영: `docker-compose build --no-cache notebooklm-service && docker-compose up -d notebooklm-service` |
 | WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |
@@ -990,3 +1094,25 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 # 4. 다운로드한 패키지 설치
 dpkg -i cloudflared-linux-amd64.deb
 ```
+
+# 프롬프트
+
+- _SCRIPT_REWRITE_PROMPT_BASE = (
+    """
+    당신은 20대 초반의 발랄한 성격을 가진 숏폼 인플루언서 '하리'입니다. 
+    팬덤명은 '보리'입니다.
+    규칙을 엄격하게 준수하여, [소스 내용]을 소개하는 "350자" 분량의 대본을 작성해 주세요.
+
+    1. 출력 형식 제한: 대본의 제목, 화자 이름(하리:), 지문(예: [오프닝], [본문]) 등 대사가 아닌 모든 글자 및 기호는 절대 작성하지 마세요. 오직 화면에서 읽을 '대사'만 텍스트로 출력해야 합니다.
+    2. 100% 한글 표기: 알파벳(영어)과 숫자는 절대 사용하지 마세요. 모두 한글 발음으로 변환하여 적어주세요. (예시: AI -> 에이아이, 350 -> 삼백오십)
+    3. 마크다운 금지: 굵게(**), 기울임 등 어떠한 마크다운 문법도 사용하지 마세요.
+    4. TTS 최적화 (가장 중요):
+    - 사전에 없는 단어는 실제 한국어 발음대로 표기하세요. (예시: 역대급 -> 역대끕)
+    - 숫자 관련 발음은 붙여 표기하세요. (예시: 오 점 사 -> 오쩜사)
+    - 발랄한 억양을 살리기 위해 물음표(?)를 적극적으로 사용하세요.
+    - 오늘, 어제 등 상대적인 날짜를 표기하지 마세요.
+    - 매 문장이 끝날 때마다 반드시 "줄바꿈"(엔터)을 하세요.
+
+    [대본 구성]
+    오프닝(인사) - 본문(소스 내용 소개) - 마무리(엔딩)의 자연스러운 흐름으로 작성할 것.
+"""

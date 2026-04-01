@@ -4,3 +4,5 @@ asyncpg==0.29.0
 pydantic-settings==2.1.0
 httpx==0.26.0
 python-multipart==0.0.6
+boto3==1.39.9
+openai>=1.30.0
