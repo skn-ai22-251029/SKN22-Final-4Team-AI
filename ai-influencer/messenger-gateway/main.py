@@ -504,7 +504,7 @@ def _extract_supporting_facts(raw_report_text: str) -> list[str]:
     return facts
 
 
-_SCRIPT_MIN_CHARS = 350
+_SCRIPT_MIN_CHARS = 320
 _SCRIPT_MAX_CHARS = 400
 _SCRIPT_REWRITE_MAX_ATTEMPTS = 5
 
