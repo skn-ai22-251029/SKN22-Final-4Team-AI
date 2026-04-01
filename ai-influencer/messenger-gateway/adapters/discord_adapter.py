@@ -413,9 +413,15 @@ class DiscordAdapter(MessengerAdapter):
                     "components": [
                         {
                             "type": 2,
-                            "label": "✅ 승인 (WF-12 진행)",
+                            "label": "✅ 일반 승인",
                             "style": 3,
-                            "custom_id": f"tts_approve:{job_id}",
+                            "custom_id": f"tts_approve_standard:{job_id}",
+                        },
+                        {
+                            "type": 2,
+                            "label": "💎 고화질 승인",
+                            "style": 2,
+                            "custom_id": f"tts_approve_hd:{job_id}",
                         },
                         {
                             "type": 2,
@@ -460,9 +466,15 @@ class DiscordAdapter(MessengerAdapter):
                     "components": [
                         {
                             "type": 2,
-                            "label": "✅ 승인 (WF-12 진행)",
+                            "label": "✅ 일반 승인",
                             "style": 3,
-                            "custom_id": f"tts_approve:{job_id}",
+                            "custom_id": f"tts_approve_standard:{job_id}",
+                        },
+                        {
+                            "type": 2,
+                            "label": "💎 고화질 승인",
+                            "style": 2,
+                            "custom_id": f"tts_approve_hd:{job_id}",
                         },
                         {
                             "type": 2,
@@ -473,7 +485,7 @@ class DiscordAdapter(MessengerAdapter):
                     ],
                 }
             ]
-        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택하세요."
         suffix = f"\n\n📎 TTS 링크(24시간 유효):\n{audio_url}"
         max_prefix_len = max(0, 1900 - len(suffix))
         if len(prefix) > max_prefix_len:

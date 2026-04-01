@@ -135,6 +135,13 @@ async def _safe_defer(interaction: discord.Interaction, *, ephemeral: bool = Tru
         logger.error("[discord] defer failed: %s", e)
 
 
+def _build_button_view(*buttons: tuple[str, str, discord.ButtonStyle]) -> discord.ui.View:
+    view = discord.ui.View(timeout=300)
+    for label, custom_id, style in buttons:
+        view.add_item(discord.ui.Button(label=label, custom_id=custom_id, style=style))
+    return view
+
+
 # ─────────────────────────────────────────
 # 인메모리 수정 대기 상태 (pending_store)
 # ─────────────────────────────────────────
@@ -376,30 +383,12 @@ async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> 
             await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
             return
 
-        await _safe_defer(interaction, ephemeral=True)
-        normalized_job_id = (job_id or "").strip()
-        # /heygen도 /tts와 동일하게 "최근 job 자동 선택"을 gateway 쪽 규칙에 맡긴다.
-        result = await gateway_call(
-            "/internal/heygen-generate",
-            {
-                "job_id": normalized_job_id,
-                "messenger_user_id": user_id,
-                "messenger_channel_id": str(interaction.channel_id),
-            },
+        await _safe_reply(
+            interaction,
+            "🎬 `/heygen` 명령은 비활성화되었습니다. TTS 완료 메시지의 `일반 승인` 또는 `고화질 승인` 버튼에서만 WF-12를 실행할 수 있습니다.",
+            ephemeral=True,
         )
-        resolved_job_id = (result.get("job_id") or normalized_job_id).strip()
-        if not resolved_job_id:
-            raise RuntimeError("gateway returned empty job_id")
-
-        picked_latest = not normalized_job_id
-        message = (
-            "🎬 WF-12(HeyGen) 시작 요청 완료 "
-            f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
-            if picked_latest
-            else f"🎬 WF-12(HeyGen) 시작 요청 완료: `{resolved_job_id[:8]}`"
-        )
-        await _safe_reply(interaction, message, ephemeral=True)
-        logger.info("[/heygen] success user=%s resolved_job_id=%s", user_id, resolved_job_id)
+        logger.info("[/heygen] disabled user=%s", user_id)
     except Exception as e:
         logger.exception(
             "[/heygen] failed user=%s channel=%s job_input=%s",
@@ -454,7 +443,7 @@ async def jobs_command(interaction: discord.Interaction, purpose: str = "all") -
             has_audio = "Y" if item.get("has_audio_url") else "N"
             lines.append(f"`{jid}` status={status} script={has_script} audio={has_audio}")
 
-        guide = "사용: `/tts` 또는 `/heygen`에 위 8자리 job_id를 넣거나, job_id 없이 실행"
+        guide = "사용: `/tts`에 위 8자리 job_id를 넣거나, job_id 없이 실행. 영상은 TTS 완료 메시지의 승인 버튼에서 진행"
         await interaction.followup.send(
             f"최근 job 목록(purpose={normalized_purpose}):\n" + "\n".join(lines) + f"\n\n{guide}",
             ephemeral=True,
@@ -478,10 +467,15 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     parts = custom_id.split(":")
     action = parts[0]
     # video_reject_step: video_reject_step:{job_id}:{step}
-    # tts_approve:       tts_approve:{job_id}
+    # tts_approve_standard:   tts_approve_standard:{job_id}
+    # tts_approve_hd:         tts_approve_hd:{job_id}
+    # tts_approve_hd_confirm: tts_approve_hd_confirm:{job_id}
+    # tts_approve_hd_cancel:  tts_approve_hd_cancel:{job_id}
     # tts_reject:        tts_reject:{job_id}
     # report_to_tts:     report_to_tts:{job_id}
-    # report_to_video:   report_to_video:{job_id}
+    # report_to_video:         report_to_video:{job_id}
+    # report_to_video_confirm: report_to_video_confirm:{job_id}
+    # report_to_video_cancel:  report_to_video_cancel:{job_id}
     # select_report:     select_report:{job_id}:{channel_id}:{index}
     # new_report:        new_report:{job_id}:{channel_id}
     # select_channel:    select_channel:{job_id}:{channel_id}
@@ -502,6 +496,22 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "select_channel" and len(parts) >= 3:
         job_id = parts[1]
         channel_id_value = ":".join(parts[2:])
+    elif action in {
+        "tts_approve_standard",
+        "tts_approve_hd",
+        "tts_approve_hd_confirm",
+        "tts_approve_hd_cancel",
+        "tts_reject",
+        "report_to_tts",
+        "report_to_video",
+        "report_to_video_confirm",
+        "report_to_video_cancel",
+        "approve",
+        "revise",
+        "video_approve",
+        "video_reject",
+    } and len(parts) >= 2:
+        job_id = parts[-1]
     else:
         job_id = ":".join(parts[1:])
     user_id = str(interaction.user.id)
@@ -516,7 +526,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         return
 
     # Discord 컴포넌트는 3초 안에 응답해야 하므로 먼저 defer하고 실제 처리는 뒤에서 한다.
-    await interaction.response.defer()
+    await _safe_defer(interaction, ephemeral=True)
 
     if action == "approve":
         # 스크립트 승인 -> gateway confirm-action -> WF-05 -> WF-11 경로로 이어진다.
@@ -563,16 +573,43 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
-    elif action == "tts_approve":
-        # TTS 승인 -> gateway tts-action -> WF-12(HeyGen) 호출.
+    elif action == "tts_approve_standard":
+        # 일반 승인 -> gateway tts-action -> WF-12(HeyGen) 일반 모드 호출.
         try:
             await gateway_call(
                 "/internal/tts-action",
-                {"job_id": job_id, "action": "approve"},
+                {"job_id": job_id, "action": "approve_standard", "use_avatar_iv_model": False},
             )
-            await interaction.followup.send("✅ TTS 승인됨. WF-12(HeyGen) 실행 중...", ephemeral=True)
+            await interaction.followup.send("✅ 일반 승인됨. WF-12(HeyGen) 일반 모드 실행 중...", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_approve_hd":
+        try:
+            view = _build_button_view(
+                ("💎 고화질 최종 승인", f"tts_approve_hd_confirm:{job_id}", discord.ButtonStyle.danger),
+                ("취소", f"tts_approve_hd_cancel:{job_id}", discord.ButtonStyle.secondary),
+            )
+            await interaction.followup.send(
+                "⚠️ 고화질 Avatar IV 모드는 추가 비용이 발생할 수 있습니다. 최종 승인하면 WF-12를 고화질 모드로 실행합니다.",
+                ephemeral=True,
+                view=view,
+            )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_approve_hd_confirm":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {"job_id": job_id, "action": "approve_hd", "use_avatar_iv_model": True},
+            )
+            await interaction.followup.send("💎 고화질 승인됨. WF-12(HeyGen) Avatar IV 모드 실행 중...", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_approve_hd_cancel":
+        await interaction.followup.send("고화질 승인 요청을 취소했습니다.", ephemeral=True)
 
     elif action == "tts_reject":
         # TTS 반려는 job을 대본 승인 상태로 되돌려 수동 재생성을 가능하게 한다.
@@ -586,15 +623,34 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "report_to_video":
-        # 보고서 결과에서 바로 영상 제작 모드로 진입하면 gateway가 TTS 후 WF-12까지 자동으로 잇는다.
+        try:
+            view = _build_button_view(
+                ("계속", f"report_to_video_confirm:{job_id}", discord.ButtonStyle.primary),
+                ("취소", f"report_to_video_cancel:{job_id}", discord.ButtonStyle.secondary),
+            )
+            await interaction.followup.send(
+                "⚠️ 영상 제작 모드로 전환하면 먼저 TTS를 생성하고, 완료 후 일반 승인 또는 고화질 승인을 다시 선택하게 됩니다.",
+                ephemeral=True,
+                view=view,
+            )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "report_to_video_confirm":
         try:
             await gateway_call(
                 "/internal/report-to-video",
                 {"job_id": job_id},
             )
-            await interaction.followup.send("🎬 영상 제작 모드 시작: TTS 후 WF-12까지 자동 진행됩니다.", ephemeral=True)
+            await interaction.followup.send(
+                "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하세요.",
+                ephemeral=True,
+            )
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "report_to_video_cancel":
+        await interaction.followup.send("영상 제작 전환을 취소했습니다.", ephemeral=True)
 
     elif action == "report_to_tts":
         # 보고서 결과에서 TTS만 제작하는 분기.

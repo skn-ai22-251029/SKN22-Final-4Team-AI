@@ -44,7 +44,7 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-RAPI_TALKING_PHOTO_ID = "ee354bb52158453d80822a4b76b77768"
+RAPI_TALKING_PHOTO_ID = "b903a1fd1ec846e0ba2e89620bc0aaae"
 
 INPUT_AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_audio")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output_videos")

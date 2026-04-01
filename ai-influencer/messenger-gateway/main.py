@@ -200,6 +200,9 @@ def _merge_script_json_with_media_names(
     script_rewrite_prompt: Optional[str] = None,
     script_rewrite_status: Optional[str] = None,
     script_rewrite_error: Optional[str] = None,
+    generated_content_id: Optional[str] = None,
+    generated_content_error: Optional[str] = None,
+    heygen_use_avatar_iv_model: Optional[bool] = None,
 ) -> dict:
     merged = _as_script_json(existing)
     resolved_subtitle_script_text = subtitle_script_text
@@ -251,6 +254,20 @@ def _merge_script_json_with_media_names(
             merged["script_rewrite_error"] = script_rewrite_error
         else:
             merged.pop("script_rewrite_error", None)
+    if generated_content_id is not None:
+        normalized_content_id = str(generated_content_id).strip()
+        if normalized_content_id:
+            merged["generated_content_id"] = normalized_content_id
+        else:
+            merged.pop("generated_content_id", None)
+    if generated_content_error is not None:
+        normalized_content_error = str(generated_content_error).strip()
+        if normalized_content_error:
+            merged["generated_content_error"] = normalized_content_error
+        else:
+            merged.pop("generated_content_error", None)
+    if heygen_use_avatar_iv_model is not None:
+        merged["heygen_use_avatar_iv_model"] = bool(heygen_use_avatar_iv_model)
     media_names = merged.get("media_names")
     if not isinstance(media_names, dict):
         media_names = {}
@@ -320,7 +337,7 @@ def _is_transient_notebooklm_error(err: Exception) -> bool:
 def _default_tts_caption(*, auto_trigger_wf12: bool) -> str:
     if auto_trigger_wf12:
         return "🔊 TTS 완료. 영상 제작 모드로 WF-12(HeyGen)를 자동 실행합니다."
-    return "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+    return "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택하세요."
 
 
 def _get_subtitle_script_text(script_json: dict) -> str:
@@ -356,6 +373,42 @@ async def _persist_job_avatar_override(job_id: str, existing_script_json: object
         heygen_avatar_id=avatar_id,
     )
     return await job_service.update_job(job_id, script_json=merged_script)
+
+
+async def _register_generated_content(
+    *,
+    job_id: str,
+    script_text: str,
+    content_url: str,
+) -> tuple[str, str]:
+    service_base_url = settings.heygen_pipeline_service_url.rstrip("/")
+    if not service_base_url:
+        return "", ""
+
+    cleaned_script_text = (script_text or "").strip()
+    cleaned_content_url = (content_url or "").strip()
+    if not cleaned_script_text or not cleaned_content_url:
+        return "", ""
+
+    try:
+        resp = await _http_client.post(
+            f"{service_base_url}/register-content",
+            json={
+                "job_id": job_id,
+                "script_text": cleaned_script_text,
+                "content_url": cleaned_content_url,
+            },
+            timeout=settings.heygen_pipeline_service_timeout_seconds,
+        )
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        content_id = str(payload.get("content_id") or "").strip()
+        if content_id:
+            logger.info("[generated-content] registered job_id=%s content_id=%s", job_id, content_id)
+        return content_id, ""
+    except Exception as e:
+        logger.warning("[generated-content] register failed job_id=%s: %s", job_id, e)
+        return "", str(e)
 
 
 async def _resolve_heygen_avatar_id(job: dict, *, requested_avatar_id: str = "") -> tuple[str, str]:
@@ -998,6 +1051,7 @@ async def _run_tts_generation(
                 user_id,
                 audio_url=approved_audio_url,
                 avatar_id=resolved_avatar_id,
+                use_avatar_iv_model=False,
             )
             logger.info("[heygen-avatar] auto wf12 avatar source=%s job_id=%s", avatar_source, job_id)
     except Exception as e:
@@ -1982,7 +2036,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
     except Exception as e:
         logger.error("[storage] tts upload failed job_id=%s: %s", body.job_id, e)
 
-    caption = body.caption or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+    caption = body.caption or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택하세요."
     if stored and stored.size_bytes > _discord_attachment_limit_bytes():
         # 큰 파일은 Discord 첨부 대신 presigned link + 버튼 메시지로 전송한다.
         try:
@@ -2050,12 +2104,13 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
 
-    if body.action == "approve":
+    if body.action in {"approve_standard", "approve_hd"}:
         # WF-12는 외부 URL을 읽어야 하므로 s3:// 저장값은 presigned URL로 바꿔 넘긴다.
         resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
         audio_url = job.get("audio_url", "")
         if not audio_url:
             raise HTTPException(status_code=400, detail="No audio_url found in job")
+        use_avatar_iv_model = body.action == "approve_hd" or body.use_avatar_iv_model
         approved_audio_url = audio_url
         if isinstance(audio_url, str) and audio_url.startswith("s3://"):
             try:
@@ -2063,6 +2118,11 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             except Exception as e:
                 logger.error("[storage] presign audio s3 uri failed job_id=%s: %s", body.job_id, e)
                 raise HTTPException(status_code=500, detail=f"audio presign failed: {e}")
+        merged_script = _merge_script_json_with_media_names(
+            job.get("script_json"),
+            heygen_use_avatar_iv_model=use_avatar_iv_model,
+        )
+        await job_service.update_job(body.job_id, script_json=merged_script)
         try:
             await n8n_service.call_wf12_heygen_generate(
                 job_id=body.job_id,
@@ -2070,17 +2130,29 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
                 user_id=user_id,
                 audio_url=approved_audio_url,
                 avatar_id=resolved_avatar_id,
+                use_avatar_iv_model=use_avatar_iv_model,
             )
-            await _discord_adapter.send_text_message(channel_id, "🎬 WF-12(HeyGen) 영상 생성을 시작합니다.")
+            mode_text = "고화질 Avatar IV" if use_avatar_iv_model else "일반"
+            await _discord_adapter.send_text_message(
+                channel_id,
+                f"🎬 WF-12(HeyGen) 영상 생성을 시작합니다. 모드: {mode_text}",
+            )
         except Exception as e:
             logger.error("call_wf12 (tts approve) failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=500, detail=str(e))
-        logger.info("[discord] tts_action=approve trigger_wf12 job_id=%s avatar_source=%s", body.job_id, avatar_source)
+        logger.info(
+            "[discord] tts_action=%s trigger_wf12 job_id=%s avatar_source=%s use_avatar_iv_model=%s",
+            body.action,
+            body.job_id,
+            avatar_source,
+            use_avatar_iv_model,
+        )
         return {
             "job_id": body.job_id,
-            "action": "approve",
+            "action": body.action,
             "avatar_id": resolved_avatar_id,
             "avatar_source": avatar_source,
+            "use_avatar_iv_model": use_avatar_iv_model,
         }
 
     if body.action == "reject":
@@ -2131,9 +2203,19 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         logger.error("[discord] send_video_preview failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
+    existing_script_json = _as_script_json(existing_job.get("script_json") if existing_job else None)
+    subtitle_script_text = _get_subtitle_script_text(existing_script_json)
+    generated_content_id, generated_content_error = await _register_generated_content(
+        job_id=body.job_id,
+        script_text=subtitle_script_text,
+        content_url=stored.s3_uri,
+    )
+
     merged_script = _merge_script_json_with_media_names(
-        existing_job.get("script_json") if existing_job else None,
+        existing_script_json,
         video_filename=normalized_video_filename,
+        generated_content_id=generated_content_id if generated_content_id else None,
+        generated_content_error=generated_content_error,
     )
     video_storage_url = stored.s3_uri
     await job_service.update_job(
@@ -2295,8 +2377,9 @@ async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
 
 @app.post("/internal/report-to-video")
 async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
-    """/report 결과의 '영상으로 제작' 버튼 클릭 처리 — WF-11 후 WF-12 자동 트리거."""
-    # 보고서 -> TTS -> WF-12를 사용자가 추가 승인 없이 한 번에 연결하는 경로.
+    """/report 결과의 '영상으로 제작' 버튼 클릭 처리 — TTS 생성 후 Discord 승인 단계로 넘긴다."""
+    # 보고서 -> TTS까지만 자동 진행하고,
+    # WF-12는 TTS 완료 후 Discord 버튼에서 일반/고화질 중 선택한다.
     job = await job_service.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -2320,11 +2403,11 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
             script_text=script_text,
             channel_id=channel_id,
             user_id=user_id,
-            auto_trigger_wf12=True,
+            auto_trigger_wf12=False,
         )
         await _discord_adapter.send_text_message(
             channel_id,
-            "🎬 영상 제작 모드로 진행합니다. TTS 생성 후 WF-12(HeyGen)까지 자동 실행됩니다.",
+            "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하세요.",
         )
     except Exception as e:
         logger.error("call_wf11 (report_to_video) failed job_id=%s: %s", body.job_id, e)
@@ -2334,7 +2417,7 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
     return {
         "job_id": body.job_id,
         "status": "triggered",
-        "mode": "video-auto",
+        "mode": "video-prepare",
         "avatar_id": resolved_avatar_id,
         "avatar_source": avatar_source,
     }
@@ -2443,51 +2526,10 @@ async def set_character_avatar(_: AuthDep, body: CharacterAvatarRequest) -> dict
 
 @app.post("/internal/heygen-generate")
 async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
-    """수동 /heygen 명령 처리 — job_id(전체/접두) 또는 최근 작업으로 WF-12 실행."""
-    logger.info(
-        "[manual /heygen] request job_id=%s user=%s channel=%s",
-        (body.job_id or "").strip(),
-        (body.messenger_user_id or "").strip(),
-        (body.messenger_channel_id or "").strip(),
+    raise HTTPException(
+        status_code=410,
+        detail="Manual /heygen is disabled. Use the TTS approval buttons to choose standard or high-quality WF-12.",
     )
-    job = await _resolve_manual_job(body, require_audio=True)
-    resolved_job_id = job["id"]
-    if (body.avatar_id or "").strip():
-        job = await _persist_job_avatar_override(resolved_job_id, job.get("script_json"), body.avatar_id)
-
-    channel_id = job["messenger_channel_id"]
-    user_id = job["messenger_user_id"]
-    resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job, requested_avatar_id=body.avatar_id)
-    audio_url = job.get("audio_url", "")
-    if not audio_url:
-        raise HTTPException(status_code=400, detail="No audio_url found in resolved job")
-    if isinstance(audio_url, str) and audio_url.startswith("s3://"):
-        try:
-            audio_url = presign_s3_uri(audio_url)
-        except Exception as e:
-            logger.error("[storage] presign audio s3 uri failed job_id=%s: %s", resolved_job_id, e)
-            raise HTTPException(status_code=500, detail=f"audio presign failed: {e}")
-
-    try:
-        await n8n_service.call_wf12_heygen_generate(
-            job_id=resolved_job_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            audio_url=audio_url,
-            avatar_id=resolved_avatar_id,
-        )
-    except Exception as e:
-        logger.error("call_wf12 (manual /heygen) failed job_id=%s: %s", resolved_job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-    logger.info("[manual /heygen] triggered job_id=%s avatar_source=%s", resolved_job_id, avatar_source)
-    return {
-        "job_id": resolved_job_id,
-        "status": "triggered",
-        "workflow": "WF-12",
-        "avatar_id": resolved_avatar_id,
-        "avatar_source": avatar_source,
-    }
 
 
 @app.post("/internal/jobs")

@@ -1,0 +1,11 @@
+[
+  "WF-01_input_receive.json",
+  "WF-04_confirm_request.json",
+  "WF-05_confirm_handler.json",
+  "WF-06_notebooklm_report.json",
+  "WF-08_sns_upload.json",
+  "WF-09-youtube-source.json",
+  "WF-10-daily-notebook.json",
+  "WF-11_tts_generate.json",
+  "WF-12_heygen_generate.json"
+]

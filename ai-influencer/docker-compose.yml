@@ -71,15 +71,16 @@ services:
       HEYGEN_MAX_WAIT_SECONDS: ${HEYGEN_MAX_WAIT_SECONDS:-900}
       HEYGEN_MOCK_ENABLED: ${HEYGEN_MOCK_ENABLED:-false}
       HEYGEN_MOCK_VIDEO_URL: ${HEYGEN_MOCK_VIDEO_URL:-https://samplelib.com/lib/preview/mp4/sample-5s.mp4}
+      HEYGEN_PIPELINE_SERVICE_URL: ${HEYGEN_PIPELINE_SERVICE_URL:-http://heygen-pipeline-service:8100}
       N8N_RUNNERS_ENABLED: "true"
       N8N_RUNNERS_TASK_TIMEOUT: ${N8N_RUNNERS_TASK_TIMEOUT:-1200}
       N8N_SECURE_COOKIE: "false"
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./n8n/workflows:/workflows:ro
-    entrypoint: ["tini", "--", "/bin/sh", "-c"]
-    command: "n8n import:workflow --separate --input=/workflows || true && exec n8n start"
+      - ./n8n:/n8n-config:ro
+    entrypoint: ["tini", "--"]
+    command: ["/bin/sh", "-c", "node /n8n-config/sync_workflows.js import && exec n8n start"]
     ports:
       - "5678:5678"
     networks:
@@ -110,6 +111,8 @@ services:
       n8n:
         condition: service_started
       notebooklm-service:
+        condition: service_started
+      heygen-pipeline-service:
         condition: service_started
     environment:
       GATEWAY_PORT: ${GATEWAY_PORT}
@@ -165,8 +168,26 @@ services:
       HEYGEN_MAX_WAIT_SECONDS: ${HEYGEN_MAX_WAIT_SECONDS:-900}
       HEYGEN_MOCK_ENABLED: ${HEYGEN_MOCK_ENABLED:-false}
       HEYGEN_MOCK_VIDEO_URL: ${HEYGEN_MOCK_VIDEO_URL:-https://samplelib.com/lib/preview/mp4/sample-5s.mp4}
+      HEYGEN_PIPELINE_SERVICE_URL: ${HEYGEN_PIPELINE_SERVICE_URL:-http://heygen-pipeline-service:8100}
     ports:
       - "8080:8080"
+    networks:
+      - internal
+
+  heygen-pipeline-service:
+    build:
+      context: ..
+      dockerfile: ai-influencer/heygen-pipeline-service/Dockerfile
+    restart: always
+    environment:
+      HEYGEN_API_KEY: ${HEYGEN_API_KEY:-}
+      HEYGEN_AVATAR_ID: ${HEYGEN_AVATAR_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DB_HOST: ${PERSONA_DB_HOST:-}
+      DB_PORT: ${PERSONA_DB_PORT:-5432}
+      DB_NAME: ${PERSONA_DB_NAME:-}
+      DB_USER: ${PERSONA_DB_USER:-}
+      DB_PASSWORD: ${PERSONA_DB_PASSWORD:-}
     networks:
       - internal
 

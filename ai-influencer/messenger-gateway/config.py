@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     heygen_max_wait_seconds: int = 900
     heygen_mock_enabled: bool = False
     heygen_mock_video_url: str = "https://samplelib.com/lib/preview/mp4/sample-5s.mp4"
+    heygen_pipeline_service_url: str = "http://heygen-pipeline-service:8100"
+    heygen_pipeline_service_timeout_seconds: float = 120.0
 
     # Cross-account S3 (AssumeRole)
     media_s3_bucket: str = ""

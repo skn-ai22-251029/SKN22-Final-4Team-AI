@@ -99,7 +99,8 @@ class SendAudioRequest(BaseModel):
 
 class TtsActionRequest(BaseModel):
     job_id: str
-    action: str  # "approve" | "reject"
+    action: str  # "approve_standard" | "approve_hd" | "reject"
+    use_avatar_iv_model: bool = False
 
 
 class VideoActionRequest(BaseModel):
@@ -122,6 +123,7 @@ class ManualGenerateRequest(BaseModel):
     messenger_user_id: str = ""
     messenger_channel_id: str = ""
     avatar_id: str = ""
+    use_avatar_iv_model: bool = False
 
 
 class HeygenSmokeTestRequest(BaseModel):
