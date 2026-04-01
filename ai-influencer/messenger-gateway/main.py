@@ -203,6 +203,8 @@ def _merge_script_json_with_media_names(
     generated_content_id: Optional[str] = None,
     generated_content_error: Optional[str] = None,
     heygen_use_avatar_iv_model: Optional[bool] = None,
+    tts_error_type: Optional[str] = None,
+    tts_error_detail: Optional[str] = None,
 ) -> dict:
     merged = _as_script_json(existing)
     resolved_subtitle_script_text = subtitle_script_text
@@ -268,6 +270,18 @@ def _merge_script_json_with_media_names(
             merged.pop("generated_content_error", None)
     if heygen_use_avatar_iv_model is not None:
         merged["heygen_use_avatar_iv_model"] = bool(heygen_use_avatar_iv_model)
+    if tts_error_type is not None:
+        normalized_tts_error_type = str(tts_error_type).strip()
+        if normalized_tts_error_type:
+            merged["tts_error_type"] = normalized_tts_error_type
+        else:
+            merged.pop("tts_error_type", None)
+    if tts_error_detail is not None:
+        normalized_tts_error_detail = str(tts_error_detail).strip()
+        if normalized_tts_error_detail:
+            merged["tts_error_detail"] = normalized_tts_error_detail
+        else:
+            merged.pop("tts_error_detail", None)
     media_names = merged.get("media_names")
     if not isinstance(media_names, dict):
         media_names = {}
@@ -595,6 +609,77 @@ def _script_char_count(script_text: str) -> int:
 def _sanitize_prompt_text(text: str) -> str:
     sanitized = (text or "").replace("\x00", "")
     return sanitized.encode("utf-8", "ignore").decode("utf-8")
+
+
+def _build_tts_request_body(script_text: str) -> dict:
+    cleaned_script_text = (script_text or "").strip()
+    if not cleaned_script_text:
+        raise RuntimeError("script_text is required")
+
+    tts_body = {
+        "text": cleaned_script_text,
+        "text_lang": settings.tts_text_lang or "ko",
+        "prompt_lang": settings.tts_prompt_lang or settings.tts_text_lang or "ko",
+        "media_type": "wav",
+        "streaming_mode": False,
+        "top_k": settings.tts_top_k,
+        "sample_steps": settings.tts_sample_steps,
+        "super_sampling": settings.tts_super_sampling,
+        "fragment_interval": settings.tts_fragment_interval,
+    }
+
+    ref_audio_path = settings.tts_ref_audio_path.strip()
+    prompt_text = settings.tts_prompt_text.strip()
+    if ref_audio_path or prompt_text:
+        if not (ref_audio_path and prompt_text):
+            raise RuntimeError("TTS_REF_AUDIO_PATH와 TTS_PROMPT_TEXT는 함께 설정해야 합니다.")
+        tts_body["ref_audio_path"] = ref_audio_path
+        tts_body["prompt_text"] = prompt_text
+
+    return tts_body
+
+
+def _classify_tts_error(detail: str, *, status_code: Optional[int] = None) -> str:
+    normalized = (detail or "").lower()
+    runtime_markers = (
+        "averaged_perceptron_tagger_eng",
+        "resource '",
+        "nltk",
+        "traceback",
+        '"exception":"',
+        "searched in:",
+    )
+    request_markers = (
+        "script_text is required",
+        "ref_audio_path is required",
+        "prompt_text cannot be empty",
+        "tts_ref_audio_path와 tts_prompt_text는 함께 설정해야 합니다.",
+        "invalid",
+        "unprocessable",
+    )
+
+    if any(marker in normalized for marker in runtime_markers):
+        return "tts_server_runtime_error"
+    if any(marker in normalized for marker in request_markers):
+        return "request_validation_error"
+    if status_code is not None and status_code >= 500:
+        return "tts_server_runtime_error"
+    if status_code in {400, 401, 403, 404, 405, 409, 422}:
+        return "request_validation_error"
+    return "tts_server_runtime_error"
+
+
+def _extract_tts_error_type(detail: str) -> str:
+    match = re.search(r"\[(request_validation_error|tts_server_runtime_error)\]", detail or "")
+    if match:
+        return match.group(1)
+    return _classify_tts_error(detail)
+
+
+def _format_tts_api_error(status_code: int, detail: str) -> str:
+    error_type = _classify_tts_error(detail, status_code=status_code)
+    normalized_detail = (detail or "").strip() or "empty response"
+    return f"TTS API failed [{error_type}]: {status_code} {normalized_detail}"
 
 
 def _non_empty_line_count(script_text: str) -> int:
@@ -973,24 +1058,7 @@ async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[st
     if not tts_api_url:
         raise RuntimeError("TTS_API_URL is not configured")
 
-    tts_body = {
-        "text": script_text,
-        "text_lang": settings.tts_text_lang or "ko",
-        "prompt_lang": settings.tts_prompt_lang or settings.tts_text_lang or "ko",
-        "media_type": "wav",
-        "streaming_mode": False,
-        "top_k": settings.tts_top_k,
-        "sample_steps": settings.tts_sample_steps,
-        "super_sampling": settings.tts_super_sampling,
-        "fragment_interval": settings.tts_fragment_interval,
-    }
-
-    ref_audio_path = settings.tts_ref_audio_path.strip()
-    prompt_text = settings.tts_prompt_text.strip()
-    if ref_audio_path:
-        tts_body["ref_audio_path"] = ref_audio_path
-    if prompt_text:
-        tts_body["prompt_text"] = prompt_text
+    tts_body = _build_tts_request_body(script_text)
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         endpoint = tts_api_url if tts_api_url.rstrip("/").endswith("/tts") else f"{tts_api_url.rstrip('/')}/tts"
@@ -1000,7 +1068,7 @@ async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[st
             headers={"Content-Type": "application/json"},
         )
         if not resp.is_success:
-            raise RuntimeError(f"TTS API failed: {resp.status_code} {resp.text}")
+            raise RuntimeError(_format_tts_api_error(resp.status_code, resp.text))
         audio_b64 = base64.b64encode(resp.content).decode("ascii")
 
     filename = _normalize_audio_filename(job_id, None, None)
@@ -1033,7 +1101,13 @@ async def _run_tts_generation(
             ),
         )
         await job_service.transition_status(job_id, "APPROVED")
-        await job_service.update_job(job_id, error_message="")
+        current_job = await job_service.get_job(job_id)
+        cleared_script = _merge_script_json_with_media_names(
+            current_job.get("script_json") if current_job else None,
+            tts_error_type="",
+            tts_error_detail="",
+        )
+        await job_service.update_job(job_id, error_message="", script_json=cleared_script)
 
         if auto_trigger_wf12:
             # report_to_video 경로는 TTS 승인 버튼을 기다리지 않고
@@ -1056,12 +1130,24 @@ async def _run_tts_generation(
             logger.info("[heygen-avatar] auto wf12 avatar source=%s job_id=%s", avatar_source, job_id)
     except Exception as e:
         logger.exception("[tts-direct] failed job_id=%s: %r", job_id, e)
+        error_text = str(e)
+        error_type = _extract_tts_error_type(error_text)
         await job_service.transition_status(job_id, "FAILED")
-        await job_service.update_job(job_id, error_message=f"TTS 생성 실패: {e}")
+        current_job = await job_service.get_job(job_id)
+        failed_script = _merge_script_json_with_media_names(
+            current_job.get("script_json") if current_job else None,
+            tts_error_type=error_type,
+            tts_error_detail=error_text,
+        )
+        await job_service.update_job(
+            job_id,
+            error_message=f"TTS 생성 실패 [{error_type}]: {error_text}",
+            script_json=failed_script,
+        )
         try:
             await _discord_adapter.send_text_message(
                 channel_id,
-                f"❌ TTS 생성에 실패했습니다.\nJob ID: {job_id[:8]}\n오류: {e}",
+                f"❌ TTS 생성에 실패했습니다.\nJob ID: {job_id[:8]}\n오류 유형: {error_type}\n오류: {error_text}",
             )
         except Exception as notify_err:
             logger.error("[tts-direct] failure notify failed job_id=%s: %s", job_id, notify_err)
