@@ -17,7 +17,10 @@ from config import settings
 from prompts import (
     NOTEBOOKLM_REPORT_PROMPT,
     SCRIPT_REWRITE_SYSTEM_PROMPT,
+    SCRIPT_ENDING_LINE,
+    SUBTITLE_SCRIPT_OPENING_LINE,
     TTS_SCRIPT_REWRITE_PROMPT_BASE,
+    TTS_SCRIPT_OPENING_LINE,
     build_subtitle_retry_prompt,
     build_tts_retry_prompt,
     build_tts_script_rewrite_instruction,
@@ -788,8 +791,19 @@ def _validate_subtitle_script(tts_script_text: str, subtitle_script_text: str) -
         raise RuntimeError(
             f"subtitle_script_text line count mismatch: tts={len(tts_lines)} subtitle={len(subtitle_lines)}"
         )
-    if tts_lines and "보리" in tts_lines[0] and "보리" not in subtitle_lines[0]:
-        raise RuntimeError("subtitle_script_text dropped opening vocative from first line")
+    if not subtitle_lines:
+        raise RuntimeError("subtitle_script_text is empty")
+    if not subtitle_lines[0].startswith(SUBTITLE_SCRIPT_OPENING_LINE):
+        raise RuntimeError("subtitle_script_text opening line mismatch")
+    if not subtitle_lines[-1].endswith(SCRIPT_ENDING_LINE):
+        raise RuntimeError("subtitle_script_text ending line mismatch")
+    if tts_lines:
+        if not tts_lines[0].startswith(TTS_SCRIPT_OPENING_LINE):
+            raise RuntimeError("tts_script_text opening line mismatch before subtitle conversion")
+        if subtitle_lines[0] != tts_lines[0]:
+            raise RuntimeError("subtitle_script_text first line does not preserve tts line")
+        if not tts_lines[-1].endswith(SCRIPT_ENDING_LINE):
+            raise RuntimeError("tts_script_text ending line mismatch before subtitle conversion")
 
 
 def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> None:
@@ -803,6 +817,13 @@ def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> None:
         raise RuntimeError(
             f"tts_script_text length out of range: {tts_len} (expected {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
         )
+    tts_lines = [line.strip() for line in tts_script_text.splitlines() if line.strip()]
+    if not tts_lines:
+        raise RuntimeError("tts_script_text is empty")
+    if not tts_lines[0].startswith(TTS_SCRIPT_OPENING_LINE):
+        raise RuntimeError("tts_script_text opening line mismatch")
+    if not tts_lines[-1].endswith(SCRIPT_ENDING_LINE):
+        raise RuntimeError("tts_script_text ending line mismatch")
 
 
 async def _rewrite_report_to_script(
