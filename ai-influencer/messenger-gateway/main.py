@@ -6,7 +6,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated, Awaitable, Optional
+from typing import Annotated, Awaitable, Callable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -599,6 +599,7 @@ def _extract_supporting_facts(raw_report_text: str) -> list[str]:
 _SCRIPT_MIN_CHARS = 320
 _SCRIPT_MAX_CHARS = 400
 _SCRIPT_REWRITE_MAX_ATTEMPTS = 5
+_REPORT_SCRIPT_RETRY_MAX_ATTEMPTS = 5
 
 
 def _script_char_count(script_text: str) -> int:
@@ -709,6 +710,7 @@ def _build_job_prompt_log(
             "instruction_base": TTS_SCRIPT_REWRITE_PROMPT_BASE,
             "instruction_custom": rewrite_prompt,
             "instruction_final": rewrite_instruction,
+            "report_attempts": [],
             "tts_attempts": [],
             "subtitle_attempts": [],
             "final": {
@@ -721,6 +723,25 @@ def _build_job_prompt_log(
             },
         },
     }
+
+
+def _latest_rewrite_response_text(prompt_log: dict, attempt_key: str) -> str:
+    rewrite = prompt_log.get("rewrite") if isinstance(prompt_log, dict) else None
+    attempts = rewrite.get(attempt_key) if isinstance(rewrite, dict) else None
+    if not isinstance(attempts, list) or not attempts:
+        return ""
+    latest = attempts[-1]
+    if not isinstance(latest, dict):
+        return ""
+    return _sanitize_prompt_text(str(latest.get("response_text") or "").strip())
+
+
+def _build_report_retry_notice(*, attempt: int, max_attempts: int, reason: str) -> str:
+    clipped_reason = _sanitize_prompt_text((reason or "").strip())[:160] or "원인 미상"
+    return (
+        f"⚠️ 대본 생성에 실패해 다시 시도합니다. ({attempt}/{max_attempts})\n"
+        f"사유: {clipped_reason}"
+    )
 
 
 def _upload_prompt_log_file(
@@ -789,6 +810,9 @@ async def _rewrite_report_to_script(
     rewrite_instruction: str,
     *,
     prompt_log: dict,
+    max_attempts: int = _SCRIPT_REWRITE_MAX_ATTEMPTS,
+    seed_tts_script_text: str = "",
+    seed_subtitle_script_text: str = "",
 ) -> tuple[str, str]:
     # NotebookLM 원문 보고서를 한 번 더 정제해
     # 자막용/ TTS용 스크립트를 동시에 만든다.
@@ -800,26 +824,27 @@ async def _rewrite_report_to_script(
     try:
         last_error: Exception | None = None
         fact_lines = "\n".join(f"- {fact}" for fact in _extract_supporting_facts(raw_report_text)) or "- 원문 보고서의 핵심 사실을 그대로 사용한다."
-        tts_script_text = ""
-        for attempt in range(_SCRIPT_REWRITE_MAX_ATTEMPTS):
+        tts_script_text = _sanitize_prompt_text((seed_tts_script_text or "").strip())
+        for attempt in range(max(1, max_attempts)):
+            use_retry_prompt = attempt > 0 or bool(tts_script_text)
             tts_prompt = (
-                build_tts_script_prompt(
-                    raw_report_text=raw_report_text,
-                    fact_lines=fact_lines,
-                    rewrite_instruction=rewrite_instruction,
-                )
-                if attempt == 0
-                else build_tts_retry_prompt(
+                build_tts_retry_prompt(
                     raw_report_text=raw_report_text,
                     rewrite_instruction=rewrite_instruction,
                     previous_script_text=tts_script_text,
                     char_count=_script_char_count(tts_script_text),
                     fact_lines=fact_lines,
                 )
+                if use_retry_prompt
+                else build_tts_script_prompt(
+                    raw_report_text=raw_report_text,
+                    fact_lines=fact_lines,
+                    rewrite_instruction=rewrite_instruction,
+                )
             )
             tts_prompt = _sanitize_prompt_text(tts_prompt)
             attempt_record = {
-                "attempt": attempt + 1,
+                "attempt": len(prompt_log["rewrite"]["tts_attempts"]) + 1,
                 "prompt": tts_prompt,
                 "response_text": "",
                 "char_count": 0,
@@ -867,20 +892,21 @@ async def _rewrite_report_to_script(
         else:
             raise RuntimeError(str(last_error or "tts rewrite failed after retries"))
 
-        subtitle_script_text = ""
-        for attempt in range(_SCRIPT_REWRITE_MAX_ATTEMPTS):
+        subtitle_script_text = _sanitize_prompt_text((seed_subtitle_script_text or "").strip())
+        for attempt in range(max(1, max_attempts)):
+            use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
             subtitle_prompt = (
-                build_subtitle_from_tts_prompt(tts_script_text=tts_script_text)
-                if attempt == 0
-                else build_subtitle_retry_prompt(
+                build_subtitle_retry_prompt(
                     tts_script_text=tts_script_text,
                     previous_script_text=subtitle_script_text,
                     char_count=_script_char_count(subtitle_script_text),
                 )
+                if use_retry_prompt
+                else build_subtitle_from_tts_prompt(tts_script_text=tts_script_text)
             )
             subtitle_prompt = _sanitize_prompt_text(subtitle_prompt)
             attempt_record = {
-                "attempt": attempt + 1,
+                "attempt": len(prompt_log["rewrite"]["subtitle_attempts"]) + 1,
                 "prompt": subtitle_prompt,
                 "response_text": "",
                 "char_count": 0,
@@ -946,6 +972,8 @@ async def _prepare_report_delivery(
     existing_script_json: object,
     filename: str,
     rewrite_prompt: str,
+    manual_report_retry: bool = False,
+    retry_notifier: Optional[Callable[[int, int, str], Awaitable[None]]] = None,
 ) -> tuple[str, bytes, str, dict]:
     raw_report_text = (raw_report_text or "").strip()
     rewrite_prompt = (rewrite_prompt or "").strip()
@@ -975,49 +1003,104 @@ async def _prepare_report_delivery(
         )
         raise ReportPreparationError("raw report is empty", script_json=merged_script)
 
-    try:
-        subtitle_script_text, tts_script_text = await _rewrite_report_to_script(
-            raw_report_text,
-            rewrite_instruction,
-            prompt_log=prompt_log,
-        )
-        rewrite_status = "success"
-        rewrite_error = ""
-    except Exception as e:
-        logger.exception("[script-rewrite] failed job_id=%s", job_id)
-        prompt_log["rewrite"]["final"]["status"] = "failed"
-        prompt_log["rewrite"]["final"]["error"] = str(e)
-        failure_script = _merge_script_json_with_media_names(
-            existing_script_json,
-            report_filename=filename,
-            notebooklm_report_text=raw_report_text,
-            script_rewrite_prompt=rewrite_instruction,
-            script_rewrite_status="failed",
-            script_rewrite_error=str(e),
-        )
-        _, failure_script = _upload_prompt_log_file(
-            job_id=job_id,
-            log_payload=prompt_log,
-            existing_script_json=failure_script,
-        )
-        raise ReportPreparationError(f"script rewrite failed: {e}", script_json=failure_script) from e
+    total_attempts = _REPORT_SCRIPT_RETRY_MAX_ATTEMPTS if manual_report_retry else 1
+    stage_attempts = 1 if manual_report_retry else _SCRIPT_REWRITE_MAX_ATTEMPTS
+    previous_tts_script_text = ""
+    previous_subtitle_script_text = ""
+    last_error: Exception | None = None
 
-    merged_script = _merge_script_json_with_media_names(
-        existing_script_json,
-        subtitle_script_text=subtitle_script_text,
-        tts_script_text=tts_script_text,
-        report_filename=filename,
-        notebooklm_report_text=raw_report_text,
-        script_rewrite_prompt=rewrite_instruction,
-        script_rewrite_status=rewrite_status,
-        script_rewrite_error=rewrite_error,
-    )
-    _, merged_script = _upload_prompt_log_file(
-        job_id=job_id,
-        log_payload=prompt_log,
-        existing_script_json=merged_script,
-    )
-    return subtitle_script_text, subtitle_script_text.encode("utf-8"), tts_script_text, merged_script
+    for report_attempt_index in range(total_attempts):
+        if report_attempt_index > 0 and retry_notifier is not None and last_error is not None:
+            try:
+                await retry_notifier(report_attempt_index + 1, total_attempts, str(last_error))
+            except Exception as notify_error:
+                logger.warning(
+                    "[script-rewrite] retry notifier failed job_id=%s attempt=%d/%d: %s",
+                    job_id,
+                    report_attempt_index + 1,
+                    total_attempts,
+                    notify_error,
+                )
+
+        report_attempt_record = {
+            "attempt": report_attempt_index + 1,
+            "max_attempts": total_attempts,
+            "status": "pending",
+            "error": "",
+        }
+        prompt_log["rewrite"]["report_attempts"].append(report_attempt_record)
+
+        try:
+            subtitle_script_text, tts_script_text = await _rewrite_report_to_script(
+                raw_report_text,
+                rewrite_instruction,
+                prompt_log=prompt_log,
+                max_attempts=stage_attempts,
+                seed_tts_script_text=previous_tts_script_text,
+                seed_subtitle_script_text=previous_subtitle_script_text,
+            )
+            report_attempt_record["status"] = "success"
+            rewrite_status = "success"
+            rewrite_error = ""
+            merged_script = _merge_script_json_with_media_names(
+                existing_script_json,
+                subtitle_script_text=subtitle_script_text,
+                tts_script_text=tts_script_text,
+                report_filename=filename,
+                notebooklm_report_text=raw_report_text,
+                script_rewrite_prompt=rewrite_instruction,
+                script_rewrite_status=rewrite_status,
+                script_rewrite_error=rewrite_error,
+            )
+            _, merged_script = _upload_prompt_log_file(
+                job_id=job_id,
+                log_payload=prompt_log,
+                existing_script_json=merged_script,
+            )
+            return subtitle_script_text, subtitle_script_text.encode("utf-8"), tts_script_text, merged_script
+        except Exception as e:
+            last_error = e
+            report_attempt_record["status"] = "failed"
+            report_attempt_record["error"] = str(e)
+            previous_tts_script_text = _latest_rewrite_response_text(prompt_log, "tts_attempts") or previous_tts_script_text
+            previous_subtitle_script_text = _latest_rewrite_response_text(prompt_log, "subtitle_attempts") or previous_subtitle_script_text
+            if report_attempt_index + 1 < total_attempts:
+                logger.warning(
+                    "[script-rewrite] retry scheduled job_id=%s attempt=%d/%d error=%s",
+                    job_id,
+                    report_attempt_index + 1,
+                    total_attempts,
+                    e,
+                )
+                continue
+            logger.exception(
+                "[script-rewrite] failed job_id=%s attempts=%d",
+                job_id,
+                report_attempt_index + 1,
+            )
+            failure_detail = (
+                f"after {report_attempt_index + 1} attempts: {e}"
+                if total_attempts > 1
+                else str(e)
+            )
+            prompt_log["rewrite"]["final"]["status"] = "failed"
+            prompt_log["rewrite"]["final"]["error"] = failure_detail
+            failure_script = _merge_script_json_with_media_names(
+                existing_script_json,
+                report_filename=filename,
+                notebooklm_report_text=raw_report_text,
+                script_rewrite_prompt=rewrite_instruction,
+                script_rewrite_status="failed",
+                script_rewrite_error=failure_detail,
+            )
+            _, failure_script = _upload_prompt_log_file(
+                job_id=job_id,
+                log_payload=prompt_log,
+                existing_script_json=failure_script,
+            )
+            raise ReportPreparationError(f"script rewrite failed: {failure_detail}", script_json=failure_script) from e
+
+    raise ReportPreparationError("script rewrite failed: unknown error")
 
 
 def _upload_tts_script_file(
@@ -1911,6 +1994,15 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
 
         report_content = data["report_content"]
         filename = _normalize_report_filename(body.job_id, data.get("filename"), job.get("script_json"))
+        async def _notify_report_retry(attempt: int, max_attempts: int, reason: str) -> None:
+            await _discord_adapter.send_text_message(
+                channel_id,
+                _build_report_retry_notice(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    reason=reason,
+                ),
+            )
         try:
             final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
                 job_id=body.job_id,
@@ -1920,6 +2012,8 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
                 existing_script_json=job.get("script_json"),
                 filename=filename,
                 rewrite_prompt=job.get("concept_text", ""),
+                manual_report_retry=True,
+                retry_notifier=_notify_report_retry,
             )
         except ReportPreparationError as e:
             update_kwargs = {"error_message": str(e)}
@@ -1992,11 +2086,21 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     """n8n WF-06에서 호출 — Discord로 보고서 파일을 전송한다."""
     # 여기서 raw report -> subtitle/tts 스크립트 분리, S3 저장, Discord 전송을 한 번에 마무리한다.
     existing_job = await job_service.get_job(body.job_id)
+    manual_report_retry = existing_job is not None and not _should_skip_auto_report_discord_delivery(existing_job)
     filename = _normalize_report_filename(
         body.job_id,
         body.filename,
         existing_job.get("script_json") if existing_job else None,
     )
+    async def _notify_report_retry(attempt: int, max_attempts: int, reason: str) -> None:
+        await _discord_adapter.send_text_message(
+            body.messenger_channel_id,
+            _build_report_retry_notice(
+                attempt=attempt,
+                max_attempts=max_attempts,
+                reason=reason,
+            ),
+        )
     try:
         final_script_text, file_bytes, tts_script_text, merged_script = await _prepare_report_delivery(
             job_id=body.job_id,
@@ -2006,6 +2110,8 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
             existing_script_json=existing_job.get("script_json") if existing_job else None,
             filename=filename,
             rewrite_prompt=existing_job.get("concept_text", "") if existing_job else "",
+            manual_report_retry=manual_report_retry,
+            retry_notifier=_notify_report_retry if manual_report_retry else None,
         )
     except ReportPreparationError as e:
         update_kwargs = {"error_message": str(e)}
