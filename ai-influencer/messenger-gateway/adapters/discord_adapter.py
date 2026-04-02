@@ -485,7 +485,7 @@ class DiscordAdapter(MessengerAdapter):
                     ],
                 }
             ]
-        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택하세요."
+        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
         suffix = f"\n\n📎 TTS 링크(24시간 유효):\n{audio_url}"
         max_prefix_len = max(0, 1900 - len(suffix))
         if len(prefix) > max_prefix_len:

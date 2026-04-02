@@ -500,10 +500,12 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     parts = custom_id.split(":")
     action = parts[0]
     # video_reject_step: video_reject_step:{job_id}:{step}
-    # tts_approve_standard:   tts_approve_standard:{job_id}
-    # tts_approve_hd:         tts_approve_hd:{job_id}
-    # tts_approve_hd_confirm: tts_approve_hd_confirm:{job_id}
-    # tts_approve_hd_cancel:  tts_approve_hd_cancel:{job_id}
+    # tts_approve_standard:         tts_approve_standard:{job_id}
+    # tts_approve_standard_confirm: tts_approve_standard_confirm:{job_id}
+    # tts_approve_standard_cancel:  tts_approve_standard_cancel:{job_id}
+    # tts_approve_hd:               tts_approve_hd:{job_id}
+    # tts_approve_hd_confirm:       tts_approve_hd_confirm:{job_id}
+    # tts_approve_hd_cancel:        tts_approve_hd_cancel:{job_id}
     # tts_reject:        tts_reject:{job_id}
     # report_to_tts:     report_to_tts:{job_id}
     # report_to_video:         report_to_video:{job_id}
@@ -531,6 +533,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         channel_id_value = ":".join(parts[2:])
     elif action in {
         "tts_approve_standard",
+        "tts_approve_standard_confirm",
+        "tts_approve_standard_cancel",
         "tts_approve_hd",
         "tts_approve_hd_confirm",
         "tts_approve_hd_cancel",
@@ -607,7 +611,20 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
     elif action == "tts_approve_standard":
-        # 일반 승인 -> gateway tts-action -> WF-12(HeyGen) 일반 모드 호출.
+        try:
+            view = _build_button_view(
+                ("✅ 일반 최종 승인", f"tts_approve_standard_confirm:{job_id}", discord.ButtonStyle.primary),
+                ("취소", f"tts_approve_standard_cancel:{job_id}", discord.ButtonStyle.secondary),
+            )
+            await interaction.followup.send(
+                "⚠️ 일반 모드로 영상을 생성합니다. 최종 승인하면 WF-12(HeyGen) 일반 모드를 실행합니다.",
+                ephemeral=True,
+                view=view,
+            )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_approve_standard_confirm":
         try:
             await gateway_call(
                 "/internal/tts-action",
@@ -616,6 +633,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.followup.send("✅ 일반 승인됨. WF-12(HeyGen) 일반 모드 실행 중...", ephemeral=True)
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_approve_standard_cancel":
+        await interaction.followup.send("일반 승인 요청을 취소했습니다.", ephemeral=True)
 
     elif action == "tts_approve_hd":
         try:
@@ -676,7 +696,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 {"job_id": job_id},
             )
             await interaction.followup.send(
-                "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하세요.",
+                "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하고, 최종 확인 후 영상을 생성하세요.",
                 ephemeral=True,
             )
         except Exception as e:

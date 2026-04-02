@@ -351,7 +351,7 @@ def _is_transient_notebooklm_error(err: Exception) -> bool:
 def _default_tts_caption(*, auto_trigger_wf12: bool) -> str:
     if auto_trigger_wf12:
         return "🔊 TTS 완료. 영상 제작 모드로 WF-12(HeyGen)를 자동 실행합니다."
-    return "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택하세요."
+    return "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
 
 
 def _get_subtitle_script_text(script_json: dict) -> str:
@@ -2261,7 +2261,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
     except Exception as e:
         logger.error("[storage] tts upload failed job_id=%s: %s", body.job_id, e)
 
-    caption = body.caption or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택하세요."
+    caption = body.caption or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
     if stored and stored.size_bytes > _discord_attachment_limit_bytes():
         # 큰 파일은 Discord 첨부 대신 presigned link + 버튼 메시지로 전송한다.
         try:
@@ -2632,7 +2632,7 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
         )
         await _discord_adapter.send_text_message(
             channel_id,
-            "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하세요.",
+            "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하고, 최종 확인 후 영상을 생성하세요.",
         )
     except Exception as e:
         logger.error("call_wf11 (report_to_video) failed job_id=%s: %s", body.job_id, e)
