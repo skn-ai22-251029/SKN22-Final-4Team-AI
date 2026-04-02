@@ -394,29 +394,41 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 [IF: 채널 존재 여부 확인]
   ├─[skip=true]──→ 종료
   │
-  └─[유효]──→ [YouTube RSS 조회] (채널별 병렬 처리)
-                https://www.youtube.com/feeds/videos.xml?channel_id={channelId}
-                      │
-                      ▼
-              [새 영상 필터링] 최근 N시간(`WF09_LOOKBACK_HOURS`) 이내 업로드만 추출
-                      │
-                      ▼
-              [IF: 새 영상 존재 여부]
-                ├─[없음]──→ 종료 (해당 채널)
+  └─[유효]──→ [notebooklm-service /notebook-state 조회]
                 │
-                └─[있음]──→ [notebooklm-service /check-and-add-source 호출]
-                              { source_url, source_title, channel_name }
-                                    │
-                                    ▼
-                            [결과 로깅]
-                            중복 건너뜀 / 소스 추가 완료 / 오류
-                                    │
-                    [added=true일 때만 자동 보고서 트리거]
-                                    ▼
-              [gateway /internal/auto-report]
-               - job_id 자동 생성
-               - Discord 전송 채널: DISCORD_ALLOWED_CHANNEL_IDS 첫 번째
-               - WF-06 호출 → 보고서 생성/첨부 전송
+                ▼
+        [IF: active notebook에 기존 source 존재]
+          ├─[있음]──→ 종료
+          │           reason: active notebook already has sources
+          │
+          └─[없음]──→ [YouTube RSS 조회] (채널별 병렬 처리)
+                        https://www.youtube.com/feeds/videos.xml?channel_id={channelId}
+                              │
+                              ▼
+                      [새 영상 필터링]
+                      최근 N시간(`WF09_LOOKBACK_HOURS`) 이내 업로드만 유지
+                              │
+                              ▼
+                      [최신 1개만 선택]
+                              │
+                              ▼
+                      [IF: 선택 결과 존재 여부]
+                        ├─[없음]──→ 종료
+                        │           reason: no recent video within lookback
+                        │
+                        └─[있음]──→ [notebooklm-service /check-and-add-source 호출]
+                                      { source_url, source_title, channel_name }
+                                            │
+                                            ▼
+                                    [결과 로깅]
+                                    소스 추가 완료 / 오류
+                                            │
+                            [added=true일 때만 자동 보고서 트리거]
+                                            ▼
+                      [gateway /internal/auto-report]
+                       - job_id 자동 생성
+                       - Discord 전송 채널: DISCORD_ALLOWED_CHANNEL_IDS 첫 번째
+                       - WF-06 호출 → 보고서 생성/첨부 전송
 ```
 
 ---
@@ -497,7 +509,7 @@ Discord 사용자: /report
 | `WF-05_confirm_handler.json` | Webhook | `POST /webhook/wf-05-confirm` | 승인/수정 분기 및 상태 업데이트 | 승인→WF-11, 수정→WF-01 |
 | `WF-06_notebooklm_report.json` | Webhook | `POST /webhook/wf-06-report` | NotebookLM 보고서 생성 호출, 성공/실패 분기 | 성공→`/internal/send-report`, 실패→`/internal/send-text` |
 | `WF-08_sns_upload.json` | Webhook | `POST /webhook/wf-08-sns-upload` | `PUBLISHING` 전이, SNS 업로드 처리, post 기록 | 완료 알림 + `PUBLISHED` |
-| `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, 채널별 RSS 조회/재시도, 새 영상 필터 | source 추가 성공 시 gateway `/internal/auto-report` → WF-06 |
+| `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, active notebook이 비어 있을 때만 RSS 조회, 최근 시간창 안의 최신 영상 1개만 선택 | source 추가 성공 시에만 gateway `/internal/auto-report` → WF-06 |
 | `WF-10-daily-notebook.json` | Schedule(매일 00:00) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
 | `WF-11_tts_generate.json` | Webhook | `POST /webhook/wf-11-tts-generate` | TTS 생성, WAV 저장, Discord 전송, `audio_url` 저장 | 승인 대기 또는 자동 WF-12 |
 | `WF-12_heygen_generate.json` | Webhook | `POST /webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` | HeyGen 생성/폴링 또는 mock preview 생성 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
@@ -595,7 +607,7 @@ nano .env   # 또는 vi .env
 | `N8N_RUNNERS_TASK_TIMEOUT` | n8n task runner 실행 제한(초) | `1200` |
 | `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
-| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `24` |
+| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간). 빈 active notebook에도 항상 적용됨 | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/wf-11-tts-generate` |
 | `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
