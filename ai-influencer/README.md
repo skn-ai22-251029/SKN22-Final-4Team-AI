@@ -433,10 +433,10 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 ---
 
-### WF-10: 일일 노트북 생성 (매일 자정)
+### WF-10: 일일 노트북 생성 (매일 오전 7시 30분, KST)
 
 ```
-[Schedule Trigger] 매일 00:00 실행
+[Schedule Trigger] 매일 07:30 실행 (Asia/Seoul)
       │
       ▼
 [채널 목록 파싱] TOPIC_CHANNELS 환경변수
@@ -510,7 +510,7 @@ Discord 사용자: /report
 | `WF-06_notebooklm_report.json` | Webhook | `POST /webhook/wf-06-report` | NotebookLM 보고서 생성 호출, 성공/실패 분기 | 성공→`/internal/send-report`, 실패→`/internal/send-text` |
 | `WF-08_sns_upload.json` | Webhook | `POST /webhook/wf-08-sns-upload` | `PUBLISHING` 전이, SNS 업로드 처리, post 기록 | 완료 알림 + `PUBLISHED` |
 | `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, active notebook이 비어 있을 때만 RSS 조회, 최근 시간창 안의 최신 영상 1개만 선택 | source 추가 성공 시에만 gateway `/internal/auto-report` → WF-06 |
-| `WF-10-daily-notebook.json` | Schedule(매일 00:00) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
+| `WF-10-daily-notebook.json` | Schedule(매일 07:30 KST) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
 | `WF-11_tts_generate.json` | Webhook | `POST /webhook/wf-11-tts-generate` | TTS 생성, WAV 저장, Discord 전송, `audio_url` 저장 | 승인 대기 또는 자동 WF-12 |
 | `WF-12_heygen_generate.json` | Webhook | `POST /webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` | HeyGen 생성/폴링 또는 mock preview 생성 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
 
@@ -700,7 +700,7 @@ docker-compose logs -f notebooklm-service
    | `WF-12_heygen_generate.json` | HeyGen 영상 생성 | Webhook |
    | `WF-08_sns_upload.json` | SNS 업로드 | Webhook |
    | `WF-09-youtube-source.json` | YouTube 소스 자동 수집 | 매시간 Schedule |
-   | `WF-10-daily-notebook.json` | 일일 노트북 생성 | 매일 자정 Schedule |
+   | `WF-10-daily-notebook.json` | 일일 노트북 생성 | 매일 07:30 KST Schedule |
 
 3. Webhook 기반 워크플로(WF-01~08): **Postgres 노드** 클릭 → Credentials → `pg-credentials` 선택
 4. 각 워크플로 우상단 **Active 토글 ON** → **Save**
