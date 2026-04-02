@@ -599,7 +599,7 @@ def _extract_supporting_facts(raw_report_text: str) -> list[str]:
 _SCRIPT_MIN_CHARS = 320
 _SCRIPT_MAX_CHARS = 400
 _SCRIPT_REWRITE_MAX_ATTEMPTS = 5
-_REPORT_SCRIPT_RETRY_MAX_ATTEMPTS = 5
+_REPORT_SCRIPT_RETRY_MAX_ATTEMPTS = 15
 
 
 def _script_char_count(script_text: str) -> int:
@@ -1285,7 +1285,9 @@ async def _create_prompt_tts_job(body: ManualGenerateRequest) -> dict:
         subtitle_script_text=normalized_prompt,
         tts_script_text=normalized_prompt,
     )
-    return await job_service.update_job(job_id, script_json=script_json)
+    script_json["raw_prompt_text"] = normalized_prompt
+    script_json["script_source_type"] = "direct_prompt"
+    return await job_service.update_job(job_id, error_message="", script_json=script_json)
 
 
 async def _post_notebooklm_with_retry(
