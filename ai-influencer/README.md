@@ -686,8 +686,9 @@ docker-compose logs -f notebooklm-service
 
 1. 브라우저에서 `http://<서버-퍼블릭-IP>:5678` 접속
 2. `.env`의 `N8N_BASIC_AUTH_USER` / `N8N_BASIC_AUTH_PASSWORD`로 로그인
-3. 좌측 메뉴 **Settings → Credentials → + New Credential → PostgreSQL** 선택
-4. 아래 값 입력 후 **Save** (반드시 이름을 `pg-credentials`로 지정):
+3. `.env`에 `N8N_POSTGRES_CREDENTIAL_NAME=pg-credentials` 확인 (다르게 쓸 경우 해당 이름으로 생성)
+4. 좌측 메뉴 **Settings → Credentials → + New Credential → PostgreSQL** 선택
+5. 아래 값 입력 후 **Save** (이름은 `N8N_POSTGRES_CREDENTIAL_NAME` 값과 동일해야 함):
 
    | 항목 | 값 |
    |------|-----|
@@ -715,7 +716,7 @@ docker-compose logs -f notebooklm-service
    | `WF-09-youtube-source.json` | YouTube 소스 자동 수집 | 매시간 Schedule |
    | `WF-10-daily-notebook.json` | 일일 노트북 생성 | 매일 07:30 KST Schedule |
 
-3. Webhook 기반 워크플로(WF-01~08): **Postgres 노드** 클릭 → Credentials → `pg-credentials` 선택
+3. 수동 재선택은 기본적으로 불필요합니다. 컨테이너 기동 시 `sync_workflows.js`가 `N8N_POSTGRES_CREDENTIAL_NAME` 기준으로 Postgres credential id를 자동 매핑합니다.
 4. 각 워크플로 우상단 **Active 토글 ON** → **Save**
 
 > **워크플로 수정 시 재임포트 방법 (docker 재빌드 불필요):**
