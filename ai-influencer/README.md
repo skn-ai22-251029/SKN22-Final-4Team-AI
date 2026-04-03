@@ -1014,6 +1014,71 @@ PASS 기준:
 - 타겟 계정 IAM Trust/Permission(`sts:AssumeRole`, `s3:PutObject/GetObject`)
 - n8n WF-11 최신 워크플로 재임포트/재기동 여부
 
+### TTS Seed Lab (RunPod 대량 청취 테스트)
+
+RunPod TTS 서버를 그대로 사용하면서, 로컬에서 대량 seed를 생성/청취/평가하기 위한 도구입니다.
+
+준비:
+
+```bash
+cd ai-influencer
+export TTS_API_URL="https://<runpod-url>"
+cp scripts/seed_lab_dataset.example.json scripts/seed_lab_dataset.local.json
+```
+
+Stage-A (기준 스크립트 1개 x 랜덤 seed 100):
+
+```bash
+python3 scripts/seed_lab.py run \
+  --dataset scripts/seed_lab_dataset.local.json \
+  --stage a \
+  --samples 100 \
+  --concurrency 4
+```
+
+빠른 실행( `.env`의 `TTS_API_URL` 자동 사용 ):
+
+```bash
+./scripts/seed_lab_quickstart.sh
+```
+
+옵션:
+- `./scripts/seed_lab_quickstart.sh 100 4 --no-open` : 생성만 하고 브라우저 자동 열기는 비활성화
+
+생성 후:
+- `seed-lab-runs/<run_id>/index.html`을 브라우저로 열어 오디오 청취
+- 점수/메모 입력 후 `평가 Export(JSON)`
+
+Report/Top seed 산출:
+
+```bash
+python3 scripts/seed_lab.py report \
+  --run-dir seed-lab-runs/<run_id> \
+  --eval-json /path/to/exported-eval.json \
+  --top 20 \
+  --prepare-stage-b
+```
+
+산출물:
+- `seed_ranking.csv`, `seed_ranking.json`
+- `top_seeds_stage_b.txt` (상위 20 seed)
+- `env_snippet_top3.txt` (`TTS_FIXED_SEEDS=` 스니펫)
+
+Stage-B (상위 seed x 나머지 2개 스크립트):
+
+```bash
+python3 scripts/seed_lab.py run \
+  --dataset scripts/seed_lab_dataset.local.json \
+  --stage b \
+  --seeds-file seed-lab-runs/<run_id>/top_seeds_stage_b.txt \
+  --concurrency 4
+```
+
+참고:
+- `.yaml` dataset도 가능하지만 로컬 Python에 `PyYAML`이 있어야 합니다.
+- 동일 run 재실행 시 `--resume`을 주면 기존 생성된 오디오는 건너뜁니다.
+- 운영 반영은 사람이 최종 seed를 확정한 뒤 `.env`의 `TTS_FIXED_SEEDS`/`TTS_FIXED_SEEDS_BY_CHANNEL`에 수동 반영합니다.
+
 ### 자동 수집 확인
 
 ```bash
@@ -1037,7 +1102,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | n8n Postgres 연결 실패 | `postgres` 컨테이너 healthy 상태 대기 (`docker-compose ps`) |
 | n8n `$env.*` 접근 거부 | `docker-compose.yml`에 `N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"` 추가 후 재시작 |
 | n8n 환경변수 미반영 | `docker-compose up -d --force-recreate n8n` (재빌드 아닌 재생성) |
-| n8n 워크플로 import 오류 | 기존 워크플로 삭제 후 재임포트. Postgres 크레덴셜 재선택 필수 |
+| n8n 워크플로 import 오류 | `docker-compose logs n8n`에서 `workflow-sync`/credential 매핑 에러 먼저 확인 |
 | n8n `http://IP:5678` 접속 불가 | EC2 보안그룹 인바운드 5678 포트 오픈 확인 |
 | 봇이 모든 채널에서 응답 | `.env`에 `DISCORD_ALLOWED_CHANNEL_IDS` 추가 후 `docker-compose up -d --build discord-bot` |
 | WF-09 "채널 있는 경우만" false | `TOPIC_CHANNELS`가 n8n 컨테이너에 주입됐는지 docker-compose.yml 확인 |
