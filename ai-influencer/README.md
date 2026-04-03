@@ -603,17 +603,25 @@ nano .env   # 또는 vi .env
 | `DISCORD_BOT_TOKEN` | Discord Bot 토큰 | |
 | `DISCORD_ALLOWED_USER_IDS` | 허용 유저 ID (쉼표 구분) | `12345,67890` |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | 허용 채널 ID (쉼표 구분) | `11111,22222` |
+| `AUTO_REPORT_MAX_ATTEMPTS_PER_DAY` | auto-report 일일 최대 시도 횟수(채널+노트북 기준) | `3` |
+| `AUTO_REPORT_STALE_MINUTES` | auto-report 진행중 job stale 판정(분) | `45` |
 | `DISCORD_GUILD_ID` | (선택) 슬래시 명령 즉시 반영용 Guild ID | `123456789012345678` |
 | `N8N_RUNNERS_TASK_TIMEOUT` | n8n task runner 실행 제한(초) | `1200` |
 | `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
+| `N8N_WF01_WEBHOOK_URL` | WF-01 입력 웹훅 URL | `http://n8n:5678/webhook/Mt5nwvystMhfO1nl/webhook/wf-01-input` |
+| `N8N_WF05_WEBHOOK_URL` | WF-05 컨펌 웹훅 URL | `http://n8n:5678/webhook/gD9A0qy9MxY8g0T6/webhook/wf-05-confirm` |
+| `N8N_WF06_WEBHOOK_URL` | WF-06 보고서 웹훅 URL | `http://n8n:5678/webhook/QSrXdaRpKosyZIj3/webhook/wf-06-report` |
+| `N8N_WF08_WEBHOOK_URL` | WF-08 업로드 웹훅 URL | `http://n8n:5678/webhook/uLRW8JT5UitrhCC9/webhook/wf-08-sns-upload` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
 | `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간). 빈 active notebook에도 항상 적용됨 | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
-| `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/wf-11-tts-generate` |
+| `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/Wv5SdSdlPLwNzeqF/webhook/wf-11-tts-generate` |
 | `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
+| `TTS_FIXED_SEEDS` | (선택) 채널 공통 고정 seed 3개(쉼표 구분) | `101,202,303` |
+| `TTS_FIXED_SEEDS_BY_CHANNEL` | (선택) 채널별 고정 seed 3개(JSON) | `{"123456789012345678":[111,222,333]}` |
 | `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
 | `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
 | `HEYGEN_VIDEO_WIDTH` | WF-12 출력 영상 너비 | `1080` |
@@ -631,6 +639,11 @@ nano .env   # 또는 vi .env
 
 기본 경로: WF-11은 앞선 워크플로에서 전달된 `script_text`를 그대로 TTS 입력으로 사용합니다.  
 음색 클론이 필요할 때만 `TTS_REF_AUDIO_PATH` + `TTS_PROMPT_TEXT`를 **둘 다** 설정하세요.
+
+고정 seed를 쓰려면 `TTS_FIXED_SEEDS` 또는 `TTS_FIXED_SEEDS_BY_CHANNEL`을 설정하세요.
+- 형식: 반드시 정수 3개(쉼표 구분), 중복 없음, 범위 `1..2147483647`
+- 우선순위: `TTS_FIXED_SEEDS_BY_CHANNEL` > `TTS_FIXED_SEEDS` > 랜덤
+- 설정값 오류 시 서비스는 중단되지 않고 랜덤 seed 3개로 fallback합니다.
 
 **`TOPIC_CHANNELS` 형식:**
 ```
@@ -1042,6 +1055,8 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST] 종료 요약`(`elapsed/scroll/collect/premature_done/termination_reason`)을 먼저 확인. 조기 `done`은 무시되고 최소 탐색 게이트(시간/스크롤/스텝) 미충족이면 빈목록 성공으로 처리하지 않으며, 이 경우 `다시 조회` 버튼으로 재시도 |
 | `/report`에서 `Looks like Playwright ... install` 또는 브라우저 실행 Traceback | `notebooklm-service` 이미지를 최신으로 재빌드해 Chromium 포함 여부를 반영: `docker-compose build --no-cache notebooklm-service && docker-compose up -d notebooklm-service` |
 | WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |
+| Gateway에서 `http://n8n:5678/webhook/wf-06-report` 404 | n8n 최신 버전은 ID 포함 production webhook을 사용합니다. `N8N_WFxx_WEBHOOK_URL`을 `/webhook/<workflowId>/webhook/<path>` 형태로 수정 후 gateway 재기동 |
+| 아침 노트북에 소스만 있고 보고서가 계속 비어 있음 | WF-09 최신 워크플로 재임포트 후 `결과 로깅` 노드에서 `recovery-no-report` 로그 확인. `AUTO_REPORT_MAX_ATTEMPTS_PER_DAY`, `AUTO_REPORT_STALE_MINUTES` 설정도 점검 |
 | 자동 보고서가 예상 채널이 아닌 곳에 옴 | auto-report는 `DISCORD_ALLOWED_CHANNEL_IDS`의 첫 번째 채널만 사용함. 순서 변경 후 gateway 재기동 필요 |
 | TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
 | CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | `OPENAI_CUA_API_KEY` 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |

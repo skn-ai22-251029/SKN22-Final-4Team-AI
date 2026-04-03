@@ -326,7 +326,7 @@ async def report_command(
         await interaction.followup.send("보고서 요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
 
-@bot.tree.command(name="tts", description="기존 job_id 또는 직접 프롬프트로 WF-11(TTS) 생성을 시작합니다")
+@bot.tree.command(name="tts", description="기존 job_id 또는 직접 프롬프트로 TTS 후보 3개 생성을 시작합니다")
 @app_commands.describe(
     job_id="기존 job_id 또는 앞 8자리. 비우면 최근 job을 자동 선택합니다.",
     prompt="직접 TTS로 만들 대본. 입력 시 새 job을 생성합니다.",
@@ -380,14 +380,14 @@ async def tts_command(
             raise RuntimeError("gateway returned empty job_id")
 
         if normalized_prompt:
-            message = f"🔊 새 대본으로 WF-11(TTS) 시작 요청 완료: `{resolved_job_id[:8]}`"
+            message = f"🔊 새 대본으로 TTS 후보 3개 생성 요청 완료: `{resolved_job_id[:8]}`"
         else:
             picked_latest = not normalized_job_id
             message = (
-                "🔊 WF-11(TTS) 시작 요청 완료 "
+                "🔊 TTS 후보 3개 생성 요청 완료 "
                 f"(자동 선택: 최근 job): `{resolved_job_id[:8]}`"
                 if picked_latest
-                else f"🔊 WF-11(TTS) 시작 요청 완료: `{resolved_job_id[:8]}`"
+                else f"🔊 TTS 후보 3개 생성 요청 완료: `{resolved_job_id[:8]}`"
             )
         await _safe_reply(interaction, message, ephemeral=True)
         logger.info("[/tts] success user=%s resolved_job_id=%s", user_id, resolved_job_id)
@@ -500,12 +500,21 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     parts = custom_id.split(":")
     action = parts[0]
     # video_reject_step: video_reject_step:{job_id}:{step}
+    # video_publish_youtube: video_publish_youtube:{job_id}
+    # video_publish_instagram: video_publish_instagram:{job_id}
+    # video_publish_both: video_publish_both:{job_id}
+    # video_publish_confirm_youtube: video_publish_confirm_youtube:{job_id}
+    # video_publish_confirm_instagram: video_publish_confirm_instagram:{job_id}
+    # video_publish_confirm_both: video_publish_confirm_both:{job_id}
+    # video_publish_cancel: video_publish_cancel:{job_id}
     # tts_approve_standard:         tts_approve_standard:{job_id}
     # tts_approve_standard_confirm: tts_approve_standard_confirm:{job_id}
     # tts_approve_standard_cancel:  tts_approve_standard_cancel:{job_id}
     # tts_approve_hd:               tts_approve_hd:{job_id}
     # tts_approve_hd_confirm:       tts_approve_hd_confirm:{job_id}
     # tts_approve_hd_cancel:        tts_approve_hd_cancel:{job_id}
+    # tts_select:                   tts_select:{job_id}:{batch_id}:{variant_index}
+    # tts_regenerate:               tts_regenerate:{job_id}:{batch_id}
     # tts_reject:        tts_reject:{job_id}
     # report_to_tts:     report_to_tts:{job_id}
     # report_to_video:         report_to_video:{job_id}
@@ -517,6 +526,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     step = None
     report_index = None
     channel_id_value = None
+    batch_id = ""
+    variant_index = None
     # 버튼 종류마다 인코딩된 파라미터 수가 달라서 여기서 먼저 분해한다.
     if action == "video_reject_step" and len(parts) >= 3:
         job_id = parts[1]
@@ -531,6 +542,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "select_channel" and len(parts) >= 3:
         job_id = parts[1]
         channel_id_value = ":".join(parts[2:])
+    elif action == "tts_select" and len(parts) >= 4:
+        job_id = parts[1]
+        batch_id = parts[2]
+        variant_index = int(parts[3])
+    elif action == "tts_regenerate" and len(parts) >= 3:
+        job_id = parts[1]
+        batch_id = parts[2]
     elif action in {
         "tts_approve_standard",
         "tts_approve_standard_confirm",
@@ -539,6 +557,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         "tts_approve_hd_confirm",
         "tts_approve_hd_cancel",
         "tts_reject",
+        "video_publish_youtube",
+        "video_publish_instagram",
+        "video_publish_both",
+        "video_publish_confirm_youtube",
+        "video_publish_confirm_instagram",
+        "video_publish_confirm_both",
+        "video_publish_cancel",
         "report_to_tts",
         "report_to_video",
         "report_to_video_confirm",
@@ -581,11 +606,17 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         await interaction.channel.send("✏️ 어떤 점을 수정할까요? 구체적으로 입력해주세요.")
 
     elif action == "video_approve":
-        # 영상 승인 -> gateway video-action -> WF-08(SNS 업로드) 호출.
         try:
-            await gateway_call(
-                "/internal/video-action",
-                {"job_id": job_id, "action": "approved"},
+            view = _build_button_view(
+                ("📺 유튜브 업로드", f"video_publish_youtube:{job_id}", discord.ButtonStyle.primary),
+                ("📸 인스타 업로드", f"video_publish_instagram:{job_id}", discord.ButtonStyle.primary),
+                ("📺📸 둘 다 업로드", f"video_publish_both:{job_id}", discord.ButtonStyle.success),
+                ("취소", f"video_publish_cancel:{job_id}", discord.ButtonStyle.secondary),
+            )
+            await interaction.followup.send(
+                "업로드할 플랫폼을 선택하세요. 선택 후 한 번 더 최종 확인합니다.",
+                ephemeral=True,
+                view=view,
             )
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
@@ -609,6 +640,52 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             )
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action in {"video_publish_youtube", "video_publish_instagram", "video_publish_both"}:
+        try:
+            if action == "video_publish_youtube":
+                label = "유튜브"
+                confirm_action = "video_publish_confirm_youtube"
+            elif action == "video_publish_instagram":
+                label = "인스타그램"
+                confirm_action = "video_publish_confirm_instagram"
+            else:
+                label = "유튜브 + 인스타그램"
+                confirm_action = "video_publish_confirm_both"
+
+            view = _build_button_view(
+                (f"✅ {label} 최종 승인", f"{confirm_action}:{job_id}", discord.ButtonStyle.danger),
+                ("취소", f"video_publish_cancel:{job_id}", discord.ButtonStyle.secondary),
+            )
+            await interaction.followup.send(
+                f"⚠️ {label} 업로드를 시작합니다. 최종 승인하면 WF-08 SNS 업로드를 실행합니다.",
+                ephemeral=True,
+                view=view,
+            )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action in {"video_publish_confirm_youtube", "video_publish_confirm_instagram", "video_publish_confirm_both"}:
+        try:
+            if action == "video_publish_confirm_youtube":
+                targets = ["youtube"]
+                label = "유튜브"
+            elif action == "video_publish_confirm_instagram":
+                targets = ["instagram"]
+                label = "인스타그램"
+            else:
+                targets = ["youtube", "instagram"]
+                label = "유튜브 + 인스타그램"
+            await gateway_call(
+                "/internal/video-action",
+                {"job_id": job_id, "action": "approved", "targets": targets},
+            )
+            await interaction.followup.send(f"✅ {label} 업로드를 시작합니다. WF-08 실행 중...", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "video_publish_cancel":
+        await interaction.followup.send("SNS 업로드 요청을 취소했습니다.", ephemeral=True)
 
     elif action == "tts_approve_standard":
         try:
@@ -664,6 +741,38 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "tts_approve_hd_cancel":
         await interaction.followup.send("고화질 승인 요청을 취소했습니다.", ephemeral=True)
 
+    elif action == "tts_select":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {
+                    "job_id": job_id,
+                    "action": "select_variant",
+                    "batch_id": batch_id,
+                    "variant_index": variant_index,
+                },
+            )
+            await interaction.followup.send(
+                f"✅ TTS 후보 {int(variant_index) + 1}번을 선택했습니다. 다음 단계 버튼을 확인하세요.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_regenerate":
+        try:
+            await gateway_call(
+                "/internal/tts-action",
+                {
+                    "job_id": job_id,
+                    "action": "regenerate_batch",
+                    "batch_id": batch_id,
+                },
+            )
+            await interaction.followup.send("🔁 TTS 후보 3개를 다시 생성합니다.", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
     elif action == "tts_reject":
         # TTS 반려는 job을 대본 승인 상태로 되돌려 수동 재생성을 가능하게 한다.
         try:
@@ -696,7 +805,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 {"job_id": job_id},
             )
             await interaction.followup.send(
-                "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하고, 최종 확인 후 영상을 생성하세요.",
+                "🎬 영상 제작 준비를 시작합니다. TTS 후보 3개 중 하나를 선택한 뒤 일반 승인 또는 고화질 승인을 선택하고, 최종 확인 후 영상을 생성하세요.",
                 ephemeral=True,
             )
         except Exception as e:

@@ -14,15 +14,17 @@ class Settings(BaseSettings):
     discord_bot_token: str = ""
     discord_allowed_channel_ids: str = ""
     auto_report_discord_delivery_enabled: bool = False
+    auto_report_max_attempts_per_day: int = 3
+    auto_report_stale_minutes: int = 45
     openai_api_key: str = ""
     script_rewrite_model: str = "gpt-5.4"
 
-    n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/wf-01-input"
-    n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/wf-05-confirm"
-    n8n_wf06_webhook_url: str = "http://n8n:5678/webhook/wf-06-report"
-    n8n_wf11_webhook_url: str = "http://n8n:5678/webhook/wf-11-tts-generate"
+    n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/Mt5nwvystMhfO1nl/webhook/wf-01-input"
+    n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/gD9A0qy9MxY8g0T6/webhook/wf-05-confirm"
+    n8n_wf06_webhook_url: str = "http://n8n:5678/webhook/QSrXdaRpKosyZIj3/webhook/wf-06-report"
+    n8n_wf11_webhook_url: str = "http://n8n:5678/webhook/Wv5SdSdlPLwNzeqF/webhook/wf-11-tts-generate"
     n8n_wf12_webhook_url: str = "http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2"
-    n8n_wf08_webhook_url: str = "http://n8n:5678/webhook/wf-08-sns-upload"
+    n8n_wf08_webhook_url: str = "http://n8n:5678/webhook/uLRW8JT5UitrhCC9/webhook/wf-08-sns-upload"
 
     notebooklm_service_url: str = "http://notebooklm-service:8090"
     topic_channels: str = ""
@@ -35,6 +37,8 @@ class Settings(BaseSettings):
     tts_sample_steps: int = 32
     tts_super_sampling: bool = True
     tts_fragment_interval: float = 0.4
+    tts_fixed_seeds: str = ""
+    tts_fixed_seeds_by_channel: str = ""
     heygen_api_key: str = ""
     heygen_avatar_id: str = ""
     heygen_api_base_url: str = "https://api.heygen.com"

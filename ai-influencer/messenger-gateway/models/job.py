@@ -14,6 +14,8 @@ class JobStatus(str, Enum):
     WAITING_VIDEO_APPROVAL = "WAITING_VIDEO_APPROVAL"
     PUBLISHING = "PUBLISHING"
     PUBLISHED = "PUBLISHED"
+    PARTIALLY_PUBLISHED = "PARTIALLY_PUBLISHED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
     ANALYTICS_COLLECTED = "ANALYTICS_COLLECTED"
     FAILED = "FAILED"
 
@@ -99,14 +101,17 @@ class SendAudioRequest(BaseModel):
 
 class TtsActionRequest(BaseModel):
     job_id: str
-    action: str  # "approve_standard" | "approve_hd" | "reject"
+    action: str  # "select_variant" | "regenerate_batch" | "approve_standard" | "approve_hd" | "reject"
     use_avatar_iv_model: bool = False
+    batch_id: str = ""
+    variant_index: Optional[int] = None
 
 
 class VideoActionRequest(BaseModel):
     job_id: str
     action: str  # "approved" | "reject_select" | "reject_step"
     step: Optional[str] = None  # "script" | "tts" | "draft"
+    targets: list[str] = []
 
 
 class ReportToVideoRequest(BaseModel):

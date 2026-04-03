@@ -5,7 +5,7 @@ import json
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Awaitable, Callable, Optional
 
 import httpx
@@ -64,6 +64,7 @@ _http_client: Optional[httpx.AsyncClient] = None
 _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 _HEYGEN_REQUEST_TIMEOUT_SECONDS = 30.0
+_TTS_VARIANT_COUNT = 3
 
 
 def _extract_valid_basename(job_id: str, filename: object) -> Optional[str]:
@@ -121,6 +122,12 @@ def _normalize_audio_filename(
     existing_script_json: object = None,
 ) -> str:
     return _normalize_filename(job_id, "wav", candidate, existing_script_json)
+
+
+def _build_tts_variant_filename(job_id: str, variant_index: int) -> str:
+    base_filename = build_filename(job_id, "wav")
+    stem, ext = base_filename.rsplit(".", 1)
+    return f"{stem}-v{variant_index + 1}.{ext}"
 
 
 def _normalize_video_filename(
@@ -357,6 +364,120 @@ def _default_tts_caption(*, auto_trigger_wf12: bool) -> str:
     return "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
 
 
+def _next_tts_batch_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _build_random_tts_variant_seeds() -> list[int]:
+    seeds: list[int] = []
+    while len(seeds) < _TTS_VARIANT_COUNT:
+        seed = (uuid.uuid4().int % 2_147_483_647) or len(seeds) + 1
+        if seed not in seeds:
+            seeds.append(seed)
+    return seeds
+
+
+def _parse_tts_seed_list(raw_value: object, *, source_name: str) -> list[int]:
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+    elif isinstance(raw_value, (list, tuple)):
+        tokens = list(raw_value)
+    else:
+        raise ValueError(f"{source_name}: unsupported type={type(raw_value).__name__}")
+
+    if len(tokens) != _TTS_VARIANT_COUNT:
+        raise ValueError(f"{source_name}: expected {_TTS_VARIANT_COUNT} seeds, got {len(tokens)}")
+
+    seeds: list[int] = []
+    for idx, token in enumerate(tokens):
+        try:
+            seed = int(str(token).strip())
+        except Exception as e:
+            raise ValueError(f"{source_name}: invalid int at index={idx}") from e
+        if seed <= 0 or seed > 2_147_483_647:
+            raise ValueError(f"{source_name}: out of range seed={seed} index={idx}")
+        if seed in seeds:
+            raise ValueError(f"{source_name}: duplicate seed={seed}")
+        seeds.append(seed)
+    return seeds
+
+
+def _resolve_tts_variant_seeds(channel_id: str) -> tuple[list[int], str]:
+    had_invalid_config = False
+
+    by_channel_raw = (settings.tts_fixed_seeds_by_channel or "").strip()
+    if by_channel_raw:
+        try:
+            mapping = json.loads(by_channel_raw)
+            if not isinstance(mapping, dict):
+                raise ValueError("must be a JSON object")
+            if channel_id in mapping:
+                try:
+                    return _parse_tts_seed_list(
+                        mapping.get(channel_id),
+                        source_name=f"TTS_FIXED_SEEDS_BY_CHANNEL[{channel_id}]",
+                    ), "fixed_by_channel"
+                except Exception as e:
+                    had_invalid_config = True
+                    logger.warning("[tts-seed] invalid channel seed config channel_id=%s err=%s", channel_id, e)
+        except Exception as e:
+            had_invalid_config = True
+            logger.warning("[tts-seed] invalid TTS_FIXED_SEEDS_BY_CHANNEL config err=%s", e)
+
+    default_raw = (settings.tts_fixed_seeds or "").strip()
+    if default_raw:
+        try:
+            return _parse_tts_seed_list(default_raw, source_name="TTS_FIXED_SEEDS"), "fixed_default"
+        except Exception as e:
+            had_invalid_config = True
+            logger.warning("[tts-seed] invalid TTS_FIXED_SEEDS config err=%s", e)
+
+    return _build_random_tts_variant_seeds(), ("random_fallback" if had_invalid_config else "random")
+
+
+def _get_tts_variants(script_json: dict) -> list[dict]:
+    variants = script_json.get("tts_variants")
+    if not isinstance(variants, list):
+        return []
+    result: list[dict] = []
+    for item in variants:
+        if isinstance(item, dict):
+            result.append(dict(item))
+    return result
+
+
+def _clear_tts_variant_metadata(script_json: dict) -> dict:
+    merged = _as_script_json(script_json)
+    for key in (
+        "tts_variants",
+        "active_tts_batch_id",
+        "selected_tts_variant_index",
+        "selected_tts_seed",
+        "tts_variant_control_message_id",
+        "tts_variant_action_message_id",
+        "tts_downstream_intent",
+        "tts_seed_strategy",
+        "tts_seed_values",
+    ):
+        merged.pop(key, None)
+    media_names = merged.get("media_names")
+    if isinstance(media_names, dict):
+        media_names.pop("audio_filename", None)
+        if media_names:
+            merged["media_names"] = media_names
+        else:
+            merged.pop("media_names", None)
+    return merged
+
+
+def _get_tts_downstream_intent(script_json: dict) -> str:
+    intent = str(script_json.get("tts_downstream_intent") or "").strip()
+    return intent or "tts_only"
+
+
 def _get_subtitle_script_text(script_json: dict) -> str:
     return (
         script_json.get("subtitle_script_text")
@@ -382,6 +503,48 @@ def _get_job_avatar_override(script_json: dict) -> str:
         or script_json.get("avatar_id")
         or ""
     ).strip()
+
+
+def _normalize_publish_targets(raw_targets: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for raw_target in raw_targets:
+        target = str(raw_target or "").strip().lower()
+        if not target or target in normalized:
+            continue
+        if target not in {"youtube", "instagram"}:
+            raise HTTPException(status_code=400, detail=f"unsupported publish target: {target}")
+        normalized.append(target)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="at least one publish target is required")
+    return normalized
+
+
+def _build_publish_title(job_id: str, video_filename: str, subtitle_script_text: str, concept_text: str) -> str:
+    lines = [line.strip() for line in subtitle_script_text.splitlines() if line.strip()]
+    title_candidate = ""
+    for idx, line in enumerate(lines):
+        if line.startswith(SUBTITLE_SCRIPT_OPENING_LINE):
+            if idx + 1 < len(lines):
+                title_candidate = lines[idx + 1]
+            continue
+        title_candidate = line
+        break
+    if not title_candidate:
+        title_candidate = (concept_text or "").strip()
+    if not title_candidate:
+        title_candidate = re.sub(r"\.mp4$", "", video_filename or "", flags=re.IGNORECASE).strip()
+    if not title_candidate:
+        title_candidate = f"Hari {job_id[:8]}"
+    normalized = re.sub(r"\s+", " ", title_candidate).strip()
+    return normalized[:95].rstrip()
+
+
+def _build_publish_description(subtitle_script_text: str) -> str:
+    return subtitle_script_text.strip()[:4500]
+
+
+def _build_publish_caption(subtitle_script_text: str) -> str:
+    return subtitle_script_text.strip()[:2200]
 
 
 async def _persist_job_avatar_override(job_id: str, existing_script_json: object, avatar_id: str) -> dict:
@@ -615,7 +778,7 @@ def _sanitize_prompt_text(text: str) -> str:
     return sanitized.encode("utf-8", "ignore").decode("utf-8")
 
 
-def _build_tts_request_body(script_text: str) -> dict:
+def _build_tts_request_body(script_text: str, *, seed: Optional[int] = None) -> dict:
     cleaned_script_text = (script_text or "").strip()
     if not cleaned_script_text:
         raise RuntimeError("script_text is required")
@@ -639,6 +802,8 @@ def _build_tts_request_body(script_text: str) -> dict:
             raise RuntimeError("TTS_REF_AUDIO_PATH와 TTS_PROMPT_TEXT는 함께 설정해야 합니다.")
         tts_body["ref_audio_path"] = ref_audio_path
         tts_body["prompt_text"] = prompt_text
+    if seed is not None:
+        tts_body["seed"] = int(seed)
 
     return tts_body
 
@@ -1155,14 +1320,128 @@ def _upload_tts_script_file(
     return stored, merged_script
 
 
-async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[str, str]:
-    # gateway가 직접 TTS API를 호출해 WAV 바이트를 받아오고,
-    # 이후 Discord/S3 저장은 send_audio 엔드포인트에 위임한다.
+def _build_tts_variant_caption(variant_index: int, seed: Optional[int]) -> str:
+    seed_text = f" (seed={seed})" if seed is not None else ""
+    return (
+        f"🔊 TTS 후보 {variant_index + 1}/{_TTS_VARIANT_COUNT}{seed_text}입니다.\n"
+        "마음에 들면 아래 버튼으로 이 버전을 선택하세요."
+    )
+
+
+def _build_tts_variant_control_caption(
+    *,
+    success_count: int,
+    failure_count: int,
+    downstream_intent: str,
+    seed_strategy: str,
+    seeds: list[int],
+) -> str:
+    base = [f"🔊 TTS 후보 생성 완료: {success_count}/{_TTS_VARIANT_COUNT}개 성공"]
+    if seeds:
+        base.append(f"seed 전략: {seed_strategy} / seed={', '.join(str(seed) for seed in seeds)}")
+    if failure_count:
+        base.append(f"실패: {failure_count}개")
+    if downstream_intent == "video_prepare":
+        base.append("원하는 후보를 선택한 뒤 일반 승인 또는 고화질 승인을 진행하면 영상 생성으로 이어집니다.")
+    else:
+        base.append("원하는 후보를 선택한 뒤 일반 승인 또는 고화질 승인을 진행하세요.")
+    base.append("마음에 들지 않으면 `다시 생성`으로 새 후보 3개를 만들 수 있습니다.")
+    return "\n".join(base)
+
+
+def _build_selected_tts_caption(*, downstream_intent: str, variant_index: int, selected_seed: Optional[int]) -> str:
+    seed_text = f"(seed={selected_seed}) " if selected_seed is not None else ""
+    if downstream_intent == "video_prepare":
+        return (
+            f"✅ {seed_text}TTS 후보 {variant_index + 1}번을 선택했습니다.\n"
+            "이제 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
+        )
+    return (
+        f"✅ {seed_text}TTS 후보 {variant_index + 1}번을 선택했습니다.\n"
+        "아래에서 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
+    )
+
+
+async def _disable_tts_variant_buttons(channel_id: str, script_json: dict) -> None:
+    message_ids: list[str] = []
+    control_message_id = str(script_json.get("tts_variant_control_message_id") or "").strip()
+    if control_message_id:
+        message_ids.append(control_message_id)
+    for variant in _get_tts_variants(script_json):
+        message_id = str(variant.get("discord_message_id") or "").strip()
+        if message_id:
+            message_ids.append(message_id)
+    for message_id in message_ids:
+        try:
+            await _discord_adapter.clear_message_components(channel_id, message_id)
+        except Exception as e:
+            logger.warning("[discord] clear tts variant buttons failed channel=%s message_id=%s err=%s", channel_id, message_id, e)
+
+
+async def _store_and_send_tts_variant(
+    *,
+    job_id: str,
+    channel_id: str,
+    batch_id: str,
+    variant_index: int,
+    seed: Optional[int],
+    audio_bytes: bytes,
+) -> dict:
+    filename = _build_tts_variant_filename(job_id, variant_index)
+    stored = None
+    try:
+        stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_tts,
+            filename=filename,
+            content=audio_bytes,
+            content_type="audio/wav",
+        )
+    except Exception as e:
+        logger.error("[storage] tts variant upload failed job_id=%s variant=%s: %s", job_id, variant_index, e)
+
+    caption = _build_tts_variant_caption(variant_index, seed)
+    delivery_url = ""
+    if stored and stored.size_bytes > _discord_attachment_limit_bytes():
+        message_id = await _discord_adapter.send_tts_variant_link_message(
+            channel_id=channel_id,
+            job_id=job_id,
+            batch_id=batch_id,
+            variant_index=variant_index,
+            caption=caption,
+            audio_url=stored.presigned_url,
+        )
+        delivery_url = stored.presigned_url
+    else:
+        if stored is None and len(audio_bytes) > _discord_attachment_limit_bytes():
+            raise RuntimeError("TTS upload failed and audio exceeds Discord attachment size limit")
+        message_id, attachment_url = await _discord_adapter.send_tts_variant_audio_message(
+            channel_id=channel_id,
+            job_id=job_id,
+            batch_id=batch_id,
+            variant_index=variant_index,
+            caption=caption,
+            audio_bytes=audio_bytes,
+            filename=filename,
+        )
+        delivery_url = attachment_url or (stored.presigned_url if stored else "")
+
+    return {
+        "variant_index": variant_index,
+        "filename": filename,
+        "s3_uri": stored.s3_uri if stored else "",
+        "attachment_or_presigned_url": delivery_url,
+        "discord_message_id": message_id,
+        "status": "ready",
+    }
+
+
+async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Optional[int] = None) -> bytes:
+    # gateway가 직접 TTS API를 호출해 WAV 바이트를 받아온다.
     tts_api_url = settings.tts_api_url.strip()
     if not tts_api_url:
         raise RuntimeError("TTS_API_URL is not configured")
 
-    tts_body = _build_tts_request_body(script_text)
+    tts_body = _build_tts_request_body(script_text, seed=seed)
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         endpoint = tts_api_url if tts_api_url.rstrip("/").endswith("/tts") else f"{tts_api_url.rstrip('/')}/tts"
@@ -1173,10 +1452,7 @@ async def _generate_tts_audio_content(job_id: str, script_text: str) -> tuple[st
         )
         if not resp.is_success:
             raise RuntimeError(_format_tts_api_error(resp.status_code, resp.text))
-        audio_b64 = base64.b64encode(resp.content).decode("ascii")
-
-    filename = _normalize_audio_filename(job_id, None, None)
-    return audio_b64, filename
+        return resp.content
 
 
 async def _run_tts_generation(
@@ -1185,53 +1461,105 @@ async def _run_tts_generation(
     script_text: str,
     channel_id: str,
     user_id: str,
-    auto_trigger_wf12: bool,
+    downstream_intent: str,
 ) -> None:
     try:
-        # 1) TTS 생성 2) Discord/S3 저장 3) 필요 시 WF-12 자동 트리거 순서로 진행한다.
+        # 1) 같은 대본으로 TTS 후보 3개를 순차 생성 2) Discord/S3 저장 3) 사용자가 1개를 선택한 뒤 승인 단계로 이동한다.
         await job_service.transition_status(job_id, "GENERATING")
-        audio_b64, filename = await _generate_tts_audio_content(job_id, script_text)
-        send_result = await send_audio(
-            None,
-            SendAudioRequest(
-                messenger_source=MessengerSource.DISCORD,
-                messenger_channel_id=channel_id,
-                job_id=job_id,
-                audio_content_b64=audio_b64,
-                audio_file_path="",
-                filename=filename,
-                caption=_default_tts_caption(auto_trigger_wf12=auto_trigger_wf12),
-                include_wf12_button=not auto_trigger_wf12,
+        current_job = await job_service.get_job(job_id)
+        cleaned_script = _clear_tts_variant_metadata(current_job.get("script_json") if current_job else {})
+        await job_service.update_job(
+            job_id,
+            audio_url="",
+            final_url="",
+            error_message="",
+            script_json=_merge_script_json_with_media_names(
+                cleaned_script,
+                audio_filename="",
+                tts_error_type="",
+                tts_error_detail="",
             ),
         )
-        await job_service.transition_status(job_id, "APPROVED")
-        current_job = await job_service.get_job(job_id)
-        cleared_script = _merge_script_json_with_media_names(
-            current_job.get("script_json") if current_job else None,
+        batch_id = _next_tts_batch_id()
+        seeds, seed_strategy = _resolve_tts_variant_seeds(channel_id)
+        logger.info(
+            "[tts-seed] resolved channel_id=%s strategy=%s seeds=%s",
+            channel_id,
+            seed_strategy,
+            ",".join(str(seed) for seed in seeds),
+        )
+        variants: list[dict] = []
+        success_count = 0
+        failure_count = 0
+        for variant_index, seed in enumerate(seeds):
+            try:
+                audio_bytes = await _generate_tts_audio_content(job_id, script_text, seed=seed)
+                variant_info = await _store_and_send_tts_variant(
+                    job_id=job_id,
+                    channel_id=channel_id,
+                    batch_id=batch_id,
+                    variant_index=variant_index,
+                    seed=seed,
+                    audio_bytes=audio_bytes,
+                )
+                variant_info["seed"] = seed
+                variants.append(variant_info)
+                success_count += 1
+            except Exception as e:
+                logger.exception("[tts-direct] variant failed job_id=%s batch_id=%s variant=%s", job_id, batch_id, variant_index)
+                variants.append(
+                    {
+                        "variant_index": variant_index,
+                        "seed": seed,
+                        "filename": _build_tts_variant_filename(job_id, variant_index),
+                        "s3_uri": "",
+                        "attachment_or_presigned_url": "",
+                        "discord_message_id": "",
+                        "status": "failed",
+                        "error": str(e)[:500],
+                    }
+                )
+                failure_count += 1
+
+        if success_count == 0:
+            raise RuntimeError("TTS 후보 3개 생성이 모두 실패했습니다.")
+
+        control_message_id = await _discord_adapter.send_tts_variant_control_message(
+            channel_id=channel_id,
+            job_id=job_id,
+            batch_id=batch_id,
+            caption=_build_tts_variant_control_caption(
+                success_count=success_count,
+                failure_count=failure_count,
+                downstream_intent=downstream_intent,
+                seed_strategy=seed_strategy,
+                seeds=seeds,
+            ),
+        )
+
+        latest_job = await job_service.get_job(job_id)
+        merged_script = _merge_script_json_with_media_names(
+            _clear_tts_variant_metadata(latest_job.get("script_json") if latest_job else {}),
             tts_error_type="",
             tts_error_detail="",
         )
-        await job_service.update_job(job_id, error_message="", script_json=cleared_script)
-
-        if auto_trigger_wf12:
-            # report_to_video 경로는 TTS 승인 버튼을 기다리지 않고
-            # 생성된 audio_url을 바로 WF-12 입력으로 넘긴다.
-            job = await job_service.get_job(job_id)
-            if job is None:
-                raise RuntimeError(f"Job not found while resolving HeyGen avatar: {job_id}")
-            resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
-            approved_audio_url = str(send_result.get("audio_url") or "").strip()
-            if not approved_audio_url:
-                raise RuntimeError("Generated TTS audio_url is empty")
-            await n8n_service.call_wf12_heygen_generate(
-                job_id,
-                channel_id,
-                user_id,
-                audio_url=approved_audio_url,
-                avatar_id=resolved_avatar_id,
-                use_avatar_iv_model=False,
-            )
-            logger.info("[heygen-avatar] auto wf12 avatar source=%s job_id=%s", avatar_source, job_id)
+        merged_script["tts_variants"] = variants
+        merged_script["active_tts_batch_id"] = batch_id
+        merged_script["selected_tts_variant_index"] = None
+        merged_script["tts_variant_control_message_id"] = control_message_id
+        merged_script["tts_variant_action_message_id"] = ""
+        merged_script["tts_downstream_intent"] = downstream_intent
+        merged_script["tts_seed_strategy"] = seed_strategy
+        merged_script["tts_seed_values"] = [int(seed) for seed in seeds]
+        merged_script["selected_tts_seed"] = None
+        await job_service.update_job(
+            job_id,
+            audio_url="",
+            final_url="",
+            error_message="",
+            script_json=merged_script,
+        )
+        await job_service.transition_status(job_id, "APPROVED")
     except Exception as e:
         logger.exception("[tts-direct] failed job_id=%s: %r", job_id, e)
         error_text = str(e)
@@ -1263,7 +1591,7 @@ def _spawn_tts_generation(
     script_text: str,
     channel_id: str,
     user_id: str,
-    auto_trigger_wf12: bool,
+    downstream_intent: str,
 ) -> None:
     # slash command/버튼 응답을 오래 붙잡지 않기 위해
     # 실제 TTS 생성은 background task로 분리한다.
@@ -1273,7 +1601,7 @@ def _spawn_tts_generation(
             script_text=script_text,
             channel_id=channel_id,
             user_id=user_id,
-            auto_trigger_wf12=auto_trigger_wf12,
+            downstream_intent=downstream_intent,
         )
     )
 
@@ -1488,6 +1816,32 @@ def _build_auto_report_prompt(body: AutoReportRequest) -> str:
         segments.append(f"최신 참고 영상 URL: {body.source_url}.")
     segments.append("위 최신 소스를 참고해 오늘 업로드 흐름에 맞는 대사를 작성한다.")
     return " ".join(segments)
+
+
+def _coerce_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _is_auto_report_job_stale(job: dict, stale_minutes: int) -> bool:
+    updated_at = _coerce_datetime(job.get("updated_at")) or _coerce_datetime(job.get("created_at"))
+    if updated_at is None:
+        return False
+    return updated_at < (datetime.now(timezone.utc) - timedelta(minutes=max(1, stale_minutes)))
 
 
 def _should_skip_auto_report_discord_delivery(job: dict | None) -> bool:
@@ -1711,28 +2065,113 @@ async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
             "notebook_url": notebook_url,
         }
 
-    existing_auto_job = await job_service.find_existing_auto_report_job(
-        channel_id=body.channel_id,
-        notebook_url=notebook_url,
-    )
-    if existing_auto_job is not None:
+    source_url = (body.source_url or str(notebook_state.get("latest_source_url") or "")).strip()
+    source_title = (body.source_title or str(notebook_state.get("latest_source_title") or "")).strip()
+    if not source_url:
         logger.info(
-            "[auto-report] skip channel=%s notebook=%s reason=existing-job job_id=%s status=%s",
+            "[auto-report] skip channel=%s notebook=%s reason=missing-latest-source",
             body.channel_id,
             notebook_url,
-            existing_auto_job["id"],
-            existing_auto_job.get("status", ""),
         )
         return {
             "status": "skipped",
-            "reason": "existing-job",
-            "job_id": existing_auto_job["id"],
-            "job_status": existing_auto_job.get("status", ""),
+            "reason": "missing-latest-source",
+            "notebook_url": notebook_url,
+        }
+
+    stale_minutes = max(1, int(settings.auto_report_stale_minutes))
+    max_attempts_per_day = max(1, int(settings.auto_report_max_attempts_per_day))
+    in_progress_statuses = {
+        "DRAFT",
+        "SCRIPTING",
+        "GENERATING",
+        "WAITING_APPROVAL",
+        "REVISION_REQUESTED",
+        "APPROVED",
+        "WAITING_VIDEO_APPROVAL",
+        "PUBLISHING",
+    }
+
+    latest_auto_job = await job_service.get_latest_auto_report_job(
+        channel_id=body.channel_id,
+        notebook_url=notebook_url,
+    )
+    if latest_auto_job is not None:
+        latest_status = str(latest_auto_job.get("status") or "").strip().upper()
+        if latest_status in in_progress_statuses:
+            if _is_auto_report_job_stale(latest_auto_job, stale_minutes):
+                stale_reason = (
+                    f"auto-report stale timeout: {stale_minutes}m "
+                    f"(prev_job={latest_auto_job['id']}, prev_status={latest_status})"
+                )
+                await job_service.transition_status(latest_auto_job["id"], "FAILED")
+                await job_service.update_job(latest_auto_job["id"], error_message=stale_reason)
+                logger.warning(
+                    "[auto-report] stale job failed channel=%s notebook=%s prev_job=%s prev_status=%s",
+                    body.channel_id,
+                    notebook_url,
+                    latest_auto_job["id"],
+                    latest_status,
+                )
+            else:
+                logger.info(
+                    "[auto-report] skip channel=%s notebook=%s reason=in-progress job_id=%s status=%s",
+                    body.channel_id,
+                    notebook_url,
+                    latest_auto_job["id"],
+                    latest_status,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "in-progress",
+                    "job_id": latest_auto_job["id"],
+                    "job_status": latest_status,
+                    "notebook_url": notebook_url,
+                }
+        elif latest_status == "PUBLISHED":
+            logger.info(
+                "[auto-report] skip channel=%s notebook=%s reason=already-published job_id=%s",
+                body.channel_id,
+                notebook_url,
+                latest_auto_job["id"],
+            )
+            return {
+                "status": "skipped",
+                "reason": "already-published",
+                "job_id": latest_auto_job["id"],
+                "job_status": latest_status,
+                "notebook_url": notebook_url,
+            }
+
+    attempts_today = await job_service.count_auto_report_attempts_today(
+        channel_id=body.channel_id,
+        notebook_url=notebook_url,
+    )
+    if attempts_today >= max_attempts_per_day:
+        logger.info(
+            "[auto-report] skip channel=%s notebook=%s reason=daily-limit attempts=%s/%s",
+            body.channel_id,
+            notebook_url,
+            attempts_today,
+            max_attempts_per_day,
+        )
+        return {
+            "status": "skipped",
+            "reason": "daily-limit",
+            "attempts_today": attempts_today,
+            "max_attempts_per_day": max_attempts_per_day,
             "notebook_url": notebook_url,
         }
 
     target_channel_id = _get_primary_discord_channel_id()
-    prompt = _build_auto_report_prompt(body)
+    prompt = _build_auto_report_prompt(
+        AutoReportRequest(
+            channel_id=body.channel_id,
+            channel_name=body.channel_name,
+            source_url=source_url,
+            source_title=source_title,
+        )
+    )
     job_id = str(uuid.uuid4())
 
     report_body = ReportMessageRequest(
@@ -1752,25 +2191,31 @@ async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
         script_json={
             "auto_report_channel_id": body.channel_id,
             "auto_report_notebook_url": notebook_url,
-            "auto_report_source_url": body.source_url,
-            "auto_report_source_title": body.source_title,
+            "auto_report_source_url": source_url,
+            "auto_report_source_title": source_title,
         },
     )
-    wf06_ok = await _call_wf06(report_body, raise_on_error=True)
-    if not wf06_ok:
-        raise HTTPException(status_code=500, detail="WF-06 trigger failed")
+    try:
+        wf06_ok = await _call_wf06(report_body, raise_on_error=True)
+        if not wf06_ok:
+            raise HTTPException(status_code=500, detail="WF-06 trigger failed")
+    except Exception as e:
+        await job_service.transition_status(job_id, "FAILED")
+        await job_service.update_job(job_id, error_message=f"WF-06 trigger failed: {e}")
+        raise
     logger.info(
         "[auto-report] triggered job_id=%s discord_channel=%s youtube_channel=%s source=%s",
         job_id,
         target_channel_id,
         body.channel_id,
-        body.source_url,
+        source_url,
     )
     return {
         "status": "triggered",
         "job_id": job_id,
         "messenger_channel_id": target_channel_id,
         "youtube_channel_id": body.channel_id,
+        "attempts_today": attempts_today + 1,
     }
 
 
@@ -2349,6 +2794,125 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
 
     channel_id = job["messenger_channel_id"]
     user_id = job["messenger_user_id"]
+    script_json = _as_script_json(job.get("script_json"))
+
+    if body.action == "select_variant":
+        active_batch_id = str(script_json.get("active_tts_batch_id") or "").strip()
+        if not body.batch_id:
+            raise HTTPException(status_code=400, detail="batch_id is required")
+        if active_batch_id != body.batch_id:
+            raise HTTPException(status_code=409, detail="stale tts batch")
+        if body.variant_index is None or body.variant_index < 0:
+            raise HTTPException(status_code=400, detail="variant_index is required")
+        if script_json.get("selected_tts_variant_index") is not None:
+            raise HTTPException(status_code=409, detail="TTS variant already selected")
+
+        chosen_variant = None
+        variants = _get_tts_variants(script_json)
+        for variant in variants:
+            if int(variant.get("variant_index", -1)) == int(body.variant_index):
+                chosen_variant = variant
+                break
+        if chosen_variant is None:
+            raise HTTPException(status_code=404, detail="TTS variant not found")
+        if str(chosen_variant.get("status") or "").strip() != "ready":
+            raise HTTPException(status_code=409, detail="TTS variant is not selectable")
+
+        resolved_audio_url = str(chosen_variant.get("s3_uri") or chosen_variant.get("attachment_or_presigned_url") or "").strip()
+        if not resolved_audio_url:
+            raise HTTPException(status_code=400, detail="Selected TTS variant has no audio URL")
+        selected_seed_raw = chosen_variant.get("seed")
+        selected_seed: Optional[int] = None
+        if selected_seed_raw is not None and str(selected_seed_raw).strip():
+            try:
+                selected_seed = int(str(selected_seed_raw).strip())
+            except Exception:
+                selected_seed = None
+
+        selected_script = _merge_script_json_with_media_names(
+            script_json,
+            audio_filename=str(chosen_variant.get("filename") or "").strip(),
+            tts_error_type="",
+            tts_error_detail="",
+        )
+        selected_script["tts_variants"] = variants
+        selected_script["active_tts_batch_id"] = active_batch_id
+        selected_script["selected_tts_variant_index"] = int(body.variant_index)
+        selected_script["selected_tts_seed"] = selected_seed
+        selected_script["tts_variant_control_message_id"] = str(script_json.get("tts_variant_control_message_id") or "").strip()
+        selected_script["tts_variant_action_message_id"] = ""
+        selected_script["tts_downstream_intent"] = _get_tts_downstream_intent(script_json)
+        selected_script["tts_seed_strategy"] = str(script_json.get("tts_seed_strategy") or "").strip()
+        selected_script["tts_seed_values"] = list(script_json.get("tts_seed_values") or [])
+        await job_service.update_job(
+            body.job_id,
+            audio_url=resolved_audio_url,
+            final_url=str(chosen_variant.get("s3_uri") or chosen_variant.get("attachment_or_presigned_url") or "").strip(),
+            script_json=selected_script,
+        )
+        try:
+            approval_message_id = await _discord_adapter.send_tts_approval_message(
+                channel_id=channel_id,
+                job_id=body.job_id,
+                caption=_build_selected_tts_caption(
+                    downstream_intent=_get_tts_downstream_intent(script_json),
+                    variant_index=int(body.variant_index),
+                    selected_seed=selected_seed,
+                ),
+            )
+        except Exception:
+            rollback_script = _merge_script_json_with_media_names(_clear_tts_variant_metadata(script_json), tts_error_type="", tts_error_detail="")
+            rollback_script["tts_variants"] = variants
+            rollback_script["active_tts_batch_id"] = active_batch_id
+            rollback_script["selected_tts_variant_index"] = None
+            rollback_script["selected_tts_seed"] = None
+            rollback_script["tts_variant_control_message_id"] = str(script_json.get("tts_variant_control_message_id") or "").strip()
+            rollback_script["tts_variant_action_message_id"] = ""
+            rollback_script["tts_downstream_intent"] = _get_tts_downstream_intent(script_json)
+            rollback_script["tts_seed_strategy"] = str(script_json.get("tts_seed_strategy") or "").strip()
+            rollback_script["tts_seed_values"] = list(script_json.get("tts_seed_values") or [])
+            await job_service.update_job(body.job_id, audio_url="", final_url="", script_json=rollback_script)
+            raise
+        selected_script["tts_variant_action_message_id"] = approval_message_id
+        await job_service.update_job(body.job_id, script_json=selected_script)
+        await _disable_tts_variant_buttons(channel_id, script_json)
+        logger.info("[discord] tts_action=select_variant job_id=%s batch_id=%s variant=%s", body.job_id, active_batch_id, body.variant_index)
+        return {
+            "job_id": body.job_id,
+            "action": body.action,
+            "batch_id": active_batch_id,
+            "variant_index": int(body.variant_index),
+            "selected_seed": selected_seed,
+            "audio_url": resolved_audio_url,
+        }
+
+    if body.action == "regenerate_batch":
+        active_batch_id = str(script_json.get("active_tts_batch_id") or "").strip()
+        if not body.batch_id:
+            raise HTTPException(status_code=400, detail="batch_id is required")
+        if active_batch_id != body.batch_id:
+            raise HTTPException(status_code=409, detail="stale tts batch")
+        script_text = _get_tts_script_text(script_json)
+        if not script_text:
+            raise HTTPException(status_code=400, detail="No script found in job")
+        await _disable_tts_variant_buttons(channel_id, script_json)
+        await job_service.update_job(
+            body.job_id,
+            audio_url="",
+            final_url="",
+            error_message="",
+            script_json=_merge_script_json_with_media_names(_clear_tts_variant_metadata(script_json), tts_error_type="", tts_error_detail=""),
+        )
+        _spawn_tts_generation(
+            job_id=body.job_id,
+            script_text=script_text,
+            channel_id=channel_id,
+            user_id=user_id,
+            downstream_intent=_get_tts_downstream_intent(script_json),
+        )
+        await _discord_adapter.send_text_message(channel_id, "🔁 TTS 후보 3개를 다시 생성합니다...")
+        logger.info("[discord] tts_action=regenerate_batch job_id=%s batch_id=%s", body.job_id, active_batch_id)
+        return {"job_id": body.job_id, "action": body.action, "batch_id": active_batch_id}
 
     if body.action in {"approve_standard", "approve_hd"}:
         # WF-12는 외부 URL을 읽어야 하므로 s3:// 저장값은 presigned URL로 바꿔 넘긴다.
@@ -2492,6 +3056,7 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
     user_id = job["messenger_user_id"]
 
     if body.action == "approved":
+        targets = _normalize_publish_targets(body.targets)
         # 최종 승인 시점에는 gateway가 직접 업로드하지 않고 WF-08에 SNS 업로드를 위임한다.
         video_url = job.get("video_url", "")
         if isinstance(video_url, str) and video_url.startswith("s3://"):
@@ -2503,20 +3068,28 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
         script_json = _as_script_json(job.get("script_json"))
         media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
         video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
+        subtitle_script_text = _get_subtitle_script_text(script_json)
+        publish_title = _build_publish_title(body.job_id, video_filename, subtitle_script_text, str(job.get("concept_text") or ""))
+        publish_description = _build_publish_description(subtitle_script_text)
+        publish_caption = _build_publish_caption(subtitle_script_text)
 
         try:
             await n8n_service.call_wf08_sns_upload(
                 body.job_id,
                 video_url,
                 channel_id,
+                targets,
                 video_filename=video_filename,
+                title=publish_title,
+                description=publish_description,
+                caption=publish_caption,
             )
         except Exception as e:
             logger.error("call_wf08_sns_upload failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=502, detail=f"WF-08 trigger failed: {e}")
 
-        logger.info("[discord] video_action=approved job_id=%s", body.job_id)
-        return {"job_id": body.job_id, "action": "approved"}
+        logger.info("[discord] video_action=approved job_id=%s targets=%s", body.job_id, ",".join(targets))
+        return {"job_id": body.job_id, "action": "approved", "targets": targets}
 
     elif body.action == "reject_select":
         try:
@@ -2563,9 +3136,9 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
                     script_text=script_text,
                     channel_id=channel_id,
                     user_id=user_id,
-                    auto_trigger_wf12=False,
+                    downstream_intent=_get_tts_downstream_intent(script_json),
                 )
-                await _discord_adapter.send_text_message(channel_id, "🔊 TTS를 재생성합니다...")
+                await _discord_adapter.send_text_message(channel_id, "🔊 TTS 후보 3개를 다시 생성합니다...")
             except Exception as e:
                 logger.error("call_wf11 (tts retry) failed job_id=%s: %s", body.job_id, e)
 
@@ -2607,11 +3180,11 @@ async def report_to_tts(_: AuthDep, body: ReportToTtsRequest) -> dict:
             script_text=script_text,
             channel_id=channel_id,
             user_id=user_id,
-            auto_trigger_wf12=False,
+            downstream_intent="tts_only",
         )
         await _discord_adapter.send_text_message(
             channel_id,
-            "🔊 TTS 생성을 시작합니다. 완료본 확인 후 승인하면 WF-12(HeyGen)로 진행됩니다.",
+            "🔊 TTS 후보 3개 생성을 시작합니다. 마음에 드는 후보를 선택한 뒤 승인하면 WF-12(HeyGen)로 진행됩니다.",
         )
     except Exception as e:
         logger.error("call_wf11 (report_to_tts) failed job_id=%s: %s", body.job_id, e)
@@ -2649,11 +3222,11 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
             script_text=script_text,
             channel_id=channel_id,
             user_id=user_id,
-            auto_trigger_wf12=False,
+            downstream_intent="video_prepare",
         )
         await _discord_adapter.send_text_message(
             channel_id,
-            "🎬 영상 제작 준비를 시작합니다. TTS 완료 후 일반 승인 또는 고화질 승인을 선택하고, 최종 확인 후 영상을 생성하세요.",
+            "🎬 영상 제작 준비를 시작합니다. TTS 후보 3개 중 하나를 선택한 뒤 일반 승인 또는 고화질 승인을 선택하고, 최종 확인 후 영상을 생성하세요.",
         )
     except Exception as e:
         logger.error("call_wf11 (report_to_video) failed job_id=%s: %s", body.job_id, e)
@@ -2704,7 +3277,7 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
             script_text=script_text,
             channel_id=channel_id,
             user_id=user_id,
-            auto_trigger_wf12=False,
+            downstream_intent="tts_only",
         )
     except Exception as e:
         logger.error("call_wf11 (manual /tts) failed job_id=%s: %s", resolved_job_id, e)
