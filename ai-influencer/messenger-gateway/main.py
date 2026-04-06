@@ -408,25 +408,6 @@ def _parse_tts_seed_list(raw_value: object, *, source_name: str) -> list[int]:
 def _resolve_tts_variant_seeds(channel_id: str) -> tuple[list[int], str]:
     had_invalid_config = False
 
-    by_channel_raw = (settings.tts_fixed_seeds_by_channel or "").strip()
-    if by_channel_raw:
-        try:
-            mapping = json.loads(by_channel_raw)
-            if not isinstance(mapping, dict):
-                raise ValueError("must be a JSON object")
-            if channel_id in mapping:
-                try:
-                    return _parse_tts_seed_list(
-                        mapping.get(channel_id),
-                        source_name=f"TTS_FIXED_SEEDS_BY_CHANNEL[{channel_id}]",
-                    ), "fixed_by_channel"
-                except Exception as e:
-                    had_invalid_config = True
-                    logger.warning("[tts-seed] invalid channel seed config channel_id=%s err=%s", channel_id, e)
-        except Exception as e:
-            had_invalid_config = True
-            logger.warning("[tts-seed] invalid TTS_FIXED_SEEDS_BY_CHANNEL config err=%s", e)
-
     default_raw = (settings.tts_fixed_seeds or "").strip()
     if default_raw:
         try:
@@ -810,6 +791,19 @@ def _build_tts_request_body(script_text: str, *, seed: Optional[int] = None) -> 
 
 def _classify_tts_error(detail: str, *, status_code: Optional[int] = None) -> str:
     normalized = (detail or "").lower()
+    network_markers = (
+        "name or service not known",
+        "temporary failure in name resolution",
+        "connecterror",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "readtimeout",
+        "connecttimeout",
+        "nodename nor servname provided",
+        "network is unreachable",
+        "no route to host",
+    )
     runtime_markers = (
         "averaged_perceptron_tagger_eng",
         "resource '",
@@ -827,10 +821,14 @@ def _classify_tts_error(detail: str, *, status_code: Optional[int] = None) -> st
         "unprocessable",
     )
 
+    if any(marker in normalized for marker in network_markers):
+        return "tts_network_error"
     if any(marker in normalized for marker in runtime_markers):
         return "tts_server_runtime_error"
     if any(marker in normalized for marker in request_markers):
         return "request_validation_error"
+    if status_code in {408, 429, 502, 503, 504}:
+        return "tts_network_error"
     if status_code is not None and status_code >= 500:
         return "tts_server_runtime_error"
     if status_code in {400, 401, 403, 404, 405, 409, 422}:
@@ -839,7 +837,7 @@ def _classify_tts_error(detail: str, *, status_code: Optional[int] = None) -> st
 
 
 def _extract_tts_error_type(detail: str) -> str:
-    match = re.search(r"\[(request_validation_error|tts_server_runtime_error)\]", detail or "")
+    match = re.search(r"\[(request_validation_error|tts_server_runtime_error|tts_network_error)\]", detail or "")
     if match:
         return match.group(1)
     return _classify_tts_error(detail)
@@ -1445,11 +1443,14 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         endpoint = tts_api_url if tts_api_url.rstrip("/").endswith("/tts") else f"{tts_api_url.rstrip('/')}/tts"
-        resp = await client.post(
-            endpoint,
-            json=tts_body,
-            headers={"Content-Type": "application/json"},
-        )
+        try:
+            resp = await client.post(
+                endpoint,
+                json=tts_body,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.RequestError as e:
+            raise RuntimeError(f"TTS API failed [tts_network_error]: {type(e).__name__}: {e}") from e
         if not resp.is_success:
             raise RuntimeError(_format_tts_api_error(resp.status_code, resp.text))
         return resp.content

@@ -7,12 +7,13 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/seed_lab_quickstart.sh ["seed1,seed2,..."]
+  ./scripts/seed_lab_quickstart.sh [-dup|--dup] ["seed1,seed2,..."]
 
 Examples:
   ./scripts/seed_lab_quickstart.sh
   ./scripts/seed_lab_quickstart.sh ""
   ./scripts/seed_lab_quickstart.sh "111,222"
+  ./scripts/seed_lab_quickstart.sh -dup "111,222"
 
 Behavior:
   - Reads TTS_API_URL from (priority):
@@ -20,12 +21,16 @@ Behavior:
     2) ./.env file
   - Ensures scripts/seed_lab_dataset.local.json exists
     (copies from example on first run)
-  - Runs Stage-A seed lab with fixed settings:
-    samples=20, concurrency=4
-  - If provided seed list has fewer than 20 seeds,
+  - Default mode:
+    samples=30, takes_per_seed=1, concurrency=4 (총 30개)
+  - Dup mode (-dup/--dup):
+    samples=10, takes_per_seed=3, concurrency=4 (총 30개)
+  - In default mode, if provided seed list has fewer than 30 seeds,
     remaining seeds are auto-filled randomly
-  - If provided seed list has more than 20 seeds,
-    only first 20 are used
+  - In dup mode, if provided seed list has fewer than 10 seeds,
+    remaining seeds are auto-filled randomly
+  - If provided seed list has more than target seed count,
+    only first N are used
   - Opens generated review HTML automatically (macOS: open)
 EOF
 }
@@ -35,15 +40,42 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-SAMPLES=20
+SAMPLES=30
+TAKES_PER_SEED=1
 CONCURRENCY=4
 OPEN_BROWSER=1
-SEED_LIST="${1:-}"
+DUP_MODE=0
+SEED_LIST=""
 
-if [[ "$#" -gt 1 ]]; then
-  echo "ERROR: only one argument is allowed: \"seed1,seed2,...\"" >&2
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -dup|--dup)
+      DUP_MODE=1
+      shift
+      ;;
+    -*)
+      echo "ERROR: unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "${#POSITIONAL[@]}" -gt 1 ]]; then
+  echo "ERROR: only one seed-list argument is allowed: \"seed1,seed2,...\"" >&2
   usage
   exit 1
+fi
+SEED_LIST="${POSITIONAL[0]:-}"
+
+if (( DUP_MODE == 1 )); then
+  SAMPLES=10
+  TAKES_PER_SEED=3
 fi
 
 if [[ -z "${TTS_API_URL:-}" ]] && [[ -f ".env" ]]; then
@@ -70,7 +102,7 @@ fi
 
 echo "[seed-lab] TTS_API_URL=${TTS_API_URL}"
 echo "[seed-lab] dataset=${DATASET_LOCAL}"
-echo "[seed-lab] stage=a samples=${SAMPLES} concurrency=${CONCURRENCY}"
+echo "[seed-lab] stage=a samples=${SAMPLES} takes_per_seed=${TAKES_PER_SEED} concurrency=${CONCURRENCY}"
 if [[ -n "$SEED_LIST" ]]; then
   echo "[seed-lab] seed_list=${SEED_LIST}"
 fi
@@ -84,6 +116,7 @@ CMD=(
   --api-url "$TTS_API_URL"
   --stage a
   --samples "$SAMPLES"
+  --takes-per-seed "$TAKES_PER_SEED"
   --concurrency "$CONCURRENCY"
 )
 if [[ -n "$SEED_LIST" ]]; then

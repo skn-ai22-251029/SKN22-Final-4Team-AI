@@ -35,7 +35,7 @@ DEFAULT_CONCURRENCY = 4
 DEFAULT_TIMEOUT = 300
 DEFAULT_SAMPLES = 20
 DEFAULT_STAGE_B_TOP = 20
-TAKES_PER_SEED = 1
+DEFAULT_TAKES_PER_SEED = 1
 
 
 @dataclass
@@ -889,6 +889,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     requested_samples = int(args.samples)
     if requested_samples <= 0:
         raise RuntimeError("samples must be > 0")
+    takes_per_seed = int(args.takes_per_seed)
+    if takes_per_seed <= 0:
+        raise RuntimeError("takes_per_seed must be > 0")
 
     seed_list: list[int]
     seed_mode = "random_only"
@@ -922,7 +925,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     tasks: list[tuple[int, ScriptItem, int]] = []
     for seed in seed_list:
         for script in selected_scripts:
-            for take_index in range(1, TAKES_PER_SEED + 1):
+            for take_index in range(1, takes_per_seed + 1):
                 tasks.append((seed, script, take_index))
 
     started_at = dt.datetime.now().isoformat()
@@ -976,7 +979,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "truncated_count": truncated_count,
         "script_ids": [s.script_id for s in selected_scripts],
         "script_titles": [s.title for s in selected_scripts],
-        "takes_per_seed": TAKES_PER_SEED,
+        "takes_per_seed": takes_per_seed,
         "concurrency": int(args.concurrency),
         "timeout_seconds": int(args.timeout),
         "retries": int(args.retries),
@@ -989,7 +992,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print("")
     print(f"[seed-lab] run_id={run_id}")
     print(f"[seed-lab] output={run_dir}")
-    print(f"[seed-lab] takes_per_seed={TAKES_PER_SEED}")
+    print(f"[seed-lab] takes_per_seed={takes_per_seed}")
     print(f"[seed-lab] ready={ready} failed={failed} total={len(records)}")
     print(f"[seed-lab] review_html={run_dir / 'index.html'}")
     print("")
@@ -1167,6 +1170,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--stage", choices=["a", "b", "full"], default="a")
     run_p.add_argument("--script-ids", default="", help="override scripts by id csv (ex: s1,s2)")
     run_p.add_argument("--samples", type=int, default=DEFAULT_SAMPLES, help="target seed count")
+    run_p.add_argument("--takes-per-seed", type=int, default=DEFAULT_TAKES_PER_SEED, help="number of audios per seed")
     run_p.add_argument(
         "--seed-list",
         default="",

@@ -624,7 +624,6 @@ nano .env   # 또는 vi .env
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
 | `TTS_FIXED_SEEDS` | (선택) 채널 공통 고정 seed 3개(쉼표 구분) | `101,202,303` |
-| `TTS_FIXED_SEEDS_BY_CHANNEL` | (선택) 채널별 고정 seed 3개(JSON) | `{"123456789012345678":[111,222,333]}` |
 | `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
 | `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
 | `HEYGEN_VIDEO_WIDTH` | WF-12 출력 영상 너비 | `1080` |
@@ -643,9 +642,9 @@ nano .env   # 또는 vi .env
 기본 경로: WF-11은 앞선 워크플로에서 전달된 `script_text`를 그대로 TTS 입력으로 사용합니다.  
 음색 클론이 필요할 때만 `TTS_REF_AUDIO_PATH` + `TTS_PROMPT_TEXT`를 **둘 다** 설정하세요.
 
-고정 seed를 쓰려면 `TTS_FIXED_SEEDS` 또는 `TTS_FIXED_SEEDS_BY_CHANNEL`을 설정하세요.
+고정 seed를 쓰려면 `TTS_FIXED_SEEDS`를 설정하세요.
 - 형식: 반드시 정수 3개(쉼표 구분), 중복 없음, 범위 `1..2147483647`
-- 우선순위: `TTS_FIXED_SEEDS_BY_CHANNEL` > `TTS_FIXED_SEEDS` > 랜덤
+- 우선순위: `TTS_FIXED_SEEDS` > 랜덤
 - 설정값 오류 시 서비스는 중단되지 않고 랜덤 seed 3개로 fallback합니다.
 
 **`TOPIC_CHANNELS` 형식:**
@@ -1081,7 +1080,7 @@ python3 scripts/seed_lab.py run \
 - `.yaml` dataset도 가능하지만 로컬 Python에 `PyYAML`이 있어야 합니다.
 - 현재 Seed Lab은 같은 seed당 3개(`t1~t3`)를 항상 새로 생성합니다.
 - 동일 run 재실행 시에도 기존 오디오를 건너뛰지 않고 다시 생성합니다.
-- 운영 반영은 사람이 최종 seed를 확정한 뒤 `.env`의 `TTS_FIXED_SEEDS`/`TTS_FIXED_SEEDS_BY_CHANNEL`에 수동 반영합니다.
+- 운영 반영은 사람이 최종 seed를 확정한 뒤 `.env`의 `TTS_FIXED_SEEDS`에 수동 반영합니다.
 
 ### 자동 수집 확인
 

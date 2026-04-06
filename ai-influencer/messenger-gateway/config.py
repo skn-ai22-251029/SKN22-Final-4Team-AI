@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     tts_super_sampling: bool = True
     tts_fragment_interval: float = 0.4
     tts_fixed_seeds: str = ""
-    tts_fixed_seeds_by_channel: str = ""
     heygen_api_key: str = ""
     heygen_avatar_id: str = ""
     heygen_api_base_url: str = "https://api.heygen.com"
