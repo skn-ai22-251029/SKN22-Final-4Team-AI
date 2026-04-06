@@ -22,9 +22,10 @@
             {"id": "a1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
             {"id": "a2", "name": "messenger_source", "value": "={{ $json.body.messenger_source }}", "type": "string"},
             {"id": "a3", "name": "messenger_channel_id", "value": "={{ $json.body.messenger_channel_id }}", "type": "string"},
-            {"id": "a4", "name": "prompt", "value": "={{ $json.body.prompt }}", "type": "string"},
-            {"id": "a5", "name": "notebook_id", "value": "={{ $json.body.notebook_id ?? '' }}", "type": "string"},
-            {"id": "a6", "name": "channel_id", "value": "={{ $json.body.channel_id ?? '' }}", "type": "string"}
+            {"id": "a4", "name": "messenger_user_id", "value": "={{ $json.body.messenger_user_id ?? '' }}", "type": "string"},
+            {"id": "a5", "name": "prompt", "value": "={{ $json.body.prompt }}", "type": "string"},
+            {"id": "a6", "name": "notebook_id", "value": "={{ $json.body.notebook_id ?? '' }}", "type": "string"},
+            {"id": "a7", "name": "channel_id", "value": "={{ $json.body.channel_id ?? '' }}", "type": "string"}
           ]
         },
         "options": {}
@@ -154,6 +155,33 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-auto-failure",
+              "leftValue": "={{ $('Extract Fields').item.json.messenger_user_id }}",
+              "rightValue": "system:auto-report",
+              "operator": {"type": "string", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf06-if-auto-failure",
+      "name": "IF Auto Report Failure",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1560, 420]
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "http://messenger-gateway:8080/internal/send-text",
         "sendHeaders": true,
@@ -171,7 +199,7 @@
       "name": "Send Error to Gateway",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1560, 420]
+      "position": [1780, 420]
     }
   ],
   "connections": {
@@ -197,7 +225,13 @@
       "main": [[{"node": "Update to PUBLISHED", "type": "main", "index": 0}]]
     },
     "Update to FAILED": {
-      "main": [[{"node": "Send Error to Gateway", "type": "main", "index": 0}]]
+      "main": [[{"node": "IF Auto Report Failure", "type": "main", "index": 0}]]
+    },
+    "IF Auto Report Failure": {
+      "main": [
+        [],
+        [{"node": "Send Error to Gateway", "type": "main", "index": 0}]
+      ]
     }
   },
   "active": true,
