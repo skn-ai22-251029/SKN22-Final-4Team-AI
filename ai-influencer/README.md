@@ -4,6 +4,8 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 테스트 편의를 위해 https://github.com/DJAeun/SKN22-Final-4Team-AI/tree/develop 클론
 ---
+TTS test script="./scripts/seed_lab_quickstart.sh"
+---
 
 ## 아키텍처 개요
 
@@ -139,8 +141,9 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 ### 시간별 자동 보고서 Discord 전송
 
 - `WF-09 -> /internal/auto-report -> WF-06` 경로는 계속 동작
-- 다만 Discord 전송은 `AUTO_REPORT_DISCORD_DELIVERY_ENABLED=false` 이면 생략
-- 기본값은 `false`
+- Discord 전송은 `AUTO_REPORT_DISCORD_DELIVERY_ENABLED=true` 일 때 활성화
+- 기본값은 `true`
+- `system:auto-report` 실패 건은 Discord에 실패 메시지를 전송하지 않고 DB 상태만 `FAILED`로 기록
 - 이때도 대본 rewrite, S3 저장, DB 업데이트는 그대로 수행
 
 ### `POST /internal/character-avatar`
@@ -1026,13 +1029,13 @@ export TTS_API_URL="https://<runpod-url>"
 cp scripts/seed_lab_dataset.example.json scripts/seed_lab_dataset.local.json
 ```
 
-Stage-A (기준 스크립트 1개 x 랜덤 seed 100):
+Stage-A (기준 스크립트 1개 x 랜덤 seed 10, seed당 3개 오디오 = 총 30개):
 
 ```bash
 python3 scripts/seed_lab.py run \
   --dataset scripts/seed_lab_dataset.local.json \
   --stage a \
-  --samples 100 \
+  --samples 10 \
   --concurrency 4
 ```
 
@@ -1043,7 +1046,7 @@ python3 scripts/seed_lab.py run \
 ```
 
 옵션:
-- `./scripts/seed_lab_quickstart.sh 100 4 --no-open` : 생성만 하고 브라우저 자동 열기는 비활성화
+- `./scripts/seed_lab_quickstart.sh 10 4 --no-open` : 생성만 하고 브라우저 자동 열기는 비활성화
 
 생성 후:
 - `seed-lab-runs/<run_id>/index.html`을 브라우저로 열어 오디오 청취
@@ -1076,7 +1079,8 @@ python3 scripts/seed_lab.py run \
 
 참고:
 - `.yaml` dataset도 가능하지만 로컬 Python에 `PyYAML`이 있어야 합니다.
-- 동일 run 재실행 시 `--resume`을 주면 기존 생성된 오디오는 건너뜁니다.
+- 현재 Seed Lab은 같은 seed당 3개(`t1~t3`)를 항상 새로 생성합니다.
+- 동일 run 재실행 시에도 기존 오디오를 건너뛰지 않고 다시 생성합니다.
 - 운영 반영은 사람이 최종 seed를 확정한 뒤 `.env`의 `TTS_FIXED_SEEDS`/`TTS_FIXED_SEEDS_BY_CHANNEL`에 수동 반영합니다.
 
 ### 자동 수집 확인

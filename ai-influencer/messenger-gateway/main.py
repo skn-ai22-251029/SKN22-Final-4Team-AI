@@ -1844,14 +1844,18 @@ def _is_auto_report_job_stale(job: dict, stale_minutes: int) -> bool:
     return updated_at < (datetime.now(timezone.utc) - timedelta(minutes=max(1, stale_minutes)))
 
 
+def _is_auto_report_job(job: dict | None) -> bool:
+    if not job:
+        return False
+    return (job.get("messenger_user_id") or "").strip() == "system:auto-report"
+
+
 def _should_skip_auto_report_discord_delivery(job: dict | None) -> bool:
     # 시간별 자동 보고서는 S3/DB 적재까지만 두고,
     # Discord 노출은 설정으로 별도 제어한다.
     if settings.auto_report_discord_delivery_enabled:
         return False
-    if not job:
-        return False
-    return (job.get("messenger_user_id") or "").strip() == "system:auto-report"
+    return _is_auto_report_job(job)
 
 
 def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> None:
@@ -2554,7 +2558,7 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     """n8n WF-06에서 호출 — Discord로 보고서 파일을 전송한다."""
     # 여기서 raw report -> subtitle/tts 스크립트 분리, S3 저장, Discord 전송을 한 번에 마무리한다.
     existing_job = await job_service.get_job(body.job_id)
-    manual_report_retry = existing_job is not None and not _should_skip_auto_report_discord_delivery(existing_job)
+    manual_report_retry = existing_job is not None and not _is_auto_report_job(existing_job)
     filename = _normalize_report_filename(
         body.job_id,
         body.filename,

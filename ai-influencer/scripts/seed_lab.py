@@ -33,8 +33,9 @@ SEED_MAX = 2_147_483_647
 DEFAULT_OUTPUT_ROOT = "seed-lab-runs"
 DEFAULT_CONCURRENCY = 4
 DEFAULT_TIMEOUT = 300
-DEFAULT_SAMPLES = 100
+DEFAULT_SAMPLES = 10
 DEFAULT_STAGE_B_TOP = 20
+TAKES_PER_SEED = 3
 
 
 @dataclass
@@ -801,27 +802,15 @@ def _worker_generate_one(
     run_dir: Path,
     seed: int,
     script: ScriptItem,
+    take_index: int,
     retries: int,
 ) -> dict[str, Any]:
-    sample_id = f"{script.script_id}:{seed}"
+    sample_id = f"{script.script_id}:{seed}:t{take_index}"
     audio_dir = run_dir / "audio" / script.script_id
     audio_dir.mkdir(parents=True, exist_ok=True)
-    audio_filename = f"seed-{seed}.wav"
+    audio_filename = f"seed-{seed}-t{take_index}.wav"
     audio_path = audio_dir / audio_filename
     audio_rel = os.path.relpath(audio_path, run_dir).replace("\\", "/")
-
-    if audio_path.exists() and audio_path.stat().st_size > 0:
-        return {
-            "sample_id": sample_id,
-            "seed": seed,
-            "script_id": script.script_id,
-            "script_title": script.title,
-            "script_text": script.text,
-            "audio_rel_path": audio_rel,
-            "status": "skipped_existing",
-            "error": "",
-            "bytes": int(audio_path.stat().st_size),
-        }
 
     attempt = 0
     last_error = ""
@@ -836,6 +825,7 @@ def _worker_generate_one(
             return {
                 "sample_id": sample_id,
                 "seed": seed,
+                "take_index": take_index,
                 "script_id": script.script_id,
                 "script_title": script.title,
                 "script_text": script.text,
@@ -851,6 +841,7 @@ def _worker_generate_one(
     return {
         "sample_id": sample_id,
         "seed": seed,
+        "take_index": take_index,
         "script_id": script.script_id,
         "script_title": script.title,
         "script_text": script.text,
@@ -887,26 +878,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_records_map = _load_existing_manifest(run_dir / "manifest.json") if args.resume else {}
-
-    tasks: list[tuple[int, ScriptItem]] = []
+    tasks: list[tuple[int, ScriptItem, int]] = []
     for seed in seed_list:
         for script in selected_scripts:
-            tasks.append((seed, script))
+            for take_index in range(1, TAKES_PER_SEED + 1):
+                tasks.append((seed, script, take_index))
 
     started_at = dt.datetime.now().isoformat()
     records: list[dict[str, Any]] = []
-    if existing_records_map and args.resume:
-        for rec in existing_records_map.values():
-            records.append(rec)
-    existing_ids = {str(rec.get("sample_id") or "") for rec in records}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.concurrency))) as pool:
         futures: list[concurrent.futures.Future[dict[str, Any]]] = []
-        for seed, script in tasks:
-            sample_id = f"{script.script_id}:{seed}"
-            if sample_id in existing_ids:
-                continue
+        for seed, script, take_index in tasks:
             futures.append(
                 pool.submit(
                     _worker_generate_one,
@@ -916,6 +899,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     run_dir,
                     seed,
                     script,
+                    take_index,
                     int(args.retries),
                 )
             )
@@ -927,7 +911,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             if done_count % 10 == 0 or done_count == len(futures):
                 print(f"[seed-lab] progress {done_count}/{len(futures)}", flush=True)
 
-    records.sort(key=lambda r: (str(r.get("script_id", "")), int(r.get("seed", 0))))
+    records.sort(
+        key=lambda r: (
+            str(r.get("script_id", "")),
+            int(r.get("seed", 0)),
+            int(r.get("take_index", 0)),
+        )
+    )
     ready = sum(1 for r in records if r.get("status") in ("ready", "skipped_existing"))
     failed = sum(1 for r in records if r.get("status") == "failed")
 
@@ -941,6 +931,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "seed_count": len(seed_list),
         "script_ids": [s.script_id for s in selected_scripts],
         "script_titles": [s.title for s in selected_scripts],
+        "takes_per_seed": TAKES_PER_SEED,
         "concurrency": int(args.concurrency),
         "timeout_seconds": int(args.timeout),
         "retries": int(args.retries),
@@ -953,6 +944,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print("")
     print(f"[seed-lab] run_id={run_id}")
     print(f"[seed-lab] output={run_dir}")
+    print(f"[seed-lab] takes_per_seed={TAKES_PER_SEED}")
     print(f"[seed-lab] ready={ready} failed={failed} total={len(records)}")
     print(f"[seed-lab] review_html={run_dir / 'index.html'}")
     print("")

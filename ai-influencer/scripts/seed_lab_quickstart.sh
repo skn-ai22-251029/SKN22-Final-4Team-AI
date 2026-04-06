@@ -11,8 +11,8 @@ Usage:
 
 Examples:
   ./scripts/seed_lab_quickstart.sh
-  ./scripts/seed_lab_quickstart.sh 100 4
-  ./scripts/seed_lab_quickstart.sh 100 4 --no-open
+  ./scripts/seed_lab_quickstart.sh 10 4
+  ./scripts/seed_lab_quickstart.sh 10 4 --no-open
 
 Behavior:
   - Reads TTS_API_URL from (priority):
@@ -20,7 +20,7 @@ Behavior:
     2) ./.env file
   - Ensures scripts/seed_lab_dataset.local.json exists
     (copies from example on first run)
-  - Runs Stage-A seed lab (default 100 seeds)
+  - Runs Stage-A seed lab (default 10 seeds)
   - Opens generated review HTML automatically (macOS: open)
 EOF
 }
@@ -30,7 +30,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-SAMPLES="${1:-100}"
+SAMPLES="${1:-10}"
 CONCURRENCY="${2:-4}"
 OPEN_BROWSER=1
 

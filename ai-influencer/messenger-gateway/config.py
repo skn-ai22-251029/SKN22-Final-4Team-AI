@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     discord_bot_token: str = ""
     discord_allowed_channel_ids: str = ""
-    auto_report_discord_delivery_enabled: bool = False
+    auto_report_discord_delivery_enabled: bool = True
     auto_report_max_attempts_per_day: int = 3
     auto_report_stale_minutes: int = 45
     openai_api_key: str = ""
