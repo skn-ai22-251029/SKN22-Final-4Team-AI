@@ -7,12 +7,12 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/seed_lab_quickstart.sh [samples] [concurrency] [--no-open]
+  ./scripts/seed_lab_quickstart.sh ["seed1,seed2,..."]
 
 Examples:
   ./scripts/seed_lab_quickstart.sh
-  ./scripts/seed_lab_quickstart.sh 10 4
-  ./scripts/seed_lab_quickstart.sh 10 4 --no-open
+  ./scripts/seed_lab_quickstart.sh ""
+  ./scripts/seed_lab_quickstart.sh "111,222"
 
 Behavior:
   - Reads TTS_API_URL from (priority):
@@ -20,7 +20,12 @@ Behavior:
     2) ./.env file
   - Ensures scripts/seed_lab_dataset.local.json exists
     (copies from example on first run)
-  - Runs Stage-A seed lab (default 10 seeds)
+  - Runs Stage-A seed lab with fixed settings:
+    samples=20, concurrency=4
+  - If provided seed list has fewer than 20 seeds,
+    remaining seeds are auto-filled randomly
+  - If provided seed list has more than 20 seeds,
+    only first 20 are used
   - Opens generated review HTML automatically (macOS: open)
 EOF
 }
@@ -30,20 +35,14 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-SAMPLES="${1:-10}"
-CONCURRENCY="${2:-4}"
+SAMPLES=20
+CONCURRENCY=4
 OPEN_BROWSER=1
+SEED_LIST="${1:-}"
 
-if [[ "${3:-}" == "--no-open" ]] || [[ "${1:-}" == "--no-open" ]] || [[ "${2:-}" == "--no-open" ]]; then
-  OPEN_BROWSER=0
-fi
-
-if ! [[ "$SAMPLES" =~ ^[0-9]+$ ]] || (( SAMPLES <= 0 )); then
-  echo "ERROR: samples must be a positive integer" >&2
-  exit 1
-fi
-if ! [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || (( CONCURRENCY <= 0 )); then
-  echo "ERROR: concurrency must be a positive integer" >&2
+if [[ "$#" -gt 1 ]]; then
+  echo "ERROR: only one argument is allowed: \"seed1,seed2,...\"" >&2
+  usage
   exit 1
 fi
 
@@ -72,16 +71,25 @@ fi
 echo "[seed-lab] TTS_API_URL=${TTS_API_URL}"
 echo "[seed-lab] dataset=${DATASET_LOCAL}"
 echo "[seed-lab] stage=a samples=${SAMPLES} concurrency=${CONCURRENCY}"
+if [[ -n "$SEED_LIST" ]]; then
+  echo "[seed-lab] seed_list=${SEED_LIST}"
+fi
 
 TMP_LOG="$(mktemp)"
 
 set +e
-python3 scripts/seed_lab.py run \
-  --dataset "$DATASET_LOCAL" \
-  --api-url "$TTS_API_URL" \
-  --stage a \
-  --samples "$SAMPLES" \
-  --concurrency "$CONCURRENCY" | tee "$TMP_LOG"
+CMD=(
+  python3 scripts/seed_lab.py run
+  --dataset "$DATASET_LOCAL"
+  --api-url "$TTS_API_URL"
+  --stage a
+  --samples "$SAMPLES"
+  --concurrency "$CONCURRENCY"
+)
+if [[ -n "$SEED_LIST" ]]; then
+  CMD+=(--seed-list "$SEED_LIST")
+fi
+"${CMD[@]}" | tee "$TMP_LOG"
 RUN_EXIT="${PIPESTATUS[0]}"
 set -e
 
@@ -99,11 +107,6 @@ if [[ -z "${REVIEW_HTML:-}" ]]; then
 fi
 
 echo "[seed-lab] review_html_path=$REVIEW_HTML"
-
-if (( OPEN_BROWSER == 0 )); then
-  echo "[seed-lab] --no-open 지정으로 자동 열기를 건너뜁니다."
-  exit 0
-fi
 
 if command -v open >/dev/null 2>&1; then
   open "$REVIEW_HTML" || true

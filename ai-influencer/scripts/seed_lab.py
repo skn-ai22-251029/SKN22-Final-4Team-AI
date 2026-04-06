@@ -33,9 +33,9 @@ SEED_MAX = 2_147_483_647
 DEFAULT_OUTPUT_ROOT = "seed-lab-runs"
 DEFAULT_CONCURRENCY = 4
 DEFAULT_TIMEOUT = 300
-DEFAULT_SAMPLES = 10
+DEFAULT_SAMPLES = 20
 DEFAULT_STAGE_B_TOP = 20
-TAKES_PER_SEED = 3
+TAKES_PER_SEED = 1
 
 
 @dataclass
@@ -201,15 +201,41 @@ def _load_seeds_file(path: Path) -> list[int]:
     return _parse_seed_values(raw)
 
 
-def _random_unique_seeds(count: int) -> list[int]:
+def _random_unique_seeds(count: int, exclude: set[int] | None = None) -> list[int]:
     if count <= 0:
         raise RuntimeError("samples must be > 0")
+    blocked = set(exclude or set())
     seeds: list[int] = []
     while len(seeds) < count:
         seed = random.randint(1, SEED_MAX)
+        if seed in blocked:
+            continue
         if seed not in seeds:
             seeds.append(seed)
     return seeds
+
+
+def _unique_preserve_order(values: list[int]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _expand_seed_list_with_random(user_seeds: list[int], samples: int) -> tuple[list[int], int, int]:
+    if samples <= 0:
+        raise RuntimeError("samples must be > 0")
+    base = _unique_preserve_order(user_seeds)
+    if len(base) >= samples:
+        truncated = len(base) - samples
+        return base[:samples], 0, truncated
+    needed = samples - len(base)
+    extra = _random_unique_seeds(needed, exclude=set(base))
+    return base + extra, needed, 0
 
 
 def _pick_scripts_for_stage(
@@ -860,15 +886,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     stage = args.stage
     selected_scripts = _pick_scripts_for_stage(scripts, stage=stage, script_ids=_parse_script_ids(args.script_ids))
 
+    requested_samples = int(args.samples)
+    if requested_samples <= 0:
+        raise RuntimeError("samples must be > 0")
+
     seed_list: list[int]
+    seed_mode = "random_only"
+    random_fill_count = 0
+    truncated_count = 0
     if args.seed_list:
-        seed_list = _parse_seed_values(args.seed_list)
+        seed_mode = "explicit_plus_random_fill"
+        seed_list, random_fill_count, truncated_count = _expand_seed_list_with_random(
+            _parse_seed_values(args.seed_list),
+            requested_samples,
+        )
     elif args.seeds_file:
-        seed_list = _load_seeds_file(Path(args.seeds_file).resolve())
+        seed_mode = "explicit_plus_random_fill"
+        seed_list, random_fill_count, truncated_count = _expand_seed_list_with_random(
+            _load_seeds_file(Path(args.seeds_file).resolve()),
+            requested_samples,
+        )
     else:
         if stage == "b":
             raise RuntimeError("stage b requires --seed-list or --seeds-file")
-        seed_list = _random_unique_seeds(args.samples)
+        seed_list = _random_unique_seeds(requested_samples)
 
     if not seed_list:
         raise RuntimeError("no seeds selected")
@@ -929,6 +970,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         "started_at": started_at,
         "finished_at": dt.datetime.now().isoformat(),
         "seed_count": len(seed_list),
+        "seed_list": seed_list,
+        "seed_mode": seed_mode,
+        "random_fill_count": random_fill_count,
+        "truncated_count": truncated_count,
         "script_ids": [s.script_id for s in selected_scripts],
         "script_titles": [s.title for s in selected_scripts],
         "takes_per_seed": TAKES_PER_SEED,
@@ -1121,8 +1166,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--run-id", default="", help="manual run id")
     run_p.add_argument("--stage", choices=["a", "b", "full"], default="a")
     run_p.add_argument("--script-ids", default="", help="override scripts by id csv (ex: s1,s2)")
-    run_p.add_argument("--samples", type=int, default=DEFAULT_SAMPLES, help="random seed count")
-    run_p.add_argument("--seed-list", default="", help="explicit seed csv")
+    run_p.add_argument("--samples", type=int, default=DEFAULT_SAMPLES, help="target seed count")
+    run_p.add_argument(
+        "--seed-list",
+        default="",
+        help="explicit seed csv; if count < samples random seeds are auto-filled, if > samples truncated",
+    )
     run_p.add_argument("--seeds-file", default="", help="explicit seeds file (.txt or .json)")
     run_p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     run_p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
