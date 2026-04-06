@@ -21,6 +21,7 @@ import os
 import random
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -31,7 +32,7 @@ from typing import Any
 
 SEED_MAX = 2_147_483_647
 DEFAULT_OUTPUT_ROOT = "seed-lab-runs"
-DEFAULT_CONCURRENCY = 4
+DEFAULT_CONCURRENCY = 2
 DEFAULT_TIMEOUT = 300
 DEFAULT_SAMPLES = 20
 DEFAULT_STAGE_B_TOP = 20
@@ -213,6 +214,25 @@ def _random_unique_seeds(count: int, exclude: set[int] | None = None) -> list[in
         if seed not in seeds:
             seeds.append(seed)
     return seeds
+
+
+def _is_network_origin_error(detail: str) -> bool:
+    normalized = (detail or "").lower()
+    markers = (
+        "http 502",
+        "bad gateway",
+        "unable to reach the origin service",
+        "connection reset by peer",
+        "incoming request ended abruptly",
+        "temporarily unavailable",
+        "timed out",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "connecterror",
+        "readtimeout",
+        "connecttimeout",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _unique_preserve_order(values: list[int]) -> list[int]:
@@ -840,6 +860,7 @@ def _worker_generate_one(
 
     attempt = 0
     last_error = ""
+    network_backoff_seconds = 1.5
     while attempt <= retries:
         attempt += 1
         try:
@@ -857,13 +878,19 @@ def _worker_generate_one(
                 "script_text": script.text,
                 "audio_rel_path": audio_rel,
                 "status": "ready",
+                "error_type": "",
                 "error": "",
                 "bytes": len(audio_bytes),
             }
         except Exception as e:
             last_error = str(e)
+            should_backoff = _is_network_origin_error(last_error)
+            if should_backoff and attempt <= retries:
+                wait_seconds = min(12.0, network_backoff_seconds * (2 ** (attempt - 1)))
+                time.sleep(wait_seconds)
             if attempt > retries:
                 break
+    error_type = "network_origin_unreachable" if _is_network_origin_error(last_error) else "generation_error"
     return {
         "sample_id": sample_id,
         "seed": seed,
@@ -873,6 +900,7 @@ def _worker_generate_one(
         "script_text": script.text,
         "audio_rel_path": "",
         "status": "failed",
+        "error_type": error_type,
         "error": last_error[:800],
         "bytes": 0,
     }
@@ -964,6 +992,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     ready = sum(1 for r in records if r.get("status") in ("ready", "skipped_existing"))
     failed = sum(1 for r in records if r.get("status") == "failed")
+    network_fail_count = sum(1 for r in records if r.get("status") == "failed" and r.get("error_type") == "network_origin_unreachable")
+    http_502_count = sum(1 for r in records if r.get("status") == "failed" and "http 502" in str(r.get("error", "")).lower())
 
     meta = {
         "run_id": run_id,
@@ -985,6 +1015,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "retries": int(args.retries),
         "ready_count": ready,
         "failed_count": failed,
+        "network_fail_count": network_fail_count,
+        "http_502_count": http_502_count,
     }
     _write_manifest(run_dir, meta, records)
     _generate_review_html(run_id, records, run_dir / "index.html")
@@ -994,6 +1026,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"[seed-lab] output={run_dir}")
     print(f"[seed-lab] takes_per_seed={takes_per_seed}")
     print(f"[seed-lab] ready={ready} failed={failed} total={len(records)}")
+    print(f"[seed-lab] network_fail={network_fail_count} http_502={http_502_count}")
     print(f"[seed-lab] review_html={run_dir / 'index.html'}")
     print("")
     print("[next]")

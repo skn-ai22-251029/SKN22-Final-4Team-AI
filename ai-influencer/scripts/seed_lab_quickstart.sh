@@ -22,9 +22,9 @@ Behavior:
   - Ensures scripts/seed_lab_dataset.local.json exists
     (copies from example on first run)
   - Default mode:
-    samples=30, takes_per_seed=1, concurrency=4 (총 30개)
+    samples=30, takes_per_seed=1, concurrency=2 (총 30개)
   - Dup mode (-dup/--dup):
-    samples=10, takes_per_seed=3, concurrency=4 (총 30개)
+    samples=10, takes_per_seed=3, concurrency=2 (총 30개)
   - In default mode, if provided seed list has fewer than 30 seeds,
     remaining seeds are auto-filled randomly
   - In dup mode, if provided seed list has fewer than 10 seeds,
@@ -42,7 +42,7 @@ fi
 
 SAMPLES=30
 TAKES_PER_SEED=1
-CONCURRENCY=4
+CONCURRENCY=2
 OPEN_BROWSER=1
 DUP_MODE=0
 SEED_LIST=""
