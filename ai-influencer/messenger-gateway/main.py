@@ -969,12 +969,20 @@ def _validate_subtitle_script(tts_script_text: str, subtitle_script_text: str) -
             raise RuntimeError("tts_script_text ending line mismatch before subtitle conversion")
 
 
-def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> None:
+def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
+    warning_message = ""
     keywords = _extract_topic_keywords(raw_report_text)
     if keywords:
         tts_ok = any(keyword in tts_script_text for keyword in keywords)
         if not tts_ok:
-            raise RuntimeError(f"script rewrite topic drift detected; missing keywords={keywords}")
+            drift_message = f"script rewrite topic drift detected; missing keywords={keywords}"
+            if settings.script_rewrite_topic_keyword_guard_enabled:
+                raise RuntimeError(drift_message)
+            warning_message = drift_message
+            logger.warning(
+                "[script-rewrite] keyword drift ignored by config (SCRIPT_REWRITE_TOPIC_KEYWORD_GUARD_ENABLED=false): %s",
+                drift_message,
+            )
     tts_len = _script_char_count(tts_script_text)
     if not (_SCRIPT_MIN_CHARS <= tts_len <= _SCRIPT_MAX_CHARS):
         raise RuntimeError(
@@ -987,6 +995,7 @@ def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> None:
         raise RuntimeError("tts_script_text opening line mismatch")
     if not tts_lines[-1].endswith(SCRIPT_ENDING_LINE):
         raise RuntimeError("tts_script_text ending line mismatch")
+    return warning_message
 
 
 async def _rewrite_report_to_script(
@@ -1064,7 +1073,9 @@ async def _rewrite_report_to_script(
                 prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
                 continue
             try:
-                _validate_tts_script(raw_report_text, tts_script_text)
+                warning_message = _validate_tts_script(raw_report_text, tts_script_text)
+                if warning_message:
+                    attempt_record["validation_warning"] = warning_message
                 prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
                 prompt_log["rewrite"]["final"]["tts_script_text"] = tts_script_text
                 prompt_log["rewrite"]["final"]["tts_prompt_final"] = attempt_record["prompt"]
@@ -1316,6 +1327,30 @@ def _upload_tts_script_file(
     )
     logger.info("[storage] tts script uploaded job_id=%s filename=%s s3_uri=%s", job_id, normalized_filename, stored.s3_uri)
     return stored, merged_script
+
+
+def _upload_subtitle_report_file(
+    *,
+    job_id: str,
+    filename: str,
+    file_bytes: bytes,
+) -> tuple[object | None, Exception | None, bool]:
+    stored = None
+    upload_error = None
+    try:
+        stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_reports,
+            filename=filename,
+            content=file_bytes,
+            content_type="text/plain; charset=utf-8",
+        )
+    except Exception as e:
+        upload_error = e
+        logger.error("[storage] report upload failed job_id=%s: %s", job_id, e)
+
+    attachment_limit = _discord_attachment_limit_bytes()
+    is_link_only_report = stored.size_bytes > attachment_limit if stored else len(file_bytes) > attachment_limit
+    return stored, upload_error, is_link_only_report
 
 
 def _build_tts_variant_caption(variant_index: int, seed: Optional[int]) -> str:
@@ -2508,25 +2543,60 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             )
         except Exception as e:
             logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
+        stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
+            job_id=body.job_id,
+            filename=filename,
+            file_bytes=file_bytes,
+        )
+        if upload_error is not None:
+            error_message = f"subtitle report upload failed: {upload_error}"
+            logger.error("[report-select] %s job_id=%s", error_message, body.job_id)
+            await job_service.transition_status(body.job_id, "FAILED")
+            await job_service.update_job(
+                body.job_id,
+                error_message=error_message,
+                script_json=merged_script,
+                final_url=None,
+            )
+            await _discord_adapter.send_text_message(channel_id, "❌ 자막 파일 S3 저장에 실패했습니다. 다시 시도해주세요.")
+            return
+
+        report_storage_url = stored.s3_uri if stored else ""
         await job_service.update_job(
             body.job_id,
             script_json=merged_script,
+            final_url=report_storage_url or None,
         )
 
         text = final_script_text
         if len(text) > 1800:
-            text = text[:1800] + "\n\n[전체 내용은 첨부 파일 참조]"
+            overflow_hint = (
+                "[전체 내용은 아래 링크 참조]"
+                if is_link_only_report
+                else "[전체 내용은 첨부 파일 참조]"
+            )
+            text = text[:1800] + f"\n\n{overflow_hint}"
 
         try:
-            await _discord_adapter.send_file_message(
-                channel_id=channel_id,
-                text=text,
-                file_bytes=file_bytes,
-                filename=filename,
-                include_tts_button=True,
-                include_video_button=True,
-                job_id=body.job_id,
-            )
+            if is_link_only_report:
+                await _discord_adapter.send_report_link_message(
+                    channel_id=channel_id,
+                    text=text,
+                    report_url=stored.presigned_url if stored else "",
+                    include_tts_button=True,
+                    include_video_button=True,
+                    job_id=body.job_id,
+                )
+            else:
+                await _discord_adapter.send_file_message(
+                    channel_id=channel_id,
+                    text=text,
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    include_tts_button=True,
+                    include_video_button=True,
+                    job_id=body.job_id,
+                )
         except Exception as e:
             logger.error("[report-select] send_file_message failed job_id=%s: %s", body.job_id, e)
             return
@@ -2606,21 +2676,11 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     except Exception as e:
         logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
 
-    stored = None
-    upload_error = None
-    try:
-        stored = put_bytes_and_presign(
-            prefix=settings.media_s3_prefix_reports,
-            filename=filename,
-            content=file_bytes,
-            content_type="text/plain; charset=utf-8",
-        )
-    except Exception as e:
-        upload_error = e
-        logger.error("[storage] report upload failed job_id=%s: %s", body.job_id, e)
-
-    attachment_limit = _discord_attachment_limit_bytes()
-    is_link_only_report = stored.size_bytes > attachment_limit if stored else len(file_bytes) > attachment_limit
+    stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
+        job_id=body.job_id,
+        filename=filename,
+        file_bytes=file_bytes,
+    )
     # Discord 첨부 제한을 넘으면 링크 메시지로 전환하고, 그마저 업로드가 없으면 에러로 본다.
     if upload_error is not None and is_link_only_report:
         raise HTTPException(status_code=500, detail=f"Report upload failed: {upload_error}")
@@ -2641,7 +2701,17 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
         script_json=merged_script,
     )
 
-    if _should_skip_auto_report_discord_delivery(existing_job):
+    is_auto_report_job = _is_auto_report_job(existing_job)
+    should_skip_discord_delivery = _should_skip_auto_report_discord_delivery(existing_job)
+    logger.info(
+        "[discord] send_report decision job_id=%s auto_report=%s delivery_enabled=%s decision=%s",
+        body.job_id,
+        is_auto_report_job,
+        settings.auto_report_discord_delivery_enabled,
+        "stored_only" if should_skip_discord_delivery else "sent",
+    )
+
+    if should_skip_discord_delivery:
         logger.info(
             "[discord] send_report skipped for auto-report job_id=%s filename=%s",
             body.job_id,

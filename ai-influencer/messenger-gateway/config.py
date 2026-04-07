@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     auto_report_stale_minutes: int = 45
     openai_api_key: str = ""
     script_rewrite_model: str = "gpt-5.4"
+    script_rewrite_topic_keyword_guard_enabled: bool = False
 
     n8n_wf01_webhook_url: str = "http://n8n:5678/webhook/Mt5nwvystMhfO1nl/webhook/wf-01-input"
     n8n_wf05_webhook_url: str = "http://n8n:5678/webhook/gD9A0qy9MxY8g0T6/webhook/wf-05-confirm"
