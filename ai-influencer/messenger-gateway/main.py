@@ -570,14 +570,6 @@ def _build_publish_caption(subtitle_script_text: str) -> str:
     return subtitle_script_text.strip()[:2200]
 
 
-async def _persist_job_avatar_override(job_id: str, existing_script_json: object, avatar_id: str) -> dict:
-    merged_script = _merge_script_json_with_media_names(
-        existing_script_json,
-        heygen_avatar_id=avatar_id,
-    )
-    return await job_service.update_job(job_id, script_json=merged_script)
-
-
 async def _register_generated_content(
     *,
     job_id: str,
@@ -614,31 +606,15 @@ async def _register_generated_content(
         return "", str(e)
 
 
-async def _resolve_heygen_avatar_id(job: dict, *, requested_avatar_id: str = "") -> tuple[str, str]:
-    explicit_avatar_id = (requested_avatar_id or "").strip()
-    if explicit_avatar_id:
-        return explicit_avatar_id, "request"
-
-    script_json = _as_script_json(job.get("script_json"))
-    job_avatar_id = _get_job_avatar_override(script_json)
-    if job_avatar_id:
-        return job_avatar_id, "job"
-
-    character_id = str(job.get("character_id") or "").strip()
-    if character_id:
-        character = await job_service.get_character(character_id)
-        if character is not None:
-            character_avatar_id = str(character.get("heygen_avatar_id") or "").strip()
-            if character_avatar_id:
-                return character_avatar_id, "character"
-
+async def _resolve_heygen_avatar_id(_: dict) -> tuple[str, str]:
+    # 운영 정책: Avatar ID는 env(HEYGEN_AVATAR_ID) 단일값만 사용한다.
     env_avatar_id = settings.heygen_avatar_id.strip()
     if env_avatar_id:
         return env_avatar_id, "env"
 
     raise HTTPException(
         status_code=400,
-        detail="No HeyGen avatar configured. Provide avatar_id, set job override, or configure character default.",
+        detail="No HeyGen avatar configured. Set HEYGEN_AVATAR_ID in env.",
     )
 
 
@@ -3513,8 +3489,11 @@ async def report_to_video(_: AuthDep, body: ReportToVideoRequest) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if (body.avatar_id or "").strip():
-        job = await _persist_job_avatar_override(body.job_id, job.get("script_json"), body.avatar_id)
-    resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job, requested_avatar_id=body.avatar_id)
+        logger.info(
+            "[avatar-policy] ignore requested avatar_id on report_to_video job_id=%s (env-first policy)",
+            body.job_id,
+        )
+    resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
 
     script_json = _as_script_json(job.get("script_json"))
     script_text = _get_tts_script_text(script_json)
