@@ -115,7 +115,7 @@ def build_tts_retry_prompt(
     )
 
 
-def build_subtitle_from_tts_prompt(*, tts_script_text: str) -> str:
+def build_subtitle_from_tts_prompt(*, tts_script_text: str, raw_report_text: str) -> str:
     return (
         "다음 TTS용 대본을 자막용 대본으로 바꿔라.\n"
         "이 작업은 재작성이나 요약이 아니라 문법/표기 보정이다.\n"
@@ -127,12 +127,17 @@ def build_subtitle_from_tts_prompt(*, tts_script_text: str) -> str:
         "- 띄어쓰기, 맞춤법, 문장부호 보정\n"
         "- 숫자, 영문, 고유명사를 자막용 표기로 정리\n"
         "- 조사와 표기만 자연스럽게 다듬기\n"
+        "- 버전/소수/연도/기간 표기를 자막용 숫자 표기로 복원\n"
+        "- 예: 일쩜영→1.0, 이쩜영→2.0, 삼쩜영→3.0, 이천이십육년 사월 육일→2026년 4월 6일, 이년→2년, 육개월→6개월\n"
         "금지 사항은 다음과 같다.\n"
         "- 문장 삭제, 문장 추가, 문장 합치기, 문장 분리\n"
         "- 인사말/호칭 삭제\n"
         "- 의미 축약, 요약, 정리, 어투 변경\n"
+        "- TTS용 대본을 한 글자도 바꾸지 않고 그대로 복사해서 반환\n"
         f"- 마지막 문장 \"{SCRIPT_ENDING_LINE}\" 변경\n"
         "출력은 자막용 대본 본문만 작성한다.\n\n"
+        "[원문 보고서]\n"
+        f"{raw_report_text.strip()}\n\n"
         "[TTS용 대본]\n"
         f"{tts_script_text.strip()}\n"
     )
@@ -140,6 +145,7 @@ def build_subtitle_from_tts_prompt(*, tts_script_text: str) -> str:
 
 def build_subtitle_retry_prompt(
     *,
+    raw_report_text: str,
     tts_script_text: str,
     previous_script_text: str,
     char_count: int,
@@ -158,8 +164,13 @@ def build_subtitle_retry_prompt(
         f"마지막 문장은 반드시 \"{SCRIPT_ENDING_LINE}\"로 유지해야 한다.\n"
         "줄 수와 문장 수를 반드시 유지한다.\n"
         "허용되는 변경은 띄어쓰기, 맞춤법, 문장부호, 숫자/영문/고유명사의 자막 표기 보정뿐이다.\n"
+        "버전/소수/연도/기간은 자막용 숫자 표기로 복원한다.\n"
+        "예: 일쩜영→1.0, 이쩜영→2.0, 삼쩜영→3.0, 이천이십육년 사월 육일→2026년 4월 6일, 이년→2년, 육개월→6개월.\n"
+        "TTS용 대본을 그대로 복사해 반환하면 실패로 간주한다.\n"
         f"{adjustment}\n"
         "출력은 자막용 대본 본문만 작성한다.\n\n"
+        "[원문 보고서]\n"
+        f"{raw_report_text.strip()}\n\n"
         "[TTS용 대본]\n"
         f"{tts_script_text.strip()}\n\n"
         "[이전 결과]\n"

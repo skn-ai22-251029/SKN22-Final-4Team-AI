@@ -942,7 +942,13 @@ def _upload_prompt_log_file(
         return None, merged_script
 
 
-def _validate_subtitle_script(tts_script_text: str, subtitle_script_text: str) -> None:
+def _validate_subtitle_script(
+    tts_script_text: str,
+    subtitle_script_text: str,
+    *,
+    raw_report_text: str = "",
+    enforce_difference: bool = False,
+) -> None:
     subtitle_len = _script_char_count(subtitle_script_text)
     if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
         raise RuntimeError(
@@ -967,6 +973,12 @@ def _validate_subtitle_script(tts_script_text: str, subtitle_script_text: str) -
             raise RuntimeError("subtitle_script_text first line does not preserve tts line")
         if not tts_lines[-1].endswith(SCRIPT_ENDING_LINE):
             raise RuntimeError("tts_script_text ending line mismatch before subtitle conversion")
+    if enforce_difference and subtitle_script_text.strip() == tts_script_text.strip():
+        raise RuntimeError("subtitle_script_text must not be identical to tts_script_text")
+    report_has_alnum = bool(re.search(r"[A-Za-z0-9]", raw_report_text or ""))
+    subtitle_has_alnum = bool(re.search(r"[A-Za-z0-9]", subtitle_script_text or ""))
+    if report_has_alnum and not subtitle_has_alnum:
+        raise RuntimeError("subtitle_script_text must preserve numeric/alphabetic notation from report")
 
 
 def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
@@ -1092,12 +1104,16 @@ async def _rewrite_report_to_script(
             use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
             subtitle_prompt = (
                 build_subtitle_retry_prompt(
+                    raw_report_text=raw_report_text,
                     tts_script_text=tts_script_text,
                     previous_script_text=subtitle_script_text,
                     char_count=_script_char_count(subtitle_script_text),
                 )
                 if use_retry_prompt
-                else build_subtitle_from_tts_prompt(tts_script_text=tts_script_text)
+                else build_subtitle_from_tts_prompt(
+                    tts_script_text=tts_script_text,
+                    raw_report_text=raw_report_text,
+                )
             )
             subtitle_prompt = _sanitize_prompt_text(subtitle_prompt)
             attempt_record = {
@@ -1137,7 +1153,12 @@ async def _rewrite_report_to_script(
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
             try:
-                _validate_subtitle_script(tts_script_text, subtitle_script_text)
+                _validate_subtitle_script(
+                    tts_script_text,
+                    subtitle_script_text,
+                    raw_report_text=raw_report_text,
+                    enforce_difference=True,
+                )
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 prompt_log["rewrite"]["final"] = {
                     "status": "success",
