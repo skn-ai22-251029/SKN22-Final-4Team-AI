@@ -176,7 +176,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ job_id: $('HeyGen Create + Poll').item.json.job_id, video_url: $('HeyGen Create + Poll').item.json.video_url, video_filename: $('HeyGen Create + Poll').item.json.video_filename, channel_id: $('HeyGen Create + Poll').item.json.channel_id, user_id: $('HeyGen Create + Poll').item.json.user_id }) }}",
+        "jsonBody": "={{ JSON.stringify({ job_id: $('HeyGen Create + Poll').item.json.job_id, video_url: $('HeyGen Create + Poll').item.json.video_url, video_filename: $('HeyGen Create + Poll').item.json.video_filename, channel_id: $('HeyGen Create + Poll').item.json.channel_id, user_id: $('HeyGen Create + Poll').item.json.user_id, heygen_status: $('HeyGen Create + Poll').item.json.status, heygen_video_id: $('HeyGen Create + Poll').item.json.video_id, heygen_avatar_id: $('HeyGen Create + Poll').item.json.avatar_id, heygen_use_avatar_iv_model: $('HeyGen Create + Poll').item.json.use_avatar_iv_model, heygen_usage_json: {}, heygen_request_snapshot: $('HeyGen Create + Poll').item.json.request_snapshot || {}, heygen_response_snapshot: $('HeyGen Create + Poll').item.json, heygen_cost_usd: $('HeyGen Create + Poll').item.json.cost_usd || null, heygen_error: $('HeyGen Create + Poll').item.json.error || '' }) }}",
         "options": {}
       },
       "id": "0810d459-151f-4f3f-a939-91bb8ae6c483",
@@ -224,7 +224,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('HeyGen Create + Poll').item.json.channel_id, text: '❌ 영상 생성에 실패했습니다.\\nJob ID: ' + $('HeyGen Create + Poll').item.json.job_id.substring(0,8) + '\\n상태: ' + ($('HeyGen Create + Poll').item.json.error || $('HeyGen Create + Poll').item.json.status) }) }}",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('HeyGen Create + Poll').item.json.channel_id, job_id: $('HeyGen Create + Poll').item.json.job_id, text: '❌ 영상 생성에 실패했습니다.\\nJob ID: ' + $('HeyGen Create + Poll').item.json.job_id.substring(0,8) + '\\n상태: ' + ($('HeyGen Create + Poll').item.json.error || $('HeyGen Create + Poll').item.json.status), cost_event: { job_id: $('HeyGen Create + Poll').item.json.job_id, stage: 'video', process: 'heygen_generate', provider: 'heygen', attempt_no: 1, status: 'failed', usage_json: { video_id: $('HeyGen Create + Poll').item.json.video_id || '', avatar_id: $('HeyGen Create + Poll').item.json.avatar_id || '', use_avatar_iv_model: !!$('HeyGen Create + Poll').item.json.use_avatar_iv_model }, raw_response_json: { request_snapshot: $('HeyGen Create + Poll').item.json.request_snapshot || {}, response_snapshot: $('HeyGen Create + Poll').item.json }, cost_usd: $('HeyGen Create + Poll').item.json.cost_usd || null, error_type: 'heygen_error', error_message: ($('HeyGen Create + Poll').item.json.error || $('HeyGen Create + Poll').item.json.status || '') } }) }}",
         "options": {}
       },
       "id": "d21a8c00-f31e-4596-94af-4744f0ab632c",

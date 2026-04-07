@@ -1,4 +1,5 @@
 from enum import Enum
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
@@ -54,6 +55,8 @@ class SendTextRequest(BaseModel):
     messenger_source: MessengerSource
     messenger_channel_id: str
     text: str
+    job_id: str = ""
+    cost_event: dict = {}
 
 
 class ReportMessageRequest(BaseModel):
@@ -85,6 +88,15 @@ class SendVideoPreviewRequest(BaseModel):
     channel_id: str
     user_id: str
     video_filename: str = ""
+    heygen_status: str = ""
+    heygen_video_id: str = ""
+    heygen_avatar_id: str = ""
+    heygen_use_avatar_iv_model: bool = False
+    heygen_usage_json: dict = {}
+    heygen_request_snapshot: dict = {}
+    heygen_response_snapshot: dict = {}
+    heygen_cost_usd: Optional[float] = None
+    heygen_error: str = ""
 
 
 class SendAudioRequest(BaseModel):
@@ -165,3 +177,21 @@ class AutoReportRequest(BaseModel):
     channel_name: str = ""
     source_url: str = ""
     source_title: str = ""
+
+
+class CostEventIngestRequest(BaseModel):
+    job_id: str
+    topic_text: str = ""
+    stage: str
+    process: str
+    provider: str
+    attempt_no: int = 1
+    status: str
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    usage_json: dict = {}
+    raw_response_json: dict = {}
+    cost_usd: Optional[float] = None
+    error_type: str = ""
+    error_message: str = ""
+    idempotency_key: str = ""

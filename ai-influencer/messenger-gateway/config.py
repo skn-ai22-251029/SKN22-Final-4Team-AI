@@ -71,6 +71,19 @@ class Settings(BaseSettings):
     media_s3_prefix_tts: str = "tts"
     media_s3_prefix_videos: str = "videos"
 
+    # Cost tracking
+    cost_viewer_basic_user: str = ""
+    cost_viewer_basic_password: str = ""
+    cost_usd_krw_rate: float = 1350.0
+    cost_default_list_limit: int = 50
+    cost_max_list_limit: int = 200
+    script_rewrite_input_cost_usd_per_1m: float = 0.0
+    script_rewrite_output_cost_usd_per_1m: float = 0.0
+    tts_cost_usd_per_1k_chars: float = 0.0
+    heygen_fallback_cost_usd_per_video: float = 0.0
+    aws_daily_fixed_usd: float = 0.0
+    runpod_daily_fixed_usd: float = 0.0
+
     class Config:
         env_file = ".env"
         case_sensitive = False

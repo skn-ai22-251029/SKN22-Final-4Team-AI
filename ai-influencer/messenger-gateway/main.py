@@ -3,13 +3,16 @@ import logging
 import base64
 import json
 import re
+import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, Awaitable, Callable, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated, Any, Awaitable, Callable, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from openai import AsyncOpenAI
 
 from adapters.discord_adapter import DiscordAdapter
@@ -31,6 +34,7 @@ from utils.file_naming import build_filename
 from services.storage_service import presign_s3_uri, put_bytes_and_presign
 from models.job import (
     AutoReportRequest,
+    CostEventIngestRequest,
     ChannelSelectRequest,
     CharacterAvatarRequest,
     ConfirmActionRequest,
@@ -51,7 +55,7 @@ from models.job import (
     TtsActionRequest,
     VideoActionRequest,
 )
-from services import job_service, n8n_service
+from services import cost_service, job_service, n8n_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +69,44 @@ _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 _HEYGEN_REQUEST_TIMEOUT_SECONDS = 30.0
 _TTS_VARIANT_COUNT = 3
+_http_basic = HTTPBasic()
+
+
+def _estimate_script_rewrite_cost_usd(usage: dict[str, Any]) -> Optional[float]:
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+    input_rate = float(settings.script_rewrite_input_cost_usd_per_1m)
+    output_rate = float(settings.script_rewrite_output_cost_usd_per_1m)
+    return ((prompt_tokens / 1_000_000.0) * input_rate) + ((completion_tokens / 1_000_000.0) * output_rate)
+
+
+def _estimate_tts_cost_usd(script_text: str) -> Optional[float]:
+    per_1k = float(settings.tts_cost_usd_per_1k_chars)
+    if per_1k <= 0:
+        return None
+    char_count = max(0, _script_char_count(script_text))
+    return (char_count / 1000.0) * per_1k
+
+
+def _estimate_heygen_cost_usd(raw_cost: Optional[float]) -> Optional[float]:
+    if raw_cost is not None:
+        try:
+            return float(raw_cost)
+        except Exception:
+            return None
+    fallback = float(settings.heygen_fallback_cost_usd_per_video)
+    if fallback > 0:
+        return fallback
+    return None
+
+
+async def _record_cost_event_safe(**kwargs: Any) -> None:
+    try:
+        await cost_service.record_event(**kwargs)
+    except Exception as e:
+        logger.warning("[cost] record event failed kwargs_keys=%s err=%s", list(kwargs.keys()), e)
 
 
 def _extract_valid_basename(job_id: str, filename: object) -> Optional[str]:
@@ -1055,6 +1097,7 @@ async def _rewrite_report_to_script(
                 "char_count": 0,
                 "validation_error": "",
             }
+            request_started_at = datetime.now(timezone.utc)
             response = await client.chat.completions.create(
                 model=settings.script_rewrite_model,
                 temperature=0,
@@ -1068,6 +1111,31 @@ async def _rewrite_report_to_script(
                         "content": tts_prompt,
                     },
                 ],
+            )
+            usage_payload: dict[str, Any] = {}
+            if response.usage is not None:
+                usage_payload = {
+                    "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
+                    "model": settings.script_rewrite_model,
+                }
+            await _record_cost_event_safe(
+                job_id=prompt_log.get("job_id", ""),
+                topic_text=str((prompt_log.get("job") or {}).get("concept_text") or ""),
+                stage="script",
+                process="tts_script_rewrite",
+                provider="openai",
+                attempt_no=int(attempt_record["attempt"]),
+                status="success" if bool(response.choices) else "failed",
+                started_at=request_started_at,
+                ended_at=datetime.now(timezone.utc),
+                usage_json=usage_payload,
+                raw_response_json={"prompt": tts_prompt, "has_choices": bool(response.choices)},
+                cost_usd=_estimate_script_rewrite_cost_usd(usage_payload),
+                error_type="",
+                error_message="",
+                idempotency_key=f"script:tts:{prompt_log.get('job_id','')}:{attempt_record['attempt']}",
             )
             if not response.choices:
                 last_error = RuntimeError("tts rewrite returned no choices")
@@ -1123,6 +1191,7 @@ async def _rewrite_report_to_script(
                 "char_count": 0,
                 "validation_error": "",
             }
+            request_started_at = datetime.now(timezone.utc)
             response = await client.chat.completions.create(
                 model=settings.script_rewrite_model,
                 temperature=0,
@@ -1136,6 +1205,31 @@ async def _rewrite_report_to_script(
                         "content": subtitle_prompt,
                     },
                 ],
+            )
+            usage_payload: dict[str, Any] = {}
+            if response.usage is not None:
+                usage_payload = {
+                    "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
+                    "model": settings.script_rewrite_model,
+                }
+            await _record_cost_event_safe(
+                job_id=prompt_log.get("job_id", ""),
+                topic_text=str((prompt_log.get("job") or {}).get("concept_text") or ""),
+                stage="script",
+                process="subtitle_script_rewrite",
+                provider="openai",
+                attempt_no=int(attempt_record["attempt"]),
+                status="success" if bool(response.choices) else "failed",
+                started_at=request_started_at,
+                ended_at=datetime.now(timezone.utc),
+                usage_json=usage_payload,
+                raw_response_json={"prompt": subtitle_prompt, "has_choices": bool(response.choices)},
+                cost_usd=_estimate_script_rewrite_cost_usd(usage_payload),
+                error_type="",
+                error_message="",
+                idempotency_key=f"script:subtitle:{prompt_log.get('job_id','')}:{attempt_record['attempt']}",
             )
             if not response.choices:
                 last_error = RuntimeError("subtitle rewrite returned no choices")
@@ -1497,6 +1591,8 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
 
     tts_body = _build_tts_request_body(script_text, seed=seed)
 
+    request_started_at = datetime.now(timezone.utc)
+    call_nonce = int(request_started_at.timestamp() * 1000)
     async with httpx.AsyncClient(timeout=180.0) as client:
         endpoint = tts_api_url if tts_api_url.rstrip("/").endswith("/tts") else f"{tts_api_url.rstrip('/')}/tts"
         try:
@@ -1506,9 +1602,61 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
                 headers={"Content-Type": "application/json"},
             )
         except httpx.RequestError as e:
+            await _record_cost_event_safe(
+                job_id=job_id,
+                stage="tts",
+                process="generate_tts_audio",
+                provider="runpod_tts",
+                attempt_no=1,
+                status="failed",
+                started_at=request_started_at,
+                ended_at=datetime.now(timezone.utc),
+                usage_json={"seed": seed, "script_chars": _script_char_count(script_text)},
+                raw_response_json={"endpoint": endpoint},
+                cost_usd=_estimate_tts_cost_usd(script_text),
+                error_type="tts_network_error",
+                error_message=f"{type(e).__name__}: {e}",
+                idempotency_key=f"tts:{job_id}:{seed}:network:{call_nonce}",
+            )
             raise RuntimeError(f"TTS API failed [tts_network_error]: {type(e).__name__}: {e}") from e
         if not resp.is_success:
+            await _record_cost_event_safe(
+                job_id=job_id,
+                stage="tts",
+                process="generate_tts_audio",
+                provider="runpod_tts",
+                attempt_no=1,
+                status="failed",
+                started_at=request_started_at,
+                ended_at=datetime.now(timezone.utc),
+                usage_json={"seed": seed, "script_chars": _script_char_count(script_text)},
+                raw_response_json={"endpoint": endpoint, "status_code": resp.status_code, "body": (resp.text or "")[:500]},
+                cost_usd=_estimate_tts_cost_usd(script_text),
+                error_type=_classify_tts_error(resp.text or "", status_code=resp.status_code),
+                error_message=(resp.text or "")[:500],
+                idempotency_key=f"tts:{job_id}:{seed}:http:{resp.status_code}:{call_nonce}",
+            )
             raise RuntimeError(_format_tts_api_error(resp.status_code, resp.text))
+        await _record_cost_event_safe(
+            job_id=job_id,
+            stage="tts",
+            process="generate_tts_audio",
+            provider="runpod_tts",
+            attempt_no=1,
+            status="success",
+            started_at=request_started_at,
+            ended_at=datetime.now(timezone.utc),
+            usage_json={
+                "seed": seed,
+                "script_chars": _script_char_count(script_text),
+                "audio_bytes": len(resp.content or b""),
+            },
+            raw_response_json={"endpoint": endpoint, "status_code": resp.status_code},
+            cost_usd=_estimate_tts_cost_usd(script_text),
+            error_type="",
+            error_message="",
+            idempotency_key=f"tts:{job_id}:{seed}:success:{call_nonce}",
+        )
         return resp.content
 
 
@@ -1964,6 +2112,27 @@ async def verify_secret(x_internal_secret: Annotated[Optional[str], Header()] = 
 
 
 AuthDep = Annotated[None, Depends(verify_secret)]
+
+
+def _verify_cost_viewer_auth(credentials: Annotated[HTTPBasicCredentials, Depends(_http_basic)]) -> None:
+    configured_user = (settings.cost_viewer_basic_user or "").strip()
+    configured_password = (settings.cost_viewer_basic_password or "").strip()
+    if not configured_user or not configured_password:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cost viewer credentials are not configured",
+        )
+    user_ok = secrets.compare_digest(credentials.username, configured_user)
+    password_ok = secrets.compare_digest(credentials.password, configured_password)
+    if not (user_ok and password_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+
+CostViewerAuthDep = Annotated[None, Depends(_verify_cost_viewer_auth)]
 
 
 # ─────────────────────────────────────────
@@ -2790,6 +2959,14 @@ async def send_text(_: AuthDep, body: SendTextRequest) -> dict:
     except Exception as e:
         logger.error("[discord] send_text failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+    if isinstance(body.cost_event, dict) and body.cost_event:
+        payload = dict(body.cost_event)
+        payload["job_id"] = str(payload.get("job_id") or body.job_id or "").strip()
+        if payload["job_id"]:
+            try:
+                await cost_service.ingest_event(payload)
+            except Exception as e:
+                logger.warning("[cost] failed to ingest cost_event from send-text job_id=%s err=%s", payload["job_id"], e)
     return {"status": "sent"}
 
 
@@ -3080,6 +3257,7 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         body.video_filename,
         existing_job.get("script_json") if existing_job else None,
     )
+    video_started_at = datetime.now(timezone.utc)
     try:
         video_resp = await _http_client.get(body.video_url, timeout=300.0)
         video_resp.raise_for_status()
@@ -3117,6 +3295,38 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         content_url=stored.s3_uri,
     )
 
+    heygen_usage_json = body.heygen_usage_json if isinstance(body.heygen_usage_json, dict) else {}
+    request_snapshot = body.heygen_request_snapshot if isinstance(body.heygen_request_snapshot, dict) else {}
+    response_snapshot = body.heygen_response_snapshot if isinstance(body.heygen_response_snapshot, dict) else {}
+    await _record_cost_event_safe(
+        job_id=body.job_id,
+        topic_text=str(existing_job.get("concept_text") or "") if isinstance(existing_job, dict) else "",
+        stage="video",
+        process="heygen_generate",
+        provider="heygen",
+        attempt_no=1,
+        status="success",
+        started_at=video_started_at,
+        ended_at=datetime.now(timezone.utc),
+        usage_json={
+            **heygen_usage_json,
+            "video_id": body.heygen_video_id,
+            "avatar_id": body.heygen_avatar_id,
+            "use_avatar_iv_model": body.heygen_use_avatar_iv_model,
+            "status": body.heygen_status or "completed",
+        },
+        raw_response_json={
+            "request_snapshot": request_snapshot,
+            "response_snapshot": response_snapshot,
+            "video_url": body.video_url,
+            "video_filename": normalized_video_filename,
+        },
+        cost_usd=_estimate_heygen_cost_usd(body.heygen_cost_usd),
+        error_type="",
+        error_message="",
+        idempotency_key=f"video:heygen:{body.job_id}:{body.heygen_video_id or normalized_video_filename}",
+    )
+
     merged_script = _merge_script_json_with_media_names(
         existing_script_json,
         video_filename=normalized_video_filename,
@@ -3131,6 +3341,10 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         final_url=video_storage_url,
         script_json=merged_script,
     )
+    try:
+        await cost_service.allocate_daily_fixed_cost(target_date=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).date())
+    except Exception as e:
+        logger.warning("[cost] daily fixed allocation failed job_id=%s err=%s", body.job_id, e)
     logger.info("[discord] send_video_preview done job_id=%s", body.job_id)
     return {
         "job_id": body.job_id,
@@ -3496,6 +3710,228 @@ async def list_jobs(_: AuthDep, body: ListJobsRequest) -> dict:
     ]
 
     return {"purpose": purpose, "count": len(jobs), "jobs": jobs}
+
+
+@app.post("/internal/cost-events")
+async def ingest_cost_event(_: AuthDep, body: CostEventIngestRequest) -> dict:
+    inserted = await cost_service.ingest_event(body.model_dump())
+    return {"status": "ok", "inserted": bool(inserted)}
+
+
+def _parse_ymd(text: str) -> Optional[date]:
+    value = (text or "").strip()
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"invalid date format: {value} (expected YYYY-MM-DD)")
+
+
+def _cost_viewer_html() -> str:
+    return """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hari Cost Viewer</title>
+  <style>
+    :root { --line:#d0d7de; --bg:#f7fafc; --panel:#ffffff; --text:#0f172a; --muted:#64748b; --accent:#0f766e; }
+    body { margin:0; padding:16px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    input, select, button { padding:8px 10px; border:1px solid var(--line); border-radius:8px; font-size:13px; }
+    button.primary { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:12px; }
+    th, td { border-bottom:1px solid var(--line); text-align:left; padding:8px; vertical-align:top; word-break:break-word; }
+    .muted { color:var(--muted); }
+    pre { background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; }
+    .ok { color:#166534; font-weight:700; }
+    .bad { color:#b91c1c; font-weight:700; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h2 style="margin:0 0 10px 0;">Cost Viewer</h2>
+    <div class="row">
+      <input id="fromDate" placeholder="from YYYY-MM-DD" />
+      <input id="toDate" placeholder="to YYYY-MM-DD" />
+      <input id="queryText" placeholder="job_id / 주제 검색" style="min-width:220px;" />
+      <select id="statusFilter">
+        <option value="">상태 전체</option>
+        <option value="PUBLISHED">PUBLISHED</option>
+        <option value="WAITING_VIDEO_APPROVAL">WAITING_VIDEO_APPROVAL</option>
+        <option value="FAILED">FAILED</option>
+      </select>
+      <button class="primary" id="searchBtn">조회</button>
+      <button id="exportRangeBtn">JSON Export(범위)</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <span id="summary" class="muted">-</span>
+    </div>
+  </div>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:120px;">job_id</th>
+          <th style="width:220px;">topic</th>
+          <th style="width:120px;">status</th>
+          <th style="width:140px;">script(s/f)</th>
+          <th style="width:140px;">tts(s/f)</th>
+          <th style="width:140px;">video(s/f)</th>
+          <th style="width:120px;">USD</th>
+          <th style="width:120px;">KRW</th>
+          <th style="width:180px;">action</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <h3 style="margin:0 0 8px 0;">Job Detail</h3>
+    <pre id="detailBox">job를 선택하면 상세 이벤트(JSON)가 표시됩니다.</pre>
+  </div>
+  <script>
+    async function fetchJson(url) {
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${text}`);
+      }
+      return await resp.json();
+    }
+
+    function q(id) { return document.getElementById(id); }
+    function num(v) { return Number(v || 0); }
+    function usd(v) { return num(v).toFixed(6); }
+    function krw(v) { return Math.round(num(v)).toLocaleString(); }
+
+    function buildListUrl() {
+      const params = new URLSearchParams();
+      const from = q("fromDate").value.trim();
+      const to = q("toDate").value.trim();
+      const query = q("queryText").value.trim();
+      const status = q("statusFilter").value.trim();
+      if (from) params.set("from", from);
+      if (to) params.set("to", to);
+      if (query) params.set("q", query);
+      if (status) params.set("status", status);
+      params.set("limit", "100");
+      params.set("offset", "0");
+      return "/costs/api/jobs?" + params.toString();
+    }
+
+    function buildExportUrl() {
+      const params = new URLSearchParams();
+      const from = q("fromDate").value.trim();
+      const to = q("toDate").value.trim();
+      if (from) params.set("from", from);
+      if (to) params.set("to", to);
+      return "/costs/api/export?" + params.toString();
+    }
+
+    async function loadRows() {
+      q("rows").innerHTML = "";
+      q("summary").textContent = "조회 중...";
+      const data = await fetchJson(buildListUrl());
+      const items = Array.isArray(data.items) ? data.items : [];
+      for (const rec of items) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${String(rec.job_id || "").slice(0, 8)}</td>
+          <td>${String(rec.topic_text || "").slice(0, 120)}</td>
+          <td>${String(rec.status || "")}</td>
+          <td>${rec.script_success}/${rec.script_failed}</td>
+          <td>${rec.tts_success}/${rec.tts_failed}</td>
+          <td>${rec.video_success}/${rec.video_failed}</td>
+          <td>${usd(rec.total_cost_usd)}</td>
+          <td>${krw(rec.total_cost_krw)}</td>
+          <td></td>
+        `;
+        const actionTd = tr.children[8];
+        const detailBtn = document.createElement("button");
+        detailBtn.className = "primary";
+        detailBtn.textContent = "상세";
+        detailBtn.onclick = async () => {
+          const detail = await fetchJson(`/costs/api/jobs/${rec.job_id}`);
+          q("detailBox").textContent = JSON.stringify(detail, null, 2);
+        };
+        const exportBtn = document.createElement("button");
+        exportBtn.textContent = "JSON";
+        exportBtn.style.marginLeft = "6px";
+        exportBtn.onclick = () => {
+          window.open(`/costs/api/export?job_id=${encodeURIComponent(rec.job_id)}`, "_blank");
+        };
+        actionTd.appendChild(detailBtn);
+        actionTd.appendChild(exportBtn);
+        q("rows").appendChild(tr);
+      }
+      q("summary").textContent = `total=${data.total} rows=${items.length}`;
+    }
+
+    q("searchBtn").addEventListener("click", async () => {
+      try { await loadRows(); } catch (e) { q("summary").textContent = String(e); }
+    });
+    q("exportRangeBtn").addEventListener("click", () => window.open(buildExportUrl(), "_blank"));
+    loadRows().catch((e) => q("summary").textContent = String(e));
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/costs", response_class=HTMLResponse)
+async def costs_page(_: CostViewerAuthDep) -> HTMLResponse:
+    return HTMLResponse(_cost_viewer_html())
+
+
+@app.get("/costs/api/jobs")
+async def costs_jobs(
+    _: CostViewerAuthDep,
+    from_date: str = Query("", alias="from"),
+    to_date: str = Query("", alias="to"),
+    q: str = Query("", alias="q"),
+    status_filter: str = Query("", alias="status"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    resolved_limit = max(1, min(int(limit), int(settings.cost_max_list_limit)))
+    payload = await cost_service.list_jobs_summary(
+        from_date=_parse_ymd(from_date),
+        to_date=_parse_ymd(to_date),
+        q=q,
+        status=status_filter,
+        limit=resolved_limit,
+        offset=offset,
+    )
+    return payload
+
+
+@app.get("/costs/api/jobs/{job_id}")
+async def costs_job_detail(_: CostViewerAuthDep, job_id: str) -> dict:
+    try:
+        return await cost_service.get_job_detail(job_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.get("/costs/api/export")
+async def costs_export(
+    _: CostViewerAuthDep,
+    job_id: str = Query(""),
+    from_date: str = Query("", alias="from"),
+    to_date: str = Query("", alias="to"),
+) -> JSONResponse:
+    payload = await cost_service.export_payload(
+        job_id=job_id.strip(),
+        from_date=_parse_ymd(from_date),
+        to_date=_parse_ymd(to_date),
+    )
+    filename = f"cost-export-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/health")

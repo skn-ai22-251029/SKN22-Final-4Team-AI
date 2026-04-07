@@ -24,6 +24,66 @@ def _normalize_job_row(row: asyncpg.Record | None) -> Optional[dict[str, Any]]:
 
 async def _ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pricing_snapshots (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                provider            TEXT NOT NULL,
+                product             TEXT NOT NULL,
+                model               TEXT NOT NULL DEFAULT '',
+                unit_type           TEXT NOT NULL,
+                unit_price_usd      NUMERIC,
+                effective_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                effective_to        TIMESTAMPTZ,
+                source_note         TEXT,
+                created_at          TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_fixed_cost_pool (
+                cost_date_kst           DATE PRIMARY KEY,
+                aws_fixed_usd           NUMERIC NOT NULL DEFAULT 0,
+                runpod_fixed_usd        NUMERIC NOT NULL DEFAULT 0,
+                usd_krw_rate            NUMERIC NOT NULL DEFAULT 0,
+                eligible_job_count      INT NOT NULL DEFAULT 0,
+                allocated_per_job_usd   NUMERIC NOT NULL DEFAULT 0,
+                created_at              TIMESTAMPTZ DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cost_events (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                job_id               UUID REFERENCES jobs(id) ON DELETE CASCADE,
+                topic_text           TEXT,
+                stage                TEXT NOT NULL,
+                process              TEXT NOT NULL,
+                provider             TEXT NOT NULL,
+                attempt_no           INT NOT NULL DEFAULT 1,
+                status               TEXT NOT NULL CHECK (status IN ('success','failed')),
+                started_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                ended_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                duration_ms          INT NOT NULL DEFAULT 0,
+                usage_json           JSONB NOT NULL DEFAULT '{}'::jsonb,
+                raw_response_json    JSONB NOT NULL DEFAULT '{}'::jsonb,
+                cost_usd             NUMERIC,
+                usd_krw_rate         NUMERIC,
+                cost_krw             NUMERIC,
+                error_type           TEXT,
+                error_message        TEXT,
+                idempotency_key      TEXT NOT NULL,
+                created_at           TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (idempotency_key)
+            )
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_job_created_idx ON cost_events(job_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_stage_status_created_idx ON cost_events(stage, status, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_provider_created_idx ON cost_events(provider, created_at DESC)")
         await conn.execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS heygen_avatar_id TEXT")
         await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS status TEXT")
         await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS platform_post_url TEXT")
