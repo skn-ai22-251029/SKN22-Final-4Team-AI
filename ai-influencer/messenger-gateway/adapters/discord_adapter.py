@@ -9,6 +9,7 @@ from .base import MessengerAdapter
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://discord.com/api/v10"
+_AVATAR_BUTTON_LABELS = ("정장", "후드", "셔츠")
 
 
 class DiscordAdapter(MessengerAdapter):
@@ -421,34 +422,13 @@ class DiscordAdapter(MessengerAdapter):
         audio_bytes: bytes,
         filename: str,
         include_wf12_button: bool = True,
+        selected_avatar_index: Optional[int] = None,
     ) -> tuple[str, str]:
-        components = []
-        if include_wf12_button:
-            components = [
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "✅ 일반 승인",
-                            "style": 3,
-                            "custom_id": f"tts_approve_standard:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "💎 고화질 승인",
-                            "style": 2,
-                            "custom_id": f"tts_approve_hd:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "❌ 반려",
-                            "style": 4,
-                            "custom_id": f"tts_reject:{job_id}",
-                        },
-                    ],
-                }
-            ]
+        components = self._build_tts_approval_components(
+            job_id=job_id,
+            include_wf12_button=include_wf12_button,
+            selected_avatar_index=selected_avatar_index,
+        )
 
         payload_json = json.dumps({"content": caption, "components": components})
         resp = await self._client.post(
@@ -598,34 +578,15 @@ class DiscordAdapter(MessengerAdapter):
         channel_id: str,
         job_id: str,
         caption: str,
+        selected_avatar_index: Optional[int] = None,
     ) -> str:
         payload = {
             "content": caption,
-            "components": [
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "✅ 일반 승인",
-                            "style": 3,
-                            "custom_id": f"tts_approve_standard:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "💎 고화질 승인",
-                            "style": 2,
-                            "custom_id": f"tts_approve_hd:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "❌ 반려",
-                            "style": 4,
-                            "custom_id": f"tts_reject:{job_id}",
-                        },
-                    ],
-                }
-            ],
+            "components": self._build_tts_approval_components(
+                job_id=job_id,
+                include_wf12_button=True,
+                selected_avatar_index=selected_avatar_index,
+            ),
         }
         resp = await self._client.post(
             f"{BASE_URL}/channels/{channel_id}/messages",
@@ -645,34 +606,13 @@ class DiscordAdapter(MessengerAdapter):
         caption: str,
         audio_url: str,
         include_wf12_button: bool = True,
+        selected_avatar_index: Optional[int] = None,
     ) -> str:
-        components = []
-        if include_wf12_button:
-            components = [
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "✅ 일반 승인",
-                            "style": 3,
-                            "custom_id": f"tts_approve_standard:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "💎 고화질 승인",
-                            "style": 2,
-                            "custom_id": f"tts_approve_hd:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "❌ 반려",
-                            "style": 4,
-                            "custom_id": f"tts_reject:{job_id}",
-                        },
-                    ],
-                }
-            ]
+        components = self._build_tts_approval_components(
+            job_id=job_id,
+            include_wf12_button=include_wf12_button,
+            selected_avatar_index=selected_avatar_index,
+        )
         prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
         suffix = f"\n\n📎 TTS 링크(24시간 유효):\n{audio_url}"
         max_prefix_len = max(0, 1900 - len(suffix))
@@ -690,3 +630,54 @@ class DiscordAdapter(MessengerAdapter):
         message_id = str(data["id"])
         logger.info("[discord] send_tts_link_message job=%s message_id=%s", job_id, message_id)
         return message_id
+
+    def _build_tts_approval_components(
+        self,
+        *,
+        job_id: str,
+        include_wf12_button: bool,
+        selected_avatar_index: Optional[int],
+    ) -> list[dict]:
+        if not include_wf12_button:
+            return []
+        avatar_buttons = []
+        normalized_index = selected_avatar_index if isinstance(selected_avatar_index, int) else None
+        for idx, label in enumerate(_AVATAR_BUTTON_LABELS):
+            is_selected = normalized_index == idx
+            avatar_buttons.append(
+                {
+                    "type": 2,
+                    "label": f"{'✅ ' if is_selected else ''}{label}",
+                    "style": 3 if is_selected else 2,
+                    "custom_id": f"tts_avatar_pick:{job_id}:{idx}",
+                }
+            )
+        return [
+            {
+                "type": 1,
+                "components": avatar_buttons,
+            },
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "label": "✅ 일반 승인",
+                        "style": 3,
+                        "custom_id": f"tts_approve_standard:{job_id}",
+                    },
+                    {
+                        "type": 2,
+                        "label": "💎 고화질 승인",
+                        "style": 2,
+                        "custom_id": f"tts_approve_hd:{job_id}",
+                    },
+                    {
+                        "type": 2,
+                        "label": "❌ 반려",
+                        "style": 4,
+                        "custom_id": f"tts_reject:{job_id}",
+                    },
+                ],
+            },
+        ]

@@ -35,6 +35,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      tts-router-service:
+        condition: service_healthy
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: ${POSTGRES_HOST}
@@ -118,6 +120,8 @@ services:
         condition: service_started
       heygen-pipeline-service:
         condition: service_started
+      tts-router-service:
+        condition: service_healthy
     environment:
       GATEWAY_PORT: ${GATEWAY_PORT}
       GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
@@ -235,6 +239,28 @@ services:
       DB_NAME: ${PERSONA_DB_NAME:-}
       DB_USER: ${PERSONA_DB_USER:-}
       DB_PASSWORD: ${PERSONA_DB_PASSWORD:-}
+    networks:
+      - internal
+
+  tts-router-service:
+    build: ./tts-router-service
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=2).getcode()==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    environment:
+      TTS_ROUTER_MODE: ${TTS_ROUTER_MODE:-legacy_http}
+      TTS_ROUTER_FAILOPEN_TO_LEGACY: ${TTS_ROUTER_FAILOPEN_TO_LEGACY:-true}
+      TTS_LEGACY_API_URL: ${TTS_API_URL:-}
+      TTS_REQUEST_TIMEOUT_SECONDS: ${TTS_REQUEST_TIMEOUT_SECONDS:-300}
+      RUNPOD_API_KEY: ${RUNPOD_API_KEY:-}
+      RUNPOD_SERVERLESS_ENDPOINT_ID: ${RUNPOD_SERVERLESS_ENDPOINT_ID:-}
+      RUNPOD_API_BASE_URL: ${RUNPOD_API_BASE_URL:-https://api.runpod.ai/v2}
+      RUNPOD_POLL_INTERVAL_SECONDS: ${RUNPOD_POLL_INTERVAL_SECONDS:-2}
+      RUNPOD_MAX_WAIT_SECONDS: ${RUNPOD_MAX_WAIT_SECONDS:-300}
     networks:
       - internal
 

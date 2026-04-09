@@ -513,6 +513,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     # tts_approve_hd:               tts_approve_hd:{job_id}
     # tts_approve_hd_confirm:       tts_approve_hd_confirm:{job_id}
     # tts_approve_hd_cancel:        tts_approve_hd_cancel:{job_id}
+    # tts_avatar_pick:              tts_avatar_pick:{job_id}:{avatar_index}
     # tts_select:                   tts_select:{job_id}:{batch_id}:{variant_index}
     # tts_regenerate:               tts_regenerate:{job_id}:{batch_id}
     # tts_reject:        tts_reject:{job_id}
@@ -528,6 +529,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     channel_id_value = None
     batch_id = ""
     variant_index = None
+    avatar_index = None
     # 버튼 종류마다 인코딩된 파라미터 수가 달라서 여기서 먼저 분해한다.
     if action == "video_reject_step" and len(parts) >= 3:
         job_id = parts[1]
@@ -549,6 +551,9 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "tts_regenerate" and len(parts) >= 3:
         job_id = parts[1]
         batch_id = parts[2]
+    elif action == "tts_avatar_pick" and len(parts) >= 3:
+        job_id = parts[1]
+        avatar_index = int(parts[2])
     elif action in {
         "tts_approve_standard",
         "tts_approve_standard_confirm",
@@ -770,6 +775,26 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 },
             )
             await interaction.followup.send("🔁 TTS 후보 3개를 다시 생성합니다.", ephemeral=True)
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action == "tts_avatar_pick":
+        try:
+            if avatar_index is None:
+                raise RuntimeError("avatar_index is required")
+            await gateway_call(
+                "/internal/tts-action",
+                {
+                    "job_id": job_id,
+                    "action": "select_avatar",
+                    "avatar_index": avatar_index,
+                },
+            )
+            avatar_label = {0: "정장", 1: "후드", 2: "셔츠"}.get(avatar_index, f"#{avatar_index}")
+            await interaction.followup.send(
+                f"👤 아바타를 `{avatar_label}`(으)로 선택했습니다. 이제 일반 승인 또는 고화질 승인을 진행하세요.",
+                ephemeral=True,
+            )
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 

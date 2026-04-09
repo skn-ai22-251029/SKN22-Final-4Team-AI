@@ -621,6 +621,8 @@ nano .env   # 또는 vi .env
 | `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/Wv5SdSdlPLwNzeqF/webhook/wf-11-tts-generate` |
 | `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
+| `TTS_API_URL_INTERNAL` | 도커 내부 서비스에서 사용할 TTS URL | `http://tts-router-service:8300` |
+| `TTS_ROUTER_MODE` | TTS Router 모드 (`legacy_http`/`runpod_serverless`) | `legacy_http` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
 | `TTS_FIXED_SEEDS` | (선택) 채널 공통 고정 seed 3개(쉼표 구분) | `101,202,303` |
@@ -1038,18 +1040,64 @@ python3 scripts/seed_lab.py run \
   --concurrency 4
 ```
 
-빠른 실행( `.env`의 `TTS_API_URL` 자동 사용 ):
+빠른 실행( `.env`의 `TTS_API_URL`, `OPENAI_API_KEY` 자동 사용 ):
 
 ```bash
 ./scripts/seed_lab_quickstart.sh
 ```
 
 옵션:
-- `./scripts/seed_lab_quickstart.sh 10 4 --no-open` : 생성만 하고 브라우저 자동 열기는 비활성화
+- `./scripts/seed_lab_quickstart.sh "111,222"` : 지정 seed + 부족분 랜덤으로 30개 생성
+- `./scripts/seed_lab_quickstart.sh -dup "111,222"` : 지정 seed + 부족분 랜덤으로 seed당 3개(총 30개) 생성
 
 생성 후:
-- `seed-lab-runs/<run_id>/index.html`을 브라우저로 열어 오디오 청취
+- quickstart가 기본적으로 생성된 샘플 전체(`30개`)에 대해 `auto-eval`을 먼저 실행합니다.
+- quickstart가 자동으로 `seed_lab.py serve`를 실행하고 `http://127.0.0.1:8765`를 엽니다.
+- 같은 페이지에서 오디오 청취/점수 입력/즉석 TTS 파라미터 조정이 가능합니다.
 - 점수/메모 입력 후 `평가 Export(JSON)`
+
+인터랙티브 테스트 서버(HTML에서 샘플 텍스트/파라미터 조정 + 즉석 TTS 생성 + 재생):
+
+```bash
+python3 scripts/seed_lab.py serve \
+  --run-dir seed-lab-runs/<run_id> \
+  --api-url "$TTS_API_URL"
+```
+
+- 접속: `http://127.0.0.1:8765`
+- `평가 테이블에 추가` 체크 후 생성하면 기존 평가 테이블에 샘플이 추가됩니다.
+- `OPENAI_API_KEY`가 있으면 추가 즉시 AI 평가를 수행해 `AI 평가(자동)` 표에 반영합니다.
+- AI 표가 비어 있으면 보통 `OPENAI_API_KEY` 미설정/미전달이거나 아직 `평가 테이블에 추가`로 생성한 샘플이 없는 상태입니다.
+- `SEED_LAB_ASR_MODEL`이 전사용 모델이 아니면 자동으로 `gpt-4o-transcribe`로 폴백합니다(예: `gpt-5.4` 입력 시).
+
+자동평가 관련 환경변수(quickstart):
+
+```bash
+SEED_LAB_AUTO_EVAL_ALL=1          # 0이면 quickstart의 전체 auto-eval 비활성
+SEED_LAB_ASR_MODEL=gpt-4o-transcribe
+SEED_LAB_JUDGE_MODEL=gpt-5.4
+SEED_LAB_AUTO_EVAL_TIMEOUT=120
+```
+
+자동 평가(ASR + LLM, 하이브리드 추천):
+
+```bash
+export OPENAI_API_KEY="<your_openai_key>"
+python3 scripts/seed_lab.py auto-eval \
+  --run-dir seed-lab-runs/<run_id> \
+  --asr-model gpt-4o-transcribe \
+  --judge-model gpt-5.4-mini
+```
+
+산출물:
+- `auto_eval.json` (기존 report/HTML import와 호환되는 평가 JSON)
+- `auto_eval_debug.jsonl` (샘플별 전사/지표/판정 로그)
+
+참고:
+- 자동 평가는 점수/메모만 채우고 `selected`는 `false`로 둡니다(최종 선택은 사람).
+- 자동 평가 JSON을 `index.html`의 `평가 Import`로 불러와 수동 검토를 이어갈 수 있습니다.
+- 평가표 헤더를 클릭하면 사람/AI 목록 모두 정렬할 수 있습니다(오름차순/내림차순 토글).
+- 자동평가 점수는 변별력을 위해 보수적으로 감점 캡이 적용됩니다(정확도/길이비/초당문자 지표 반영).
 
 Report/Top seed 산출:
 
@@ -1057,12 +1105,15 @@ Report/Top seed 산출:
 python3 scripts/seed_lab.py report \
   --run-dir seed-lab-runs/<run_id> \
   --eval-json /path/to/exported-eval.json \
+  --ai-eval-json seed-lab-runs/<run_id>/auto_eval.json \
   --top 20 \
   --prepare-stage-b
 ```
 
 산출물:
-- `seed_ranking.csv`, `seed_ranking.json`
+- `seed_ranking_human.csv`, `seed_ranking_human.json`
+- `seed_ranking_ai.csv`, `seed_ranking_ai.json` (AI 평가 파일이 있을 때)
+- `seed_ranking.csv`, `seed_ranking.json` (호환용, human과 동일)
 - `top_seeds_stage_b.txt` (상위 20 seed)
 - `env_snippet_top3.txt` (`TTS_FIXED_SEEDS=` 스니펫)
 
@@ -1105,6 +1156,8 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | n8n Postgres 연결 실패 | `postgres` 컨테이너 healthy 상태 대기 (`docker-compose ps`) |
 | n8n `$env.*` 접근 거부 | `docker-compose.yml`에 `N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"` 추가 후 재시작 |
 | n8n 환경변수 미반영 | `docker-compose up -d --force-recreate n8n` (재빌드 아닌 재생성) |
+| Seed Lab `AI 평가(자동)`이 계속 `OPENAI_API_KEY 미설정` | quickstart 로그에서 `OPENAI_API_KEY loaded: yes`와 `OPENAI_API_KEY exported to serve env: yes` 확인. 이후 serve 시작 로그가 `openai_configured=True`인지 확인 |
+| Seed Lab auto-eval이 전부 `Invalid URL (POST /v1/audio/transcriptions)` 실패 | ASR 모델이 전사용 모델인지 확인. quickstart에서는 `SEED_LAB_ASR_MODEL`을 transcribe 계열로 설정하거나 기본값(`gpt-4o-transcribe`) 사용 |
 | n8n 워크플로 import 오류 | `docker-compose logs n8n`에서 `workflow-sync`/credential 매핑 에러 먼저 확인 |
 | n8n `http://IP:5678` 접속 불가 | EC2 보안그룹 인바운드 5678 포트 오픈 확인 |
 | 봇이 모든 채널에서 응답 | `.env`에 `DISCORD_ALLOWED_CHANNEL_IDS` 추가 후 `docker-compose up -d --build discord-bot` |
@@ -1189,4 +1242,38 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 
 # 4. 다운로드한 패키지 설치
 dpkg -i cloudflared-linux-amd64.deb
+```
+
+## TTS Router 기반 RunPod Serverless 전환 (복구 가능)
+
+기존 요청 포맷(`/tts`)은 유지하고, 호출 경로만 `tts-router-service`로 분리합니다.
+
+### 핵심 환경변수
+
+- `TTS_API_URL`: 로컬 툴(예: seed lab)에서 직접 호출할 기본 URL
+- `TTS_API_URL_INTERNAL`: 도커 내부(`messenger-gateway`, `n8n`)에서 사용할 URL
+- `TTS_ROUTER_MODE`: `legacy_http` 또는 `runpod_serverless`
+- `TTS_LEGACY_API_URL`: 기존 Cloudflare/RunPod API URL
+- `RUNPOD_API_KEY`, `RUNPOD_SERVERLESS_ENDPOINT_ID`: Serverless 호출 자격
+
+### 무중단 단계별 전환
+
+1. 안전 배포(동작 동일 유지)
+   - `TTS_API_URL_INTERNAL`을 기존 값으로 두고 배포
+   - `TTS_ROUTER_MODE=legacy_http`
+2. 라우터 경유 전환
+   - `TTS_API_URL_INTERNAL=http://tts-router-service:8300`
+   - `TTS_ROUTER_MODE=legacy_http` 유지 (실동작은 기존 API 그대로)
+3. Serverless 활성화
+   - `RUNPOD_API_KEY`, `RUNPOD_SERVERLESS_ENDPOINT_ID` 설정
+   - `TTS_ROUTER_MODE=runpod_serverless`
+
+### 즉시 롤백
+
+- `TTS_ROUTER_MODE=legacy_http` 로 변경 후 재기동
+- 필요 시 `TTS_API_URL_INTERNAL`도 기존 Cloudflare URL로 복원
+
+```bash
+cd ~/SKN22-Final-4Team-AI/ai-influencer
+docker-compose up -d --build --force-recreate tts-router-service messenger-gateway n8n
 ```

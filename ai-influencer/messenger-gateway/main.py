@@ -69,6 +69,7 @@ _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 _HEYGEN_REQUEST_TIMEOUT_SECONDS = 30.0
 _TTS_VARIANT_COUNT = 3
+_HEYGEN_AVATAR_BUTTON_LABELS = ("정장", "후드", "셔츠")
 _http_basic = HTTPBasic()
 
 
@@ -447,7 +448,10 @@ def _parse_tts_seed_list(raw_value: object, *, source_name: str) -> list[int]:
     return seeds
 
 
-def _resolve_tts_variant_seeds(channel_id: str) -> tuple[list[int], str]:
+def _resolve_tts_variant_seeds(channel_id: str, *, force_random: bool = False) -> tuple[list[int], str]:
+    if force_random:
+        return _build_random_tts_variant_seeds(), "random_regenerate"
+
     had_invalid_config = False
 
     default_raw = (settings.tts_fixed_seeds or "").strip()
@@ -484,6 +488,13 @@ def _clear_tts_variant_metadata(script_json: dict) -> dict:
         "tts_downstream_intent",
         "tts_seed_strategy",
         "tts_seed_values",
+        "tts_variant_failures",
+        "tts_failure_summary",
+        "tts_last_error_at",
+        "heygen_avatar_id",
+        "avatar_id",
+        "heygen_avatar_label",
+        "heygen_avatar_index",
     ):
         merged.pop(key, None)
     media_names = merged.get("media_names")
@@ -526,6 +537,63 @@ def _get_job_avatar_override(script_json: dict) -> str:
         or script_json.get("avatar_id")
         or ""
     ).strip()
+
+
+def _get_job_avatar_index(script_json: dict) -> Optional[int]:
+    raw = script_json.get("heygen_avatar_index")
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return None
+
+
+def _get_job_avatar_label(script_json: dict) -> str:
+    return str(script_json.get("heygen_avatar_label") or "").strip()
+
+
+def _parse_heygen_avatar_options_from_env() -> list[dict[str, object]]:
+    raw = (settings.heygen_avatar_id or "").strip()
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    expected = len(_HEYGEN_AVATAR_BUTTON_LABELS)
+    if len(tokens) != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"HEYGEN_AVATAR_ID must contain exactly {expected} comma-separated avatar IDs.",
+        )
+    if len(set(tokens)) != expected:
+        raise HTTPException(
+            status_code=400,
+            detail="HEYGEN_AVATAR_ID must not contain duplicate avatar IDs.",
+        )
+    options: list[dict[str, object]] = []
+    for idx, avatar_id in enumerate(tokens):
+        options.append(
+            {
+                "index": idx,
+                "label": _HEYGEN_AVATAR_BUTTON_LABELS[idx],
+                "avatar_id": avatar_id,
+            }
+        )
+    return options
+
+
+def _resolve_selected_heygen_avatar(script_json: dict) -> tuple[str, str, int]:
+    options = _parse_heygen_avatar_options_from_env()
+    selected_index = _get_job_avatar_index(script_json)
+    if selected_index is None:
+        raise HTTPException(
+            status_code=400,
+            detail="아바타를 먼저 선택하세요. 정장/후드/셔츠 버튼 중 하나를 눌러주세요.",
+        )
+    if selected_index < 0 or selected_index >= len(options):
+        raise HTTPException(
+            status_code=400,
+            detail="선택된 아바타가 유효하지 않습니다. 아바타를 다시 선택해주세요.",
+        )
+    selected = options[selected_index]
+    return str(selected["avatar_id"]), str(selected["label"]), int(selected_index)
 
 
 def _normalize_publish_targets(raw_targets: list[str]) -> list[str]:
@@ -607,15 +675,11 @@ async def _register_generated_content(
 
 
 async def _resolve_heygen_avatar_id(_: dict) -> tuple[str, str]:
-    # 운영 정책: Avatar ID는 env(HEYGEN_AVATAR_ID) 단일값만 사용한다.
-    env_avatar_id = settings.heygen_avatar_id.strip()
-    if env_avatar_id:
-        return env_avatar_id, "env"
-
-    raise HTTPException(
-        status_code=400,
-        detail="No HeyGen avatar configured. Set HEYGEN_AVATAR_ID in env.",
-    )
+    # 기본 avatar fallback은 env 첫 번째 항목(정장)을 사용한다.
+    # 실제 WF-12 승인 경로에서는 반드시 사용자가 선택한 avatar를 사용한다.
+    options = _parse_heygen_avatar_options_from_env()
+    first = options[0]
+    return str(first["avatar_id"]), f"env:{first['label']}"
 
 
 def _extract_completion_text(content: object) -> str:
@@ -1473,15 +1537,71 @@ def _build_tts_variant_control_caption(
     return "\n".join(base)
 
 
-def _build_selected_tts_caption(*, downstream_intent: str, variant_index: int, selected_seed: Optional[int]) -> str:
+def _extract_http_status_code_from_tts_error(detail: str) -> Optional[int]:
+    match = re.search(r":\s*(\d{3})\b", detail or "")
+    if not match:
+        return None
+    try:
+        status_code = int(match.group(1))
+    except Exception:
+        return None
+    return status_code if 100 <= status_code <= 599 else None
+
+
+def _build_tts_variant_failure_entry(*, variant_index: int, seed: Optional[int], error: Exception) -> dict:
+    detail = str(error or "").strip()
+    error_type = _extract_tts_error_type(detail)
+    status_code = _extract_http_status_code_from_tts_error(detail)
+    snippet = _clip(detail, limit=240)
+    return {
+        "variant_index": int(variant_index),
+        "seed": int(seed) if seed is not None else None,
+        "error_type": error_type,
+        "status_code": status_code,
+        "error_snippet": snippet,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_tts_failure_summary(failures: list[dict], *, limit: int = 3) -> str:
+    if not failures:
+        return ""
+    chunks: list[str] = []
+    for item in failures[: max(1, limit)]:
+        idx = item.get("variant_index")
+        seed = item.get("seed")
+        error_type = str(item.get("error_type") or "tts_server_runtime_error")
+        status_code = item.get("status_code")
+        snippet = str(item.get("error_snippet") or "")
+        status_text = f"http={status_code}" if status_code else "http=?"
+        chunks.append(
+            f"v{(int(idx) + 1) if isinstance(idx, int) else '?'} seed={seed} [{error_type}] {status_text} {snippet}"
+        )
+    return "; ".join(chunks)
+
+
+def _build_selected_tts_caption(
+    *,
+    downstream_intent: str,
+    variant_index: int,
+    selected_seed: Optional[int],
+    selected_avatar_label: str,
+) -> str:
     seed_text = f"(seed={selected_seed}) " if selected_seed is not None else ""
+    avatar_line = (
+        f"선택 아바타: {selected_avatar_label}"
+        if selected_avatar_label
+        else "먼저 아바타(정장/후드/셔츠) 버튼을 선택하세요."
+    )
     if downstream_intent == "video_prepare":
         return (
             f"✅ {seed_text}TTS 후보 {variant_index + 1}번을 선택했습니다.\n"
+            f"{avatar_line}\n"
             "이제 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
         )
     return (
         f"✅ {seed_text}TTS 후보 {variant_index + 1}번을 선택했습니다.\n"
+        f"{avatar_line}\n"
         "아래에서 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
     )
 
@@ -1643,7 +1763,9 @@ async def _run_tts_generation(
     channel_id: str,
     user_id: str,
     downstream_intent: str,
+    force_random_seeds: bool = False,
 ) -> None:
+    variant_failures: list[dict] = []
     try:
         # 1) 같은 대본으로 TTS 후보 3개를 순차 생성 2) Discord/S3 저장 3) 사용자가 1개를 선택한 뒤 승인 단계로 이동한다.
         await job_service.transition_status(job_id, "GENERATING")
@@ -1662,7 +1784,7 @@ async def _run_tts_generation(
             ),
         )
         batch_id = _next_tts_batch_id()
-        seeds, seed_strategy = _resolve_tts_variant_seeds(channel_id)
+        seeds, seed_strategy = _resolve_tts_variant_seeds(channel_id, force_random=force_random_seeds)
         logger.info(
             "[tts-seed] resolved channel_id=%s strategy=%s seeds=%s",
             channel_id,
@@ -1687,7 +1809,21 @@ async def _run_tts_generation(
                 variants.append(variant_info)
                 success_count += 1
             except Exception as e:
-                logger.exception("[tts-direct] variant failed job_id=%s batch_id=%s variant=%s", job_id, batch_id, variant_index)
+                failure_entry = _build_tts_variant_failure_entry(
+                    variant_index=variant_index,
+                    seed=seed,
+                    error=e,
+                )
+                variant_failures.append(failure_entry)
+                logger.exception(
+                    "[tts-direct] variant failed job_id=%s batch_id=%s variant=%s seed=%s type=%s status=%s",
+                    job_id,
+                    batch_id,
+                    variant_index,
+                    seed,
+                    failure_entry["error_type"],
+                    failure_entry["status_code"],
+                )
                 variants.append(
                     {
                         "variant_index": variant_index,
@@ -1697,12 +1833,17 @@ async def _run_tts_generation(
                         "attachment_or_presigned_url": "",
                         "discord_message_id": "",
                         "status": "failed",
-                        "error": str(e)[:500],
+                        "error_type": failure_entry["error_type"],
+                        "status_code": failure_entry["status_code"],
+                        "error": failure_entry["error_snippet"],
                     }
                 )
                 failure_count += 1
 
         if success_count == 0:
+            failure_summary = _build_tts_failure_summary(variant_failures)
+            if failure_summary:
+                raise RuntimeError(f"TTS 후보 3개 생성이 모두 실패했습니다. {failure_summary}")
             raise RuntimeError("TTS 후보 3개 생성이 모두 실패했습니다.")
 
         control_message_id = await _discord_adapter.send_tts_variant_control_message(
@@ -1733,6 +1874,10 @@ async def _run_tts_generation(
         merged_script["tts_seed_strategy"] = seed_strategy
         merged_script["tts_seed_values"] = [int(seed) for seed in seeds]
         merged_script["selected_tts_seed"] = None
+        if variant_failures:
+            merged_script["tts_variant_failures"] = variant_failures
+            merged_script["tts_failure_summary"] = _build_tts_failure_summary(variant_failures)
+            merged_script["tts_last_error_at"] = datetime.now(timezone.utc).isoformat()
         await job_service.update_job(
             job_id,
             audio_url="",
@@ -1745,6 +1890,7 @@ async def _run_tts_generation(
         logger.exception("[tts-direct] failed job_id=%s: %r", job_id, e)
         error_text = str(e)
         error_type = _extract_tts_error_type(error_text)
+        failure_summary = _build_tts_failure_summary(variant_failures)
         await job_service.transition_status(job_id, "FAILED")
         current_job = await job_service.get_job(job_id)
         failed_script = _merge_script_json_with_media_names(
@@ -1752,15 +1898,20 @@ async def _run_tts_generation(
             tts_error_type=error_type,
             tts_error_detail=error_text,
         )
+        if variant_failures:
+            failed_script["tts_variant_failures"] = variant_failures
+            failed_script["tts_failure_summary"] = failure_summary
+            failed_script["tts_last_error_at"] = datetime.now(timezone.utc).isoformat()
         await job_service.update_job(
             job_id,
             error_message=f"TTS 생성 실패 [{error_type}]: {error_text}",
             script_json=failed_script,
         )
+        notify_reason = failure_summary or _clip(error_text, limit=260)
         try:
             await _discord_adapter.send_text_message(
                 channel_id,
-                f"❌ TTS 생성에 실패했습니다.\nJob ID: {job_id[:8]}\n오류 유형: {error_type}\n오류: {error_text}",
+                f"❌ TTS 생성에 실패했습니다.\nJob ID: {job_id[:8]}\n오류 유형: {error_type}\n사유: {notify_reason}",
             )
         except Exception as notify_err:
             logger.error("[tts-direct] failure notify failed job_id=%s: %s", job_id, notify_err)
@@ -1773,6 +1924,7 @@ def _spawn_tts_generation(
     channel_id: str,
     user_id: str,
     downstream_intent: str,
+    force_random_seeds: bool = False,
 ) -> None:
     # slash command/버튼 응답을 오래 붙잡지 않기 위해
     # 실제 TTS 생성은 background task로 분리한다.
@@ -1783,6 +1935,7 @@ def _spawn_tts_generation(
             channel_id=channel_id,
             user_id=user_id,
             downstream_intent=downstream_intent,
+            force_random_seeds=force_random_seeds,
         )
     )
 
@@ -2958,10 +3111,14 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid audio_content_b64: {e}")
 
     existing_job = await job_service.get_job(body.job_id)
+    existing_script_json = _as_script_json(existing_job.get("script_json") if existing_job else None)
+    selected_avatar_index = _get_job_avatar_index(existing_script_json)
+    if body.include_wf12_button:
+        _parse_heygen_avatar_options_from_env()
     filename = _normalize_audio_filename(
         body.job_id,
         body.filename,
-        existing_job.get("script_json") if existing_job else None,
+        existing_script_json,
     )
     stored = None
     try:
@@ -2986,6 +3143,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
                 caption=caption,
                 audio_url=stored.presigned_url,
                 include_wf12_button=body.include_wf12_button,
+                selected_avatar_index=selected_avatar_index,
             )
             attachment_url = stored.presigned_url
         except Exception as e:
@@ -3006,6 +3164,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
                 audio_bytes=audio_bytes,
                 filename=filename,
                 include_wf12_button=body.include_wf12_button,
+                selected_avatar_index=selected_avatar_index,
             )
         except Exception as e:
             logger.error("[discord] send_tts_audio_message failed job_id=%s: %s", body.job_id, e)
@@ -3013,7 +3172,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
 
     resolved_audio_url = stored.s3_uri if stored else attachment_url
     merged_script = _merge_script_json_with_media_names(
-        existing_job.get("script_json") if existing_job else None,
+        existing_script_json,
         audio_filename=filename,
     )
     await job_service.update_job(
@@ -3100,6 +3259,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             script_json=selected_script,
         )
         try:
+            selected_avatar_label = _get_job_avatar_label(script_json)
             approval_message_id = await _discord_adapter.send_tts_approval_message(
                 channel_id=channel_id,
                 job_id=body.job_id,
@@ -3107,7 +3267,9 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
                     downstream_intent=_get_tts_downstream_intent(script_json),
                     variant_index=int(body.variant_index),
                     selected_seed=selected_seed,
+                    selected_avatar_label=selected_avatar_label,
                 ),
+                selected_avatar_index=_get_job_avatar_index(script_json),
             )
         except Exception:
             rollback_script = _merge_script_json_with_media_names(_clear_tts_variant_metadata(script_json), tts_error_type="", tts_error_detail="")
@@ -3158,14 +3320,47 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             channel_id=channel_id,
             user_id=user_id,
             downstream_intent=_get_tts_downstream_intent(script_json),
+            force_random_seeds=True,
         )
-        await _discord_adapter.send_text_message(channel_id, "🔁 TTS 후보 3개를 다시 생성합니다...")
+        await _discord_adapter.send_text_message(channel_id, "🔁 랜덤 seed로 TTS 후보 3개를 다시 생성합니다...")
         logger.info("[discord] tts_action=regenerate_batch job_id=%s batch_id=%s", body.job_id, active_batch_id)
         return {"job_id": body.job_id, "action": body.action, "batch_id": active_batch_id}
 
+    if body.action == "select_avatar":
+        selected_variant_index_raw = script_json.get("selected_tts_variant_index")
+        if selected_variant_index_raw is None:
+            raise HTTPException(status_code=409, detail="TTS 후보를 먼저 선택하세요.")
+        if body.avatar_index is None:
+            raise HTTPException(status_code=400, detail="avatar_index is required")
+        options = _parse_heygen_avatar_options_from_env()
+        avatar_index = int(body.avatar_index)
+        if avatar_index < 0 or avatar_index >= len(options):
+            raise HTTPException(status_code=400, detail=f"avatar_index must be between 0 and {len(options) - 1}")
+        selected = options[avatar_index]
+        avatar_id = str(selected["avatar_id"])
+        avatar_label = str(selected["label"])
+
+        updated_script = _merge_script_json_with_media_names(
+            script_json,
+            heygen_avatar_id=avatar_id,
+        )
+        updated_script["avatar_id"] = avatar_id
+        updated_script["heygen_avatar_label"] = avatar_label
+        updated_script["heygen_avatar_index"] = avatar_index
+        await job_service.update_job(body.job_id, script_json=updated_script)
+        logger.info("[discord] tts_action=select_avatar job_id=%s avatar_index=%s label=%s", body.job_id, avatar_index, avatar_label)
+        return {
+            "job_id": body.job_id,
+            "action": body.action,
+            "avatar_id": avatar_id,
+            "avatar_label": avatar_label,
+            "avatar_index": avatar_index,
+        }
+
     if body.action in {"approve_standard", "approve_hd"}:
         # WF-12는 외부 URL을 읽어야 하므로 s3:// 저장값은 presigned URL로 바꿔 넘긴다.
-        resolved_avatar_id, avatar_source = await _resolve_heygen_avatar_id(job)
+        resolved_avatar_id, selected_avatar_label, selected_avatar_index = _resolve_selected_heygen_avatar(script_json)
+        avatar_source = f"selected:{selected_avatar_label}"
         audio_url = job.get("audio_url", "")
         if not audio_url:
             raise HTTPException(status_code=400, detail="No audio_url found in job")
@@ -3178,9 +3373,13 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
                 logger.error("[storage] presign audio s3 uri failed job_id=%s: %s", body.job_id, e)
                 raise HTTPException(status_code=500, detail=f"audio presign failed: {e}")
         merged_script = _merge_script_json_with_media_names(
-            job.get("script_json"),
+            script_json,
+            heygen_avatar_id=resolved_avatar_id,
             heygen_use_avatar_iv_model=use_avatar_iv_model,
         )
+        merged_script["avatar_id"] = resolved_avatar_id
+        merged_script["heygen_avatar_label"] = selected_avatar_label
+        merged_script["heygen_avatar_index"] = selected_avatar_index
         await job_service.update_job(body.job_id, script_json=merged_script)
         try:
             await n8n_service.call_wf12_heygen_generate(
@@ -3194,7 +3393,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             mode_text = "고화질 Avatar IV" if use_avatar_iv_model else "일반"
             await _discord_adapter.send_text_message(
                 channel_id,
-                f"🎬 WF-12(HeyGen) 영상 생성을 시작합니다. 모드: {mode_text}",
+                f"🎬 WF-12(HeyGen) 영상 생성을 시작합니다. 모드: {mode_text} / 아바타: {selected_avatar_label}",
             )
         except Exception as e:
             logger.error("call_wf12 (tts approve) failed job_id=%s: %s", body.job_id, e)
@@ -3210,6 +3409,8 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             "job_id": body.job_id,
             "action": body.action,
             "avatar_id": resolved_avatar_id,
+            "avatar_label": selected_avatar_label,
+            "avatar_index": selected_avatar_index,
             "avatar_source": avatar_source,
             "use_avatar_iv_model": use_avatar_iv_model,
         }
@@ -3588,7 +3789,13 @@ async def tts_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
 @app.post("/internal/heygen-smoke-test")
 async def heygen_smoke_test(_: AuthDep, body: HeygenSmokeTestRequest) -> dict:
     """HeyGen 과금 없는 스모크 테스트 — 인증과 avatar 접근만 검증한다."""
-    configured_avatar_id = (body.avatar_id or settings.heygen_avatar_id).strip()
+    configured_avatar_id = (body.avatar_id or "").strip()
+    config_error = ""
+    if not configured_avatar_id:
+        try:
+            configured_avatar_id = str(_parse_heygen_avatar_options_from_env()[0]["avatar_id"])
+        except HTTPException as e:
+            config_error = str(e.detail)
     avatars_payload = await _heygen_get_json("/v2/avatars")
 
     avatars_data = avatars_payload.get("data") if isinstance(avatars_payload.get("data"), dict) else {}
@@ -3599,6 +3806,7 @@ async def heygen_smoke_test(_: AuthDep, body: HeygenSmokeTestRequest) -> dict:
         "configured": bool(configured_avatar_id),
         "exists": False,
         "name": "",
+        "config_error": config_error,
     }
     if configured_avatar_id:
         try:

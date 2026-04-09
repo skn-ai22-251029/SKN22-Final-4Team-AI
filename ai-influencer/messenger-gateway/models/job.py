@@ -113,10 +113,11 @@ class SendAudioRequest(BaseModel):
 
 class TtsActionRequest(BaseModel):
     job_id: str
-    action: str  # "select_variant" | "regenerate_batch" | "approve_standard" | "approve_hd" | "reject"
+    action: str  # "select_variant" | "regenerate_batch" | "select_avatar" | "approve_standard" | "approve_hd" | "reject"
     use_avatar_iv_model: bool = False
     batch_id: str = ""
     variant_index: Optional[int] = None
+    avatar_index: Optional[int] = None
 
 
 class VideoActionRequest(BaseModel):
