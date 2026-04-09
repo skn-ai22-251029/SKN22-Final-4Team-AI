@@ -24,7 +24,98 @@ def _normalize_job_row(row: asyncpg.Record | None) -> Optional[dict[str, Any]]:
 
 async def _ensure_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pricing_snapshots (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                provider            TEXT NOT NULL,
+                product             TEXT NOT NULL,
+                model               TEXT NOT NULL DEFAULT '',
+                unit_type           TEXT NOT NULL,
+                unit_price_usd      NUMERIC,
+                effective_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                effective_to        TIMESTAMPTZ,
+                source_note         TEXT,
+                created_at          TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_fixed_cost_pool (
+                cost_date_kst           DATE PRIMARY KEY,
+                aws_fixed_usd           NUMERIC NOT NULL DEFAULT 0,
+                runpod_fixed_usd        NUMERIC NOT NULL DEFAULT 0,
+                usd_krw_rate            NUMERIC NOT NULL DEFAULT 0,
+                eligible_job_count      INT NOT NULL DEFAULT 0,
+                allocated_per_job_usd   NUMERIC NOT NULL DEFAULT 0,
+                created_at              TIMESTAMPTZ DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cost_events (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                job_id               UUID REFERENCES jobs(id) ON DELETE CASCADE,
+                topic_text           TEXT,
+                stage                TEXT NOT NULL,
+                process              TEXT NOT NULL,
+                provider             TEXT NOT NULL,
+                attempt_no           INT NOT NULL DEFAULT 1,
+                status               TEXT NOT NULL CHECK (status IN ('success','failed')),
+                started_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                ended_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                duration_ms          INT NOT NULL DEFAULT 0,
+                usage_json           JSONB NOT NULL DEFAULT '{}'::jsonb,
+                raw_response_json    JSONB NOT NULL DEFAULT '{}'::jsonb,
+                cost_usd             NUMERIC,
+                usd_krw_rate         NUMERIC,
+                cost_krw             NUMERIC,
+                error_type           TEXT,
+                error_message        TEXT,
+                idempotency_key      TEXT NOT NULL,
+                created_at           TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (idempotency_key)
+            )
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_job_created_idx ON cost_events(job_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_stage_status_created_idx ON cost_events(stage, status, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_provider_created_idx ON cost_events(provider, created_at DESC)")
         await conn.execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS heygen_avatar_id TEXT")
+        await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS status TEXT")
+        await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS platform_post_url TEXT")
+        await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS error_message TEXT")
+        await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS request_json JSONB DEFAULT '{}'::jsonb")
+        await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS response_json JSONB DEFAULT '{}'::jsonb")
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS platform_posts_job_platform_uidx ON platform_posts (job_id, platform)"
+        )
+        await conn.execute("ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check")
+        await conn.execute(
+            """
+            ALTER TABLE jobs
+            ADD CONSTRAINT jobs_status_check CHECK (
+                status IN (
+                    'DRAFT','SCRIPTING','GENERATING',
+                    'WAITING_APPROVAL','REVISION_REQUESTED',
+                    'APPROVED','PUBLISHING','PUBLISHED',
+                    'PARTIALLY_PUBLISHED','PUBLISH_FAILED',
+                    'ANALYTICS_COLLECTED','FAILED',
+                    'WAITING_VIDEO_APPROVAL'
+                )
+            )
+            """
+        )
+        await conn.execute("ALTER TABLE platform_posts DROP CONSTRAINT IF EXISTS platform_posts_platform_check")
+        await conn.execute(
+            """
+            ALTER TABLE platform_posts
+            ADD CONSTRAINT platform_posts_platform_check CHECK (platform IN ('youtube','instagram','tiktok'))
+            """
+        )
 
 
 async def get_db_pool() -> asyncpg.Pool:
@@ -270,3 +361,47 @@ async def find_existing_auto_report_job(
         notebook_url,
     )
     return _normalize_job_row(row)
+
+
+async def get_latest_auto_report_job(
+    *,
+    channel_id: str,
+    notebook_url: str,
+) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT *
+        FROM jobs
+        WHERE messenger_user_id = 'system:auto-report'
+          AND COALESCE(script_json->>'auto_report_channel_id', '') = $1
+          AND COALESCE(script_json->>'auto_report_notebook_url', '') = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        channel_id,
+        notebook_url,
+    )
+    return _normalize_job_row(row)
+
+
+async def count_auto_report_attempts_today(
+    *,
+    channel_id: str,
+    notebook_url: str,
+) -> int:
+    pool = await get_db_pool()
+    count = await pool.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM jobs
+        WHERE messenger_user_id = 'system:auto-report'
+          AND COALESCE(script_json->>'auto_report_channel_id', '') = $1
+          AND COALESCE(script_json->>'auto_report_notebook_url', '') = $2
+          AND created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Seoul') AT TIME ZONE 'Asia/Seoul')
+          AND created_at < ((date_trunc('day', now() AT TIME ZONE 'Asia/Seoul') + interval '1 day') AT TIME ZONE 'Asia/Seoul')
+        """,
+        channel_id,
+        notebook_url,
+    )
+    return int(count or 0)

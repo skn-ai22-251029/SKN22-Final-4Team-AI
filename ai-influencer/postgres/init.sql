@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
                             'DRAFT','SCRIPTING','GENERATING',
                             'WAITING_APPROVAL','REVISION_REQUESTED',
                             'APPROVED','PUBLISHING','PUBLISHED',
+                            'PARTIALLY_PUBLISHED','PUBLISH_FAILED',
                             'ANALYTICS_COLLECTED','FAILED',
                             'WAITING_VIDEO_APPROVAL'
                         )),
@@ -51,9 +52,15 @@ CREATE TABLE IF NOT EXISTS platform_posts (
     job_id              UUID REFERENCES jobs(id) ON DELETE CASCADE,
     platform            TEXT CHECK (platform IN ('youtube','instagram','tiktok')),
     platform_post_id    TEXT,
+    platform_post_url   TEXT,
+    status              TEXT,
+    error_message       TEXT,
+    request_json        JSONB DEFAULT '{}',
+    response_json       JSONB DEFAULT '{}',
     published_at        TIMESTAMPTZ,
     metrics_json        JSONB DEFAULT '{}',
-    created_at          TIMESTAMPTZ DEFAULT NOW()
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (job_id, platform)
 );
 
 -- job_logs 테이블

@@ -82,6 +82,7 @@ docker-compose.override.yml
 backend/chat_debug.log
 backend/debug.log
 debug_output.txt
+seed-lab-runs/
 
 # Media / Uploaded files
 media/
@@ -96,6 +97,7 @@ generated_videos/
 *.mp4
 *.srt
 *.webp
+*.wav
 
 # AI Model Weights
 *.safetensors
@@ -106,3 +108,7 @@ generated_videos/
 # Project specific
 z_structure.md
 lambda.md
+
+# 기타
+z_AWS_Cross-Account.md
+z_seed_lab.md

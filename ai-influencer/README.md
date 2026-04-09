@@ -4,6 +4,8 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 테스트 편의를 위해 https://github.com/DJAeun/SKN22-Final-4Team-AI/tree/develop 클론
 ---
+TTS test script="./scripts/seed_lab_quickstart.sh"
+---
 
 ## 아키텍처 개요
 
@@ -139,8 +141,9 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 ### 시간별 자동 보고서 Discord 전송
 
 - `WF-09 -> /internal/auto-report -> WF-06` 경로는 계속 동작
-- 다만 Discord 전송은 `AUTO_REPORT_DISCORD_DELIVERY_ENABLED=false` 이면 생략
-- 기본값은 `false`
+- Discord 전송은 `AUTO_REPORT_DISCORD_DELIVERY_ENABLED=true` 일 때 활성화
+- 기본값은 `true`
+- `system:auto-report` 실패 건은 Discord에 실패 메시지를 전송하지 않고 DB 상태만 `FAILED`로 기록
 - 이때도 대본 rewrite, S3 저장, DB 업데이트는 그대로 수행
 
 ### `POST /internal/character-avatar`
@@ -394,37 +397,49 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 [IF: 채널 존재 여부 확인]
   ├─[skip=true]──→ 종료
   │
-  └─[유효]──→ [YouTube RSS 조회] (채널별 병렬 처리)
-                https://www.youtube.com/feeds/videos.xml?channel_id={channelId}
-                      │
-                      ▼
-              [새 영상 필터링] 최근 N시간(`WF09_LOOKBACK_HOURS`) 이내 업로드만 추출
-                      │
-                      ▼
-              [IF: 새 영상 존재 여부]
-                ├─[없음]──→ 종료 (해당 채널)
+  └─[유효]──→ [notebooklm-service /notebook-state 조회]
                 │
-                └─[있음]──→ [notebooklm-service /check-and-add-source 호출]
-                              { source_url, source_title, channel_name }
-                                    │
-                                    ▼
-                            [결과 로깅]
-                            중복 건너뜀 / 소스 추가 완료 / 오류
-                                    │
-                    [added=true일 때만 자동 보고서 트리거]
-                                    ▼
-              [gateway /internal/auto-report]
-               - job_id 자동 생성
-               - Discord 전송 채널: DISCORD_ALLOWED_CHANNEL_IDS 첫 번째
-               - WF-06 호출 → 보고서 생성/첨부 전송
+                ▼
+        [IF: active notebook에 기존 source 존재]
+          ├─[있음]──→ 종료
+          │           reason: active notebook already has sources
+          │
+          └─[없음]──→ [YouTube RSS 조회] (채널별 병렬 처리)
+                        https://www.youtube.com/feeds/videos.xml?channel_id={channelId}
+                              │
+                              ▼
+                      [새 영상 필터링]
+                      최근 N시간(`WF09_LOOKBACK_HOURS`) 이내 업로드만 유지
+                              │
+                              ▼
+                      [최신 1개만 선택]
+                              │
+                              ▼
+                      [IF: 선택 결과 존재 여부]
+                        ├─[없음]──→ 종료
+                        │           reason: no recent video within lookback
+                        │
+                        └─[있음]──→ [notebooklm-service /check-and-add-source 호출]
+                                      { source_url, source_title, channel_name }
+                                            │
+                                            ▼
+                                    [결과 로깅]
+                                    소스 추가 완료 / 오류
+                                            │
+                            [added=true일 때만 자동 보고서 트리거]
+                                            ▼
+                      [gateway /internal/auto-report]
+                       - job_id 자동 생성
+                       - Discord 전송 채널: DISCORD_ALLOWED_CHANNEL_IDS 첫 번째
+                       - WF-06 호출 → 보고서 생성/첨부 전송
 ```
 
 ---
 
-### WF-10: 일일 노트북 생성 (매일 자정)
+### WF-10: 일일 노트북 생성 (매일 오전 7시 30분, KST)
 
 ```
-[Schedule Trigger] 매일 00:00 실행
+[Schedule Trigger] 매일 07:30 실행 (Asia/Seoul)
       │
       ▼
 [채널 목록 파싱] TOPIC_CHANNELS 환경변수
@@ -497,8 +512,8 @@ Discord 사용자: /report
 | `WF-05_confirm_handler.json` | Webhook | `POST /webhook/wf-05-confirm` | 승인/수정 분기 및 상태 업데이트 | 승인→WF-11, 수정→WF-01 |
 | `WF-06_notebooklm_report.json` | Webhook | `POST /webhook/wf-06-report` | NotebookLM 보고서 생성 호출, 성공/실패 분기 | 성공→`/internal/send-report`, 실패→`/internal/send-text` |
 | `WF-08_sns_upload.json` | Webhook | `POST /webhook/wf-08-sns-upload` | `PUBLISHING` 전이, SNS 업로드 처리, post 기록 | 완료 알림 + `PUBLISHED` |
-| `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, 채널별 RSS 조회/재시도, 새 영상 필터 | source 추가 성공 시 gateway `/internal/auto-report` → WF-06 |
-| `WF-10-daily-notebook.json` | Schedule(매일 00:00) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
+| `WF-09-youtube-source.json` | Schedule(매시간) | n8n 스케줄 | `TOPIC_CHANNELS` 파싱, active notebook이 비어 있을 때만 RSS 조회, 최근 시간창 안의 최신 영상 1개만 선택 | source 추가 성공 시에만 gateway `/internal/auto-report` → WF-06 |
+| `WF-10-daily-notebook.json` | Schedule(매일 07:30 KST) | n8n 스케줄 | 채널별 노트북 생성 요청 | notebooklm-service `/create-notebook` |
 | `WF-11_tts_generate.json` | Webhook | `POST /webhook/wf-11-tts-generate` | TTS 생성, WAV 저장, Discord 전송, `audio_url` 저장 | 승인 대기 또는 자동 WF-12 |
 | `WF-12_heygen_generate.json` | Webhook | `POST /webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` | HeyGen 생성/폴링 또는 mock preview 생성 | 성공→`/internal/send-video-preview`, 실패→`/internal/send-text` |
 
@@ -591,17 +606,26 @@ nano .env   # 또는 vi .env
 | `DISCORD_BOT_TOKEN` | Discord Bot 토큰 | |
 | `DISCORD_ALLOWED_USER_IDS` | 허용 유저 ID (쉼표 구분) | `12345,67890` |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | 허용 채널 ID (쉼표 구분) | `11111,22222` |
+| `AUTO_REPORT_MAX_ATTEMPTS_PER_DAY` | auto-report 일일 최대 시도 횟수(채널+노트북 기준) | `3` |
+| `AUTO_REPORT_STALE_MINUTES` | auto-report 진행중 job stale 판정(분) | `45` |
 | `DISCORD_GUILD_ID` | (선택) 슬래시 명령 즉시 반영용 Guild ID | `123456789012345678` |
 | `N8N_RUNNERS_TASK_TIMEOUT` | n8n task runner 실행 제한(초) | `1200` |
 | `NOTEBOOKLM_SERVICE_URL` | notebooklm-service 내부 URL | `http://notebooklm-service:8090` |
+| `N8N_WF01_WEBHOOK_URL` | WF-01 입력 웹훅 URL | `http://n8n:5678/webhook/Mt5nwvystMhfO1nl/webhook/wf-01-input` |
+| `N8N_WF05_WEBHOOK_URL` | WF-05 컨펌 웹훅 URL | `http://n8n:5678/webhook/gD9A0qy9MxY8g0T6/webhook/wf-05-confirm` |
+| `N8N_WF06_WEBHOOK_URL` | WF-06 보고서 웹훅 URL | `http://n8n:5678/webhook/QSrXdaRpKosyZIj3/webhook/wf-06-report` |
+| `N8N_WF08_WEBHOOK_URL` | WF-08 업로드 웹훅 URL | `http://n8n:5678/webhook/uLRW8JT5UitrhCC9/webhook/wf-08-sns-upload` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
-| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간) | `24` |
+| `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간). 빈 active notebook에도 항상 적용됨 | `24` |
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
-| `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/wf-11-tts-generate` |
+| `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/Wv5SdSdlPLwNzeqF/webhook/wf-11-tts-generate` |
 | `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
+| `TTS_API_URL_INTERNAL` | 도커 내부 서비스에서 사용할 TTS URL | `http://tts-router-service:8300` |
+| `TTS_ROUTER_MODE` | TTS Router 모드 (`legacy_http`/`runpod_serverless`) | `legacy_http` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
+| `TTS_FIXED_SEEDS` | (선택) 채널 공통 고정 seed 3개(쉼표 구분) | `101,202,303` |
 | `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
 | `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
 | `HEYGEN_VIDEO_WIDTH` | WF-12 출력 영상 너비 | `1080` |
@@ -619,6 +643,11 @@ nano .env   # 또는 vi .env
 
 기본 경로: WF-11은 앞선 워크플로에서 전달된 `script_text`를 그대로 TTS 입력으로 사용합니다.  
 음색 클론이 필요할 때만 `TTS_REF_AUDIO_PATH` + `TTS_PROMPT_TEXT`를 **둘 다** 설정하세요.
+
+고정 seed를 쓰려면 `TTS_FIXED_SEEDS`를 설정하세요.
+- 형식: 반드시 정수 3개(쉼표 구분), 중복 없음, 범위 `1..2147483647`
+- 우선순위: `TTS_FIXED_SEEDS` > 랜덤
+- 설정값 오류 시 서비스는 중단되지 않고 랜덤 seed 3개로 fallback합니다.
 
 **`TOPIC_CHANNELS` 형식:**
 ```
@@ -661,8 +690,9 @@ docker-compose logs -f notebooklm-service
 
 1. 브라우저에서 `http://<서버-퍼블릭-IP>:5678` 접속
 2. `.env`의 `N8N_BASIC_AUTH_USER` / `N8N_BASIC_AUTH_PASSWORD`로 로그인
-3. 좌측 메뉴 **Settings → Credentials → + New Credential → PostgreSQL** 선택
-4. 아래 값 입력 후 **Save** (반드시 이름을 `pg-credentials`로 지정):
+3. `.env`에 `N8N_POSTGRES_CREDENTIAL_NAME=pg-credentials` 확인 (다르게 쓸 경우 해당 이름으로 생성)
+4. 좌측 메뉴 **Settings → Credentials → + New Credential → PostgreSQL** 선택
+5. 아래 값 입력 후 **Save** (이름은 `N8N_POSTGRES_CREDENTIAL_NAME` 값과 동일해야 함):
 
    | 항목 | 값 |
    |------|-----|
@@ -688,9 +718,9 @@ docker-compose logs -f notebooklm-service
    | `WF-12_heygen_generate.json` | HeyGen 영상 생성 | Webhook |
    | `WF-08_sns_upload.json` | SNS 업로드 | Webhook |
    | `WF-09-youtube-source.json` | YouTube 소스 자동 수집 | 매시간 Schedule |
-   | `WF-10-daily-notebook.json` | 일일 노트북 생성 | 매일 자정 Schedule |
+   | `WF-10-daily-notebook.json` | 일일 노트북 생성 | 매일 07:30 KST Schedule |
 
-3. Webhook 기반 워크플로(WF-01~08): **Postgres 노드** 클릭 → Credentials → `pg-credentials` 선택
+3. 수동 재선택은 기본적으로 불필요합니다. 컨테이너 기동 시 `sync_workflows.js`가 `N8N_POSTGRES_CREDENTIAL_NAME` 기준으로 Postgres credential id를 자동 매핑합니다.
 4. 각 워크플로 우상단 **Active 토글 ON** → **Save**
 
 > **워크플로 수정 시 재임포트 방법 (docker 재빌드 불필요):**
@@ -988,6 +1018,121 @@ PASS 기준:
 - 타겟 계정 IAM Trust/Permission(`sts:AssumeRole`, `s3:PutObject/GetObject`)
 - n8n WF-11 최신 워크플로 재임포트/재기동 여부
 
+### TTS Seed Lab (RunPod 대량 청취 테스트)
+
+RunPod TTS 서버를 그대로 사용하면서, 로컬에서 대량 seed를 생성/청취/평가하기 위한 도구입니다.
+
+준비:
+
+```bash
+cd ai-influencer
+export TTS_API_URL="https://<runpod-url>"
+cp scripts/seed_lab_dataset.example.json scripts/seed_lab_dataset.local.json
+```
+
+Stage-A (기준 스크립트 1개 x 랜덤 seed 10, seed당 3개 오디오 = 총 30개):
+
+```bash
+python3 scripts/seed_lab.py run \
+  --dataset scripts/seed_lab_dataset.local.json \
+  --stage a \
+  --samples 10 \
+  --concurrency 4
+```
+
+빠른 실행( `.env`의 `TTS_API_URL`, `OPENAI_API_KEY` 자동 사용 ):
+
+```bash
+./scripts/seed_lab_quickstart.sh
+```
+
+옵션:
+- `./scripts/seed_lab_quickstart.sh "111,222"` : 지정 seed + 부족분 랜덤으로 30개 생성
+- `./scripts/seed_lab_quickstart.sh -dup "111,222"` : 지정 seed + 부족분 랜덤으로 seed당 3개(총 30개) 생성
+
+생성 후:
+- quickstart가 기본적으로 생성된 샘플 전체(`30개`)에 대해 `auto-eval`을 먼저 실행합니다.
+- quickstart가 자동으로 `seed_lab.py serve`를 실행하고 `http://127.0.0.1:8765`를 엽니다.
+- 같은 페이지에서 오디오 청취/점수 입력/즉석 TTS 파라미터 조정이 가능합니다.
+- 점수/메모 입력 후 `평가 Export(JSON)`
+
+인터랙티브 테스트 서버(HTML에서 샘플 텍스트/파라미터 조정 + 즉석 TTS 생성 + 재생):
+
+```bash
+python3 scripts/seed_lab.py serve \
+  --run-dir seed-lab-runs/<run_id> \
+  --api-url "$TTS_API_URL"
+```
+
+- 접속: `http://127.0.0.1:8765`
+- `평가 테이블에 추가` 체크 후 생성하면 기존 평가 테이블에 샘플이 추가됩니다.
+- `OPENAI_API_KEY`가 있으면 추가 즉시 AI 평가를 수행해 `AI 평가(자동)` 표에 반영합니다.
+- AI 표가 비어 있으면 보통 `OPENAI_API_KEY` 미설정/미전달이거나 아직 `평가 테이블에 추가`로 생성한 샘플이 없는 상태입니다.
+- `SEED_LAB_ASR_MODEL`이 전사용 모델이 아니면 자동으로 `gpt-4o-transcribe`로 폴백합니다(예: `gpt-5.4` 입력 시).
+
+자동평가 관련 환경변수(quickstart):
+
+```bash
+SEED_LAB_AUTO_EVAL_ALL=1          # 0이면 quickstart의 전체 auto-eval 비활성
+SEED_LAB_ASR_MODEL=gpt-4o-transcribe
+SEED_LAB_JUDGE_MODEL=gpt-5.4
+SEED_LAB_AUTO_EVAL_TIMEOUT=120
+```
+
+자동 평가(ASR + LLM, 하이브리드 추천):
+
+```bash
+export OPENAI_API_KEY="<your_openai_key>"
+python3 scripts/seed_lab.py auto-eval \
+  --run-dir seed-lab-runs/<run_id> \
+  --asr-model gpt-4o-transcribe \
+  --judge-model gpt-5.4-mini
+```
+
+산출물:
+- `auto_eval.json` (기존 report/HTML import와 호환되는 평가 JSON)
+- `auto_eval_debug.jsonl` (샘플별 전사/지표/판정 로그)
+
+참고:
+- 자동 평가는 점수/메모만 채우고 `selected`는 `false`로 둡니다(최종 선택은 사람).
+- 자동 평가 JSON을 `index.html`의 `평가 Import`로 불러와 수동 검토를 이어갈 수 있습니다.
+- 평가표 헤더를 클릭하면 사람/AI 목록 모두 정렬할 수 있습니다(오름차순/내림차순 토글).
+- 자동평가 점수는 변별력을 위해 보수적으로 감점 캡이 적용됩니다(정확도/길이비/초당문자 지표 반영).
+
+Report/Top seed 산출:
+
+```bash
+python3 scripts/seed_lab.py report \
+  --run-dir seed-lab-runs/<run_id> \
+  --eval-json /path/to/exported-eval.json \
+  --ai-eval-json seed-lab-runs/<run_id>/auto_eval.json \
+  --top 20 \
+  --prepare-stage-b
+```
+
+산출물:
+- `seed_ranking_human.csv`, `seed_ranking_human.json`
+- `seed_ranking_ai.csv`, `seed_ranking_ai.json` (AI 평가 파일이 있을 때)
+- `seed_ranking.csv`, `seed_ranking.json` (호환용, human과 동일)
+- `top_seeds_stage_b.txt` (상위 20 seed)
+- `env_snippet_top3.txt` (`TTS_FIXED_SEEDS=` 스니펫)
+
+Stage-B (상위 seed x 나머지 2개 스크립트):
+
+```bash
+python3 scripts/seed_lab.py run \
+  --dataset scripts/seed_lab_dataset.local.json \
+  --stage b \
+  --seeds-file seed-lab-runs/<run_id>/top_seeds_stage_b.txt \
+  --concurrency 4
+```
+
+참고:
+- `.yaml` dataset도 가능하지만 로컬 Python에 `PyYAML`이 있어야 합니다.
+- 현재 Seed Lab은 같은 seed당 3개(`t1~t3`)를 항상 새로 생성합니다.
+- 동일 run 재실행 시에도 기존 오디오를 건너뛰지 않고 다시 생성합니다.
+- 운영 반영은 사람이 최종 seed를 확정한 뒤 `.env`의 `TTS_FIXED_SEEDS`에 수동 반영합니다.
+
 ### 자동 수집 확인
 
 ```bash
@@ -1011,7 +1156,9 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | n8n Postgres 연결 실패 | `postgres` 컨테이너 healthy 상태 대기 (`docker-compose ps`) |
 | n8n `$env.*` 접근 거부 | `docker-compose.yml`에 `N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"` 추가 후 재시작 |
 | n8n 환경변수 미반영 | `docker-compose up -d --force-recreate n8n` (재빌드 아닌 재생성) |
-| n8n 워크플로 import 오류 | 기존 워크플로 삭제 후 재임포트. Postgres 크레덴셜 재선택 필수 |
+| Seed Lab `AI 평가(자동)`이 계속 `OPENAI_API_KEY 미설정` | quickstart 로그에서 `OPENAI_API_KEY loaded: yes`와 `OPENAI_API_KEY exported to serve env: yes` 확인. 이후 serve 시작 로그가 `openai_configured=True`인지 확인 |
+| Seed Lab auto-eval이 전부 `Invalid URL (POST /v1/audio/transcriptions)` 실패 | ASR 모델이 전사용 모델인지 확인. quickstart에서는 `SEED_LAB_ASR_MODEL`을 transcribe 계열로 설정하거나 기본값(`gpt-4o-transcribe`) 사용 |
+| n8n 워크플로 import 오류 | `docker-compose logs n8n`에서 `workflow-sync`/credential 매핑 에러 먼저 확인 |
 | n8n `http://IP:5678` 접속 불가 | EC2 보안그룹 인바운드 5678 포트 오픈 확인 |
 | 봇이 모든 채널에서 응답 | `.env`에 `DISCORD_ALLOWED_CHANNEL_IDS` 추가 후 `docker-compose up -d --build discord-bot` |
 | WF-09 "채널 있는 경우만" false | `TOPIC_CHANNELS`가 n8n 컨테이너에 주입됐는지 docker-compose.yml 확인 |
@@ -1030,6 +1177,8 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | `/report`에서 기존 보고서가 있는데도 새 생성만 보임 | notebooklm-service 로그의 `[CUA][LIST] 종료 요약`(`elapsed/scroll/collect/premature_done/termination_reason`)을 먼저 확인. 조기 `done`은 무시되고 최소 탐색 게이트(시간/스크롤/스텝) 미충족이면 빈목록 성공으로 처리하지 않으며, 이 경우 `다시 조회` 버튼으로 재시도 |
 | `/report`에서 `Looks like Playwright ... install` 또는 브라우저 실행 Traceback | `notebooklm-service` 이미지를 최신으로 재빌드해 Chromium 포함 여부를 반영: `docker-compose build --no-cache notebooklm-service && docker-compose up -d notebooklm-service` |
 | WF-09 소스 추가는 성공했는데 자동 보고서가 안 옴 | gateway에 `DISCORD_ALLOWED_CHANNEL_IDS`가 주입됐는지 확인. 값이 비어 있으면 `/internal/auto-report`가 실패함 |
+| Gateway에서 `http://n8n:5678/webhook/wf-06-report` 404 | n8n 최신 버전은 ID 포함 production webhook을 사용합니다. `N8N_WFxx_WEBHOOK_URL`을 `/webhook/<workflowId>/webhook/<path>` 형태로 수정 후 gateway 재기동 |
+| 아침 노트북에 소스만 있고 보고서가 계속 비어 있음 | WF-09 최신 워크플로 재임포트 후 `결과 로깅` 노드에서 `recovery-no-report` 로그 확인. `AUTO_REPORT_MAX_ATTEMPTS_PER_DAY`, `AUTO_REPORT_STALE_MINUTES` 설정도 점검 |
 | 자동 보고서가 예상 채널이 아닌 곳에 옴 | auto-report는 `DISCORD_ALLOWED_CHANNEL_IDS`의 첫 번째 채널만 사용함. 순서 변경 후 gateway 재기동 필요 |
 | TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
 | CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | `OPENAI_CUA_API_KEY` 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |
@@ -1095,24 +1244,36 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 dpkg -i cloudflared-linux-amd64.deb
 ```
 
-# 프롬프트
+## TTS Router 기반 RunPod Serverless 전환 (복구 가능)
 
-- _SCRIPT_REWRITE_PROMPT_BASE = (
-    """
-    당신은 20대 초반의 발랄한 성격을 가진 숏폼 인플루언서 '하리'입니다. 
-    팬덤명은 '보리'입니다.
-    규칙을 엄격하게 준수하여, [소스 내용]을 소개하는 "350자" 분량의 대본을 작성해 주세요.
+기존 요청 포맷(`/tts`)은 유지하고, 호출 경로만 `tts-router-service`로 분리합니다.
 
-    1. 출력 형식 제한: 대본의 제목, 화자 이름(하리:), 지문(예: [오프닝], [본문]) 등 대사가 아닌 모든 글자 및 기호는 절대 작성하지 마세요. 오직 화면에서 읽을 '대사'만 텍스트로 출력해야 합니다.
-    2. 100% 한글 표기: 알파벳(영어)과 숫자는 절대 사용하지 마세요. 모두 한글 발음으로 변환하여 적어주세요. (예시: AI -> 에이아이, 350 -> 삼백오십)
-    3. 마크다운 금지: 굵게(**), 기울임 등 어떠한 마크다운 문법도 사용하지 마세요.
-    4. TTS 최적화 (가장 중요):
-    - 사전에 없는 단어는 실제 한국어 발음대로 표기하세요. (예시: 역대급 -> 역대끕)
-    - 숫자 관련 발음은 붙여 표기하세요. (예시: 오 점 사 -> 오쩜사)
-    - 발랄한 억양을 살리기 위해 물음표(?)를 적극적으로 사용하세요.
-    - 오늘, 어제 등 상대적인 날짜를 표기하지 마세요.
-    - 매 문장이 끝날 때마다 반드시 "줄바꿈"(엔터)을 하세요.
+### 핵심 환경변수
 
-    [대본 구성]
-    오프닝(인사) - 본문(소스 내용 소개) - 마무리(엔딩)의 자연스러운 흐름으로 작성할 것.
-"""
+- `TTS_API_URL`: 로컬 툴(예: seed lab)에서 직접 호출할 기본 URL
+- `TTS_API_URL_INTERNAL`: 도커 내부(`messenger-gateway`, `n8n`)에서 사용할 URL
+- `TTS_ROUTER_MODE`: `legacy_http` 또는 `runpod_serverless`
+- `TTS_LEGACY_API_URL`: 기존 Cloudflare/RunPod API URL
+- `RUNPOD_API_KEY`, `RUNPOD_SERVERLESS_ENDPOINT_ID`: Serverless 호출 자격
+
+### 무중단 단계별 전환
+
+1. 안전 배포(동작 동일 유지)
+   - `TTS_API_URL_INTERNAL`을 기존 값으로 두고 배포
+   - `TTS_ROUTER_MODE=legacy_http`
+2. 라우터 경유 전환
+   - `TTS_API_URL_INTERNAL=http://tts-router-service:8300`
+   - `TTS_ROUTER_MODE=legacy_http` 유지 (실동작은 기존 API 그대로)
+3. Serverless 활성화
+   - `RUNPOD_API_KEY`, `RUNPOD_SERVERLESS_ENDPOINT_ID` 설정
+   - `TTS_ROUTER_MODE=runpod_serverless`
+
+### 즉시 롤백
+
+- `TTS_ROUTER_MODE=legacy_http` 로 변경 후 재기동
+- 필요 시 `TTS_API_URL_INTERNAL`도 기존 Cloudflare URL로 복원
+
+```bash
+cd ~/SKN22-Final-4Team-AI/ai-influencer
+docker-compose up -d --build --force-recreate tts-router-service messenger-gateway n8n
+```

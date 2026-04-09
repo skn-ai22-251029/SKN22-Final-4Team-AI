@@ -1,5 +1,6 @@
 {
-  "name": "WF-08: SNS 업로드 (YouTube / Instagram / TikTok)",
+  "id": "uLRW8JT5UitrhCC9",
+  "name": "WF-08: SNS 업로드 (YouTube / Instagram)",
   "nodes": [
     {
       "parameters": {
@@ -21,7 +22,11 @@
             {"id": "b1", "name": "job_id", "value": "={{ $json.body.job_id }}", "type": "string"},
             {"id": "b2", "name": "video_url", "value": "={{ $json.body.video_url }}", "type": "string"},
             {"id": "b3", "name": "channel_id", "value": "={{ $json.body.channel_id }}", "type": "string"},
-            {"id": "b4", "name": "video_filename", "value": "={{ $json.body.video_filename ?? '' }}", "type": "string"}
+            {"id": "b4", "name": "video_filename", "value": "={{ $json.body.video_filename ?? '' }}", "type": "string"},
+            {"id": "b5", "name": "title", "value": "={{ $json.body.title ?? '' }}", "type": "string"},
+            {"id": "b6", "name": "description", "value": "={{ $json.body.description ?? '' }}", "type": "string"},
+            {"id": "b7", "name": "caption", "value": "={{ $json.body.caption ?? '' }}", "type": "string"},
+            {"id": "b8", "name": "targets_json", "value": "={{ JSON.stringify($json.body.targets ?? []) }}", "type": "string"}
           ]
         },
         "options": {}
@@ -35,7 +40,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='PUBLISHING', updated_at=NOW() WHERE id='{{ $json.job_id }}' RETURNING concept_text, script_json",
+        "query": "UPDATE jobs SET status='PUBLISHING', error_message=NULL, updated_at=NOW() WHERE id='{{ $json.job_id }}'",
         "options": {}
       },
       "id": "wf08-pg-publishing",
@@ -49,90 +54,27 @@
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {"name": "Authorization", "value": "={{ 'Bearer ' + $env.YOUTUBE_ACCESS_TOKEN }}"},
-            {"name": "Content-Type", "value": "application/json"}
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ snippet: { title: (($('Extract Fields').item.json.video_filename || '').replace(/\\.mp4$/i, '') || $('Extract Fields').item.json.job_id.substring(0, 8)) + ' - AI 인플루언서 콘텐츠', description: $json.concept_text || '', tags: ['AI', '인플루언서'], categoryId: '22' }, status: { privacyStatus: 'public' } }) }}",
-        "options": {}
+        "jsCode": "const fields = $('Extract Fields').item.json;\nconst serviceUrl = ($env.SNS_PUBLISHER_SERVICE_URL || '').trim();\nconst jobId = fields.job_id;\nconst channelId = fields.channel_id;\n\nfunction clip(text, maxLen = 300) {\n  const normalized = String(text || '').trim();\n  if (normalized.length <= maxLen) return normalized;\n  return normalized.slice(0, maxLen - 3) + '...';\n}\n\nif (!serviceUrl) {\n  return {\n    json: {\n      job_id: jobId,\n      channel_id: channelId,\n      final_status: 'PUBLISH_FAILED',\n      summary_text: `❌ SNS 업로드 실패\\n\\nJob ID: ${jobId.slice(0, 8)}\\n• 시스템 오류: SNS_PUBLISHER_SERVICE_URL is not configured`,\n    },\n  };\n}\n\nlet targets = [];\ntry {\n  targets = JSON.parse(fields.targets_json || '[]');\n} catch (e) {\n  return {\n    json: {\n      job_id: jobId,\n      channel_id: channelId,\n      final_status: 'PUBLISH_FAILED',\n      summary_text: `❌ SNS 업로드 실패\\n\\nJob ID: ${jobId.slice(0, 8)}\\n• 요청 오류: targets 파싱 실패`,\n    },\n  };\n}\n\ntry {\n  const resp = await fetch(`${serviceUrl.replace(/\\/$/, '')}/publish`, {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({\n      job_id: jobId,\n      video_url: fields.video_url,\n      targets,\n      title: fields.title,\n      description: fields.description,\n      caption: fields.caption,\n      video_filename: fields.video_filename,\n    }),\n  });\n\n  let data = {};\n  try {\n    data = await resp.json();\n  } catch {\n    data = {};\n  }\n\n  if (!resp.ok) {\n    const detail = clip(data.detail || JSON.stringify(data) || resp.statusText || `HTTP ${resp.status}`);\n    return {\n      json: {\n        job_id: jobId,\n        channel_id: channelId,\n        final_status: 'PUBLISH_FAILED',\n        summary_text: `❌ SNS 업로드 실패\\n\\nJob ID: ${jobId.slice(0, 8)}\\n• 시스템 오류: ${detail}`,\n      },\n    };\n  }\n\n  return {\n    json: {\n      job_id: jobId,\n      channel_id: channelId,\n      final_status: data.final_status || 'PUBLISH_FAILED',\n      summary_text: data.summary_text || `❌ SNS 업로드 실패\\n\\nJob ID: ${jobId.slice(0, 8)}\\n• 시스템 오류: empty publish response`,\n    },\n  };\n} catch (e) {\n  return {\n    json: {\n      job_id: jobId,\n      channel_id: channelId,\n      final_status: 'PUBLISH_FAILED',\n      summary_text: `❌ SNS 업로드 실패\\n\\nJob ID: ${jobId.slice(0, 8)}\\n• 네트워크 오류: ${clip(e && e.message ? e.message : String(e))}`,\n    },\n  };\n}\n",
+        "options": {},
+        "mode": "runOnceForEachItem"
       },
-      "id": "wf08-http-youtube",
-      "name": "YouTube Upload",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [900, 160]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ 'https://graph.facebook.com/v18.0/' + $env.INSTAGRAM_USER_ID + '/media' }}",
-        "sendHeaders": false,
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ media_type: 'REELS', video_url: $('Extract Fields').item.json.video_url, caption: $('Update to PUBLISHING').item.json.concept_text || '', access_token: $env.INSTAGRAM_ACCESS_TOKEN }) }}",
-        "options": {}
-      },
-      "id": "wf08-http-instagram",
-      "name": "Instagram Upload",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
+      "id": "wf08-code-publish",
+      "name": "Publish via SNS Service",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [900, 300]
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://open.tiktokapis.com/v2/post/publish/video/init/",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {"name": "Authorization", "value": "={{ 'Bearer ' + $env.TIKTOK_ACCESS_TOKEN }}"},
-            {"name": "Content-Type", "value": "application/json; charset=UTF-8"}
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ post_info: { title: $('Update to PUBLISHING').item.json.concept_text || 'AI 인플루언서 콘텐츠', privacy_level: 'PUBLIC_TO_EVERYONE', disable_duet: false, disable_comment: false, disable_stitch: false }, source_info: { source: 'PULL_FROM_URL', video_url: $('Extract Fields').item.json.video_url } }) }}",
-        "options": {}
-      },
-      "id": "wf08-http-tiktok",
-      "name": "TikTok Upload",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [900, 440]
-    },
-    {
-      "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO platform_posts (job_id, platform, platform_post_id, published_at) VALUES ('{{ $('Extract Fields').item.json.job_id }}', 'youtube', '{{ $('YouTube Upload').item.json.id ?? '' }}', NOW()), ('{{ $('Extract Fields').item.json.job_id }}', 'instagram', '{{ $('Instagram Upload').item.json.id ?? '' }}', NOW()), ('{{ $('Extract Fields').item.json.job_id }}', 'tiktok', '{{ $('TikTok Upload').item.json.data?.publish_id ?? '' }}', NOW())",
+        "query": "UPDATE jobs SET status='{{ $('Publish via SNS Service').item.json.final_status }}', updated_at=NOW() WHERE id='{{ $('Publish via SNS Service').item.json.job_id }}'",
         "options": {}
       },
-      "id": "wf08-pg-platform-posts",
-      "name": "Insert platform_posts",
+      "id": "wf08-pg-final-status",
+      "name": "Update Final Status",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [1120, 300],
-      "credentials": {
-        "postgres": {"id": "1", "name": "pg-credentials"}
-      }
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='PUBLISHED', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
-        "options": {}
-      },
-      "id": "wf08-pg-published",
-      "name": "Update to PUBLISHED",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [1340, 300],
       "credentials": {
         "postgres": {"id": "1", "name": "pg-credentials"}
       }
@@ -149,14 +91,14 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('Extract Fields').item.json.channel_id, text: '✅ SNS 업로드 완료!\\n\\n📺 YouTube: 업로드됨\\n📸 Instagram: 업로드됨\\n🎵 TikTok: 업로드됨\\n\\nJob ID: ' + $('Extract Fields').item.json.job_id.substring(0, 8) }) }}",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('Publish via SNS Service').item.json.channel_id, text: $('Publish via SNS Service').item.json.summary_text }) }}",
         "options": {}
       },
       "id": "wf08-http-send-complete",
       "name": "Send Complete Notification",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1560, 300]
+      "position": [1340, 300]
     }
   ],
   "connections": {
@@ -167,25 +109,12 @@
       "main": [[{"node": "Update to PUBLISHING", "type": "main", "index": 0}]]
     },
     "Update to PUBLISHING": {
-      "main": [
-        [{"node": "YouTube Upload", "type": "main", "index": 0}],
-        [{"node": "Instagram Upload", "type": "main", "index": 0}],
-        [{"node": "TikTok Upload", "type": "main", "index": 0}]
-      ]
+      "main": [[{"node": "Publish via SNS Service", "type": "main", "index": 0}]]
     },
-    "YouTube Upload": {
-      "main": [[{"node": "Insert platform_posts", "type": "main", "index": 0}]]
+    "Publish via SNS Service": {
+      "main": [[{"node": "Update Final Status", "type": "main", "index": 0}]]
     },
-    "Instagram Upload": {
-      "main": [[{"node": "Insert platform_posts", "type": "main", "index": 0}]]
-    },
-    "TikTok Upload": {
-      "main": [[{"node": "Insert platform_posts", "type": "main", "index": 0}]]
-    },
-    "Insert platform_posts": {
-      "main": [[{"node": "Update to PUBLISHED", "type": "main", "index": 0}]]
-    },
-    "Update to PUBLISHED": {
+    "Update Final Status": {
       "main": [[{"node": "Send Complete Notification", "type": "main", "index": 0}]]
     }
   },

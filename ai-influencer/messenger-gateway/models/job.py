@@ -1,4 +1,5 @@
 from enum import Enum
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
@@ -14,6 +15,8 @@ class JobStatus(str, Enum):
     WAITING_VIDEO_APPROVAL = "WAITING_VIDEO_APPROVAL"
     PUBLISHING = "PUBLISHING"
     PUBLISHED = "PUBLISHED"
+    PARTIALLY_PUBLISHED = "PARTIALLY_PUBLISHED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
     ANALYTICS_COLLECTED = "ANALYTICS_COLLECTED"
     FAILED = "FAILED"
 
@@ -52,6 +55,8 @@ class SendTextRequest(BaseModel):
     messenger_source: MessengerSource
     messenger_channel_id: str
     text: str
+    job_id: str = ""
+    cost_event: dict = {}
 
 
 class ReportMessageRequest(BaseModel):
@@ -83,6 +88,15 @@ class SendVideoPreviewRequest(BaseModel):
     channel_id: str
     user_id: str
     video_filename: str = ""
+    heygen_status: str = ""
+    heygen_video_id: str = ""
+    heygen_avatar_id: str = ""
+    heygen_use_avatar_iv_model: bool = False
+    heygen_usage_json: dict = {}
+    heygen_request_snapshot: dict = {}
+    heygen_response_snapshot: dict = {}
+    heygen_cost_usd: Optional[float] = None
+    heygen_error: str = ""
 
 
 class SendAudioRequest(BaseModel):
@@ -99,13 +113,18 @@ class SendAudioRequest(BaseModel):
 
 class TtsActionRequest(BaseModel):
     job_id: str
-    action: str  # "approve" | "reject"
+    action: str  # "select_variant" | "regenerate_batch" | "select_avatar" | "approve_standard" | "approve_hd" | "reject"
+    use_avatar_iv_model: bool = False
+    batch_id: str = ""
+    variant_index: Optional[int] = None
+    avatar_index: Optional[int] = None
 
 
 class VideoActionRequest(BaseModel):
     job_id: str
     action: str  # "approved" | "reject_select" | "reject_step"
     step: Optional[str] = None  # "script" | "tts" | "draft"
+    targets: list[str] = []
 
 
 class ReportToVideoRequest(BaseModel):
@@ -122,6 +141,8 @@ class ManualGenerateRequest(BaseModel):
     messenger_user_id: str = ""
     messenger_channel_id: str = ""
     avatar_id: str = ""
+    use_avatar_iv_model: bool = False
+    prompt: str = ""
 
 
 class HeygenSmokeTestRequest(BaseModel):
@@ -157,3 +178,21 @@ class AutoReportRequest(BaseModel):
     channel_name: str = ""
     source_url: str = ""
     source_title: str = ""
+
+
+class CostEventIngestRequest(BaseModel):
+    job_id: str
+    topic_text: str = ""
+    stage: str
+    process: str
+    provider: str
+    attempt_no: int = 1
+    status: str
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    usage_json: dict = {}
+    raw_response_json: dict = {}
+    cost_usd: Optional[float] = None
+    error_type: str = ""
+    error_message: str = ""
+    idempotency_key: str = ""

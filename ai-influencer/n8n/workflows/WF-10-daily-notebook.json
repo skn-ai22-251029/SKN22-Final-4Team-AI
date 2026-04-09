@@ -1,14 +1,15 @@
 {
+  "id": "a7hLYh1ppTNbaBK4",
   "name": "WF-10: 일일 토픽 노트북 자동 생성",
   "nodes": [
     {
       "parameters": {
         "rule": {
-          "interval": [{ "field": "cronExpression", "expression": "0 0 * * *" }]
+          "interval": [{ "field": "cronExpression", "expression": "30 7 * * *" }]
         }
       },
       "id": "wf10-schedule",
-      "name": "매일 자정 실행",
+      "name": "매일 오전 7시 30분 실행",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1,
       "position": [240, 300]
@@ -82,7 +83,7 @@
     }
   ],
   "connections": {
-    "매일 자정 실행": {
+    "매일 오전 7시 30분 실행": {
       "main": [[{ "node": "토픽 목록 파싱", "type": "main", "index": 0 }]]
     },
     "토픽 목록 파싱": {

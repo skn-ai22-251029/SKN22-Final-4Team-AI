@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from urllib.parse import urlparse, urlunparse
 from typing import Optional
 
 import httpx
@@ -9,6 +10,15 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _client: Optional[httpx.AsyncClient] = None
+
+_WEBHOOK_PATH_TO_WORKFLOW_ID = {
+    "wf-01-input": "Mt5nwvystMhfO1nl",
+    "wf-05-confirm": "gD9A0qy9MxY8g0T6",
+    "wf-06-report": "QSrXdaRpKosyZIj3",
+    "wf-08-sns-upload": "uLRW8JT5UitrhCC9",
+    "wf-11-tts-generate": "Wv5SdSdlPLwNzeqF",
+    "wf-12-heygen-generate-v2": "WF12HeygenV2Run",
+}
 
 
 def get_http_client() -> httpx.AsyncClient:
@@ -30,19 +40,84 @@ def _headers() -> dict[str, str]:
     return {"X-Internal-Secret": settings.gateway_internal_secret}
 
 
+def _build_webhook_fallback_url(url: str) -> Optional[str]:
+    """Legacy /webhook/<path> URL을 /webhook/<workflowId>/webhook/<path>로 변환한다."""
+    parsed = urlparse(url)
+    prefix = "/webhook/"
+    if not parsed.path.startswith(prefix):
+        return None
+    tail = parsed.path[len(prefix):].strip("/")
+    # 이미 /webhook/<id>/webhook/<path> 형태이면 fallback 불필요
+    if "/webhook/" in tail:
+        return None
+    workflow_id = _WEBHOOK_PATH_TO_WORKFLOW_ID.get(tail)
+    if not workflow_id:
+        return None
+    fallback_path = f"/webhook/{workflow_id}/webhook/{tail}"
+    if fallback_path == parsed.path:
+        return None
+    return urlunparse(parsed._replace(path=fallback_path))
+
+
 async def _post_with_retry(url: str, payload: dict, max_retries: int = 3) -> httpx.Response:
     client = get_http_client()
-    for attempt in range(max_retries):
-        try:
-            resp = await client.post(url, json=payload, headers=_headers())
-            resp.raise_for_status()
-            return resp
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            if attempt == max_retries - 1:
-                raise
-            wait = 2 ** attempt
-            logger.warning("n8n call failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
-            await asyncio.sleep(wait)
+    candidates: list[str] = [url]
+    fallback_url = _build_webhook_fallback_url(url)
+    if fallback_url and fallback_url not in candidates:
+        candidates.append(fallback_url)
+
+    last_error: Exception | None = None
+    for candidate_index, candidate_url in enumerate(candidates):
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(candidate_url, json=payload, headers=_headers())
+                resp.raise_for_status()
+                if candidate_index > 0:
+                    logger.info("n8n call fallback succeeded url=%s", candidate_url)
+                return resp
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status_code = e.response.status_code if e.response is not None else 0
+                # legacy URL이 404면 ID URL 후보를 즉시 시도한다.
+                if status_code == 404 and candidate_index < len(candidates) - 1:
+                    logger.warning(
+                        "n8n webhook not found (url=%s status=404), trying fallback url=%s",
+                        candidate_url,
+                        candidates[candidate_index + 1],
+                    )
+                    break
+                if attempt == max_retries - 1:
+                    logger.error("n8n call failed url=%s status=%s", candidate_url, status_code)
+                    break
+                wait = 2 ** attempt
+                logger.warning(
+                    "n8n call failed (attempt %d/%d) url=%s status=%s, retrying in %ds",
+                    attempt + 1,
+                    max_retries,
+                    candidate_url,
+                    status_code,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+            except httpx.RequestError as e:
+                last_error = e
+                if attempt == max_retries - 1:
+                    logger.error("n8n request error url=%s: %s", candidate_url, e)
+                    break
+                wait = 2 ** attempt
+                logger.warning(
+                    "n8n request error (attempt %d/%d) url=%s, retrying in %ds: %s",
+                    attempt + 1,
+                    max_retries,
+                    candidate_url,
+                    wait,
+                    e,
+                )
+                await asyncio.sleep(wait)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"n8n call failed without explicit error: url={url}")
 
 
 async def call_wf01_input(
@@ -105,6 +180,7 @@ async def call_wf12_heygen_generate(
     user_id: str,
     audio_url: str = "",
     avatar_id: str = "",
+    use_avatar_iv_model: bool = False,
 ) -> None:
     payload = {
         "job_id": job_id,
@@ -112,6 +188,7 @@ async def call_wf12_heygen_generate(
         "user_id": user_id,
         "audio_url": audio_url,
         "avatar_id": avatar_id,
+        "use_avatar_iv_model": use_avatar_iv_model,
     }
     await _post_with_retry(settings.n8n_wf12_webhook_url, payload)
     logger.info("call_wf12_heygen_generate job_id=%s", job_id)
@@ -121,18 +198,28 @@ async def call_wf08_sns_upload(
     job_id: str,
     video_url: str,
     channel_id: str,
+    targets: list[str],
     video_filename: str = "",
+    title: str = "",
+    description: str = "",
+    caption: str = "",
 ) -> None:
     if not video_url:
         raise ValueError("video_url is required for WF-08 upload")
+    if not targets:
+        raise ValueError("targets are required for WF-08 upload")
     payload = {
         "job_id": job_id,
         "video_url": video_url,
         "channel_id": channel_id,
+        "targets": targets,
         "video_filename": video_filename,
+        "title": title,
+        "description": description,
+        "caption": caption,
     }
     await _post_with_retry(settings.n8n_wf08_webhook_url, payload)
-    logger.info("call_wf08_sns_upload job_id=%s video_filename=%s", job_id, video_filename)
+    logger.info("call_wf08_sns_upload job_id=%s targets=%s video_filename=%s", job_id, ",".join(targets), video_filename)
 
 
 async def call_wf06_report(
@@ -155,7 +242,5 @@ async def call_wf06_report(
         "channel_id": channel_id,
         "character_id": character_id,
     }
-    client = get_http_client()
-    resp = await client.post(settings.n8n_wf06_webhook_url, json=payload, headers=_headers())
-    resp.raise_for_status()
+    await _post_with_retry(settings.n8n_wf06_webhook_url, payload)
     logger.info("[%s] call_wf06_report job_id=%s", messenger_source, job_id)

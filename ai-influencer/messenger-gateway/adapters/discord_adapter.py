@@ -9,6 +9,7 @@ from .base import MessengerAdapter
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://discord.com/api/v10"
+_AVATAR_BUTTON_LABELS = ("정장", "후드", "셔츠")
 
 
 class DiscordAdapter(MessengerAdapter):
@@ -99,6 +100,23 @@ class DiscordAdapter(MessengerAdapter):
         await self.send_text_message(channel_id, replacement_text)
         logger.info("[discord] remove_buttons channel=%s message_id=%s", channel_id, message_id)
 
+    async def clear_message_components(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: Optional[str] = None,
+    ) -> None:
+        payload: dict[str, object] = {"components": []}
+        if content is not None:
+            payload["content"] = content
+        resp = await self._client.patch(
+            f"{BASE_URL}/channels/{channel_id}/messages/{message_id}",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        logger.info("[discord] clear_message_components channel=%s message_id=%s", channel_id, message_id)
+
     async def send_video_preview(
         self,
         channel_id: str,
@@ -109,7 +127,7 @@ class DiscordAdapter(MessengerAdapter):
         content = (
             f"🎬 **영상이 생성되었습니다!**\n\n"
             f"{video_url}\n\n"
-            "승인하시면 각 SNS에 자동 업로드됩니다."
+            "승인 후 업로드할 플랫폼을 선택합니다."
         )
         payload = {
             "content": content,
@@ -404,28 +422,13 @@ class DiscordAdapter(MessengerAdapter):
         audio_bytes: bytes,
         filename: str,
         include_wf12_button: bool = True,
+        selected_avatar_index: Optional[int] = None,
     ) -> tuple[str, str]:
-        components = []
-        if include_wf12_button:
-            components = [
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "✅ 승인 (WF-12 진행)",
-                            "style": 3,
-                            "custom_id": f"tts_approve:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "❌ 반려",
-                            "style": 4,
-                            "custom_id": f"tts_reject:{job_id}",
-                        },
-                    ],
-                }
-            ]
+        components = self._build_tts_approval_components(
+            job_id=job_id,
+            include_wf12_button=include_wf12_button,
+            selected_avatar_index=selected_avatar_index,
+        )
 
         payload_json = json.dumps({"content": caption, "components": components})
         resp = await self._client.post(
@@ -444,6 +447,158 @@ class DiscordAdapter(MessengerAdapter):
         logger.info("[discord] send_tts_audio_message job=%s message_id=%s", job_id, message_id)
         return message_id, attachment_url
 
+    async def send_tts_variant_control_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        batch_id: str,
+        caption: str,
+    ) -> str:
+        payload = {
+            "content": caption,
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "label": "🔁 다시 생성",
+                            "style": 2,
+                            "custom_id": f"tts_regenerate:{job_id}:{batch_id}",
+                        },
+                    ],
+                }
+            ],
+        }
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        logger.info("[discord] send_tts_variant_control_message job=%s batch_id=%s message_id=%s", job_id, batch_id, message_id)
+        return message_id
+
+    async def send_tts_variant_audio_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        batch_id: str,
+        variant_index: int,
+        caption: str,
+        audio_bytes: bytes,
+        filename: str,
+    ) -> tuple[str, str]:
+        payload_json = json.dumps(
+            {
+                "content": caption,
+                "components": [
+                    {
+                        "type": 1,
+                        "components": [
+                            {
+                                "type": 2,
+                                "label": "✅ 이 버전 선택",
+                                "style": 3,
+                                "custom_id": f"tts_select:{job_id}:{batch_id}:{variant_index}",
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {self._token}"},
+            files={"files[0]": (filename, audio_bytes, "audio/wav")},
+            data={"payload_json": payload_json},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        attachment_url = ""
+        attachments = data.get("attachments") or []
+        if attachments and isinstance(attachments[0], dict):
+            attachment_url = str(attachments[0].get("url") or "")
+        logger.info(
+            "[discord] send_tts_variant_audio_message job=%s batch_id=%s variant=%s message_id=%s",
+            job_id,
+            batch_id,
+            variant_index,
+            message_id,
+        )
+        return message_id, attachment_url
+
+    async def send_tts_variant_link_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        batch_id: str,
+        variant_index: int,
+        caption: str,
+        audio_url: str,
+    ) -> str:
+        payload = {
+            "content": f"{caption}\n\n📎 TTS 링크(24시간 유효):\n{audio_url}",
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "label": "✅ 이 버전 선택",
+                            "style": 3,
+                            "custom_id": f"tts_select:{job_id}:{batch_id}:{variant_index}",
+                        },
+                    ],
+                }
+            ],
+        }
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        logger.info(
+            "[discord] send_tts_variant_link_message job=%s batch_id=%s variant=%s message_id=%s",
+            job_id,
+            batch_id,
+            variant_index,
+            message_id,
+        )
+        return message_id
+
+    async def send_tts_approval_message(
+        self,
+        channel_id: str,
+        job_id: str,
+        caption: str,
+        selected_avatar_index: Optional[int] = None,
+    ) -> str:
+        payload = {
+            "content": caption,
+            "components": self._build_tts_approval_components(
+                job_id=job_id,
+                include_wf12_button=True,
+                selected_avatar_index=selected_avatar_index,
+            ),
+        }
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        logger.info("[discord] send_tts_approval_message job=%s message_id=%s", job_id, message_id)
+        return message_id
+
     async def send_tts_link_message(
         self,
         channel_id: str,
@@ -451,29 +606,14 @@ class DiscordAdapter(MessengerAdapter):
         caption: str,
         audio_url: str,
         include_wf12_button: bool = True,
+        selected_avatar_index: Optional[int] = None,
     ) -> str:
-        components = []
-        if include_wf12_button:
-            components = [
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "label": "✅ 승인 (WF-12 진행)",
-                            "style": 3,
-                            "custom_id": f"tts_approve:{job_id}",
-                        },
-                        {
-                            "type": 2,
-                            "label": "❌ 반려",
-                            "style": 4,
-                            "custom_id": f"tts_reject:{job_id}",
-                        },
-                    ],
-                }
-            ]
-        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 승인하면 WF-12(HeyGen)로 진행합니다."
+        components = self._build_tts_approval_components(
+            job_id=job_id,
+            include_wf12_button=include_wf12_button,
+            selected_avatar_index=selected_avatar_index,
+        )
+        prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
         suffix = f"\n\n📎 TTS 링크(24시간 유효):\n{audio_url}"
         max_prefix_len = max(0, 1900 - len(suffix))
         if len(prefix) > max_prefix_len:
@@ -490,3 +630,54 @@ class DiscordAdapter(MessengerAdapter):
         message_id = str(data["id"])
         logger.info("[discord] send_tts_link_message job=%s message_id=%s", job_id, message_id)
         return message_id
+
+    def _build_tts_approval_components(
+        self,
+        *,
+        job_id: str,
+        include_wf12_button: bool,
+        selected_avatar_index: Optional[int],
+    ) -> list[dict]:
+        if not include_wf12_button:
+            return []
+        avatar_buttons = []
+        normalized_index = selected_avatar_index if isinstance(selected_avatar_index, int) else None
+        for idx, label in enumerate(_AVATAR_BUTTON_LABELS):
+            is_selected = normalized_index == idx
+            avatar_buttons.append(
+                {
+                    "type": 2,
+                    "label": f"{'✅ ' if is_selected else ''}{label}",
+                    "style": 3 if is_selected else 2,
+                    "custom_id": f"tts_avatar_pick:{job_id}:{idx}",
+                }
+            )
+        return [
+            {
+                "type": 1,
+                "components": avatar_buttons,
+            },
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "label": "✅ 일반 승인",
+                        "style": 3,
+                        "custom_id": f"tts_approve_standard:{job_id}",
+                    },
+                    {
+                        "type": 2,
+                        "label": "💎 고화질 승인",
+                        "style": 2,
+                        "custom_id": f"tts_approve_hd:{job_id}",
+                    },
+                    {
+                        "type": 2,
+                        "label": "❌ 반려",
+                        "style": 4,
+                        "custom_id": f"tts_reject:{job_id}",
+                    },
+                ],
+            },
+        ]
