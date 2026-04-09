@@ -24,6 +24,17 @@ logger = logging.getLogger(__name__)
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 INSTAGRAM_GRAPH_API_BASE = "https://graph.facebook.com"
 ALLOWED_TARGETS = {"youtube", "instagram"}
+REQUIRED_ENV_BY_TARGET = {
+    "youtube": [
+        "YOUTUBE_CLIENT_ID",
+        "YOUTUBE_CLIENT_SECRET",
+        "YOUTUBE_REFRESH_TOKEN",
+    ],
+    "instagram": [
+        "INSTAGRAM_PAGE_ACCESS_TOKEN",
+        "INSTAGRAM_IG_USER_ID",
+    ],
+}
 
 
 class PublishRequest(BaseModel):
@@ -48,6 +59,32 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in {"1", "true", "yes", "on"}
+
+
+def _missing_env_keys(names: list[str]) -> list[str]:
+    missing: list[str] = []
+    for name in names:
+        if not os.environ.get(name, "").strip():
+            missing.append(name)
+    return missing
+
+
+def _target_readiness(target: str) -> dict:
+    required = REQUIRED_ENV_BY_TARGET.get(target, [])
+    missing = _missing_env_keys(required)
+    return {
+        "target": target,
+        "ready": len(missing) == 0,
+        "required_env": required,
+        "missing_env": missing,
+    }
+
+
+def _all_target_readiness() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for target in sorted(ALLOWED_TARGETS):
+        out[target] = _target_readiness(target)
+    return out
 
 
 def _clip_text(text: str, max_len: int) -> str:
@@ -403,6 +440,27 @@ def _publish_sync(body: PublishRequest) -> dict:
     results: dict[str, dict] = {}
 
     for platform in targets:
+        readiness = _target_readiness(platform)
+        if not readiness["ready"]:
+            missing_env = readiness["missing_env"]
+            result = {
+                "status": "failed",
+                "platform_post_id": "",
+                "platform_post_url": "",
+                "error_message": f"missing required env: {', '.join(missing_env)}",
+                "request_json": {"target": platform},
+                "response_json": {"missing_env": missing_env},
+            }
+            _persist_platform_result(body.job_id, platform, result)
+            results[platform] = result
+            logger.warning(
+                "[publish] skip job_id=%s platform=%s reason=missing_env missing=%s",
+                body.job_id,
+                platform,
+                ",".join(missing_env),
+            )
+            continue
+
         logger.info("[publish] start job_id=%s platform=%s", body.job_id, platform)
         if platform == "youtube":
             result = _publish_youtube(body)
@@ -462,7 +520,12 @@ async def publish(body: PublishRequest) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "targets": sorted(ALLOWED_TARGETS)}
+    readiness = _all_target_readiness()
+    return {
+        "status": "ok",
+        "targets": sorted(ALLOWED_TARGETS),
+        "readiness": readiness,
+    }
 
 
 if __name__ == "__main__":

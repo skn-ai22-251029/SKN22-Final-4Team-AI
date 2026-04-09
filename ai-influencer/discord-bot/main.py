@@ -681,11 +681,26 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             else:
                 targets = ["youtube", "instagram"]
                 label = "유튜브 + 인스타그램"
-            await gateway_call(
+            result = await gateway_call(
                 "/internal/video-action",
                 {"job_id": job_id, "action": "approved", "targets": targets},
             )
-            await interaction.followup.send(f"✅ {label} 업로드를 시작합니다. WF-08 실행 중...", ephemeral=True)
+            result_action = str(result.get("action") or "").strip()
+            if result_action == "already_published":
+                await interaction.followup.send(
+                    f"ℹ️ {label} 업로드는 이미 완료되어 있어 중복 실행하지 않았습니다.",
+                    ephemeral=True,
+                )
+            elif result_action == "already_publishing":
+                await interaction.followup.send(
+                    f"⏳ {label} 업로드가 이미 진행 중입니다. 완료 메시지를 기다려주세요.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"✅ {label} 업로드를 시작합니다. WF-08 실행 중...",
+                    ephemeral=True,
+                )
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
@@ -782,7 +797,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         try:
             if avatar_index is None:
                 raise RuntimeError("avatar_index is required")
-            await gateway_call(
+            result = await gateway_call(
                 "/internal/tts-action",
                 {
                     "job_id": job_id,
@@ -790,7 +805,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                     "avatar_index": avatar_index,
                 },
             )
-            avatar_label = {0: "정장", 1: "후드", 2: "셔츠"}.get(avatar_index, f"#{avatar_index}")
+            avatar_label = str(result.get("avatar_label") or f"#{avatar_index}")
             await interaction.followup.send(
                 f"👤 아바타를 `{avatar_label}`(으)로 선택했습니다. 이제 일반 승인 또는 고화질 승인을 진행하세요.",
                 ephemeral=True,

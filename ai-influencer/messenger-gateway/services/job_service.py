@@ -179,6 +179,31 @@ async def get_job(job_id: str) -> Optional[dict[str, Any]]:
     return _normalize_job_row(row)
 
 
+async def list_platform_posts(job_id: str) -> list[dict[str, Any]]:
+    pool = await get_db_pool()
+    rows = await pool.fetch(
+        """
+        SELECT
+            id::text AS id,
+            job_id::text AS job_id,
+            platform,
+            platform_post_id,
+            platform_post_url,
+            status,
+            error_message,
+            request_json,
+            response_json,
+            published_at,
+            created_at
+        FROM platform_posts
+        WHERE job_id::text = $1
+        ORDER BY created_at DESC
+        """,
+        job_id,
+    )
+    return [dict(row) for row in rows]
+
+
 async def get_character(character_id: str) -> Optional[dict[str, Any]]:
     pool = await get_db_pool()
     row = await pool.fetchrow("SELECT * FROM characters WHERE id = $1", character_id)

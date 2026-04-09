@@ -69,7 +69,8 @@ _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 _HEYGEN_REQUEST_TIMEOUT_SECONDS = 30.0
 _TTS_VARIANT_COUNT = 3
-_HEYGEN_AVATAR_BUTTON_LABELS = ("정장", "후드", "셔츠")
+_HEYGEN_AVATAR_OPTION_COUNT = 6
+_HEYGEN_AVATAR_LABEL_PREFIX_LEN = 6
 _http_basic = HTTPBasic()
 
 
@@ -556,7 +557,7 @@ def _get_job_avatar_label(script_json: dict) -> str:
 def _parse_heygen_avatar_options_from_env() -> list[dict[str, object]]:
     raw = (settings.heygen_avatar_id or "").strip()
     tokens = [token.strip() for token in raw.split(",") if token.strip()]
-    expected = len(_HEYGEN_AVATAR_BUTTON_LABELS)
+    expected = _HEYGEN_AVATAR_OPTION_COUNT
     if len(tokens) != expected:
         raise HTTPException(
             status_code=400,
@@ -569,10 +570,11 @@ def _parse_heygen_avatar_options_from_env() -> list[dict[str, object]]:
         )
     options: list[dict[str, object]] = []
     for idx, avatar_id in enumerate(tokens):
+        label = avatar_id[:_HEYGEN_AVATAR_LABEL_PREFIX_LEN] if avatar_id else f"#{idx}"
         options.append(
             {
                 "index": idx,
-                "label": _HEYGEN_AVATAR_BUTTON_LABELS[idx],
+                "label": label,
                 "avatar_id": avatar_id,
             }
         )
@@ -583,9 +585,10 @@ def _resolve_selected_heygen_avatar(script_json: dict) -> tuple[str, str, int]:
     options = _parse_heygen_avatar_options_from_env()
     selected_index = _get_job_avatar_index(script_json)
     if selected_index is None:
+        allowed_labels = "/".join(str(option["label"]) for option in options)
         raise HTTPException(
             status_code=400,
-            detail="아바타를 먼저 선택하세요. 정장/후드/셔츠 버튼 중 하나를 눌러주세요.",
+            detail=f"아바타를 먼저 선택하세요. {allowed_labels} 버튼 중 하나를 눌러주세요.",
         )
     if selected_index < 0 or selected_index >= len(options):
         raise HTTPException(
@@ -608,6 +611,10 @@ def _normalize_publish_targets(raw_targets: list[str]) -> list[str]:
     if not normalized:
         raise HTTPException(status_code=400, detail="at least one publish target is required")
     return normalized
+
+
+def _normalized_platform_status(value: object) -> str:
+    return str(value or "").strip().lower()
 
 
 def _build_publish_title(job_id: str, video_filename: str, subtitle_script_text: str, concept_text: str) -> str:
@@ -675,7 +682,7 @@ async def _register_generated_content(
 
 
 async def _resolve_heygen_avatar_id(_: dict) -> tuple[str, str]:
-    # 기본 avatar fallback은 env 첫 번째 항목(정장)을 사용한다.
+    # 기본 avatar fallback은 env 첫 번째 항목을 사용한다.
     # 실제 WF-12 승인 경로에서는 반드시 사용자가 선택한 avatar를 사용한다.
     options = _parse_heygen_avatar_options_from_env()
     first = options[0]
@@ -1591,7 +1598,7 @@ def _build_selected_tts_caption(
     avatar_line = (
         f"선택 아바타: {selected_avatar_label}"
         if selected_avatar_label
-        else "먼저 아바타(정장/후드/셔츠) 버튼을 선택하세요."
+        else "먼저 아바타 버튼을 선택하세요."
     )
     if downstream_intent == "video_prepare":
         return (
@@ -3113,8 +3120,9 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
     existing_job = await job_service.get_job(body.job_id)
     existing_script_json = _as_script_json(existing_job.get("script_json") if existing_job else None)
     selected_avatar_index = _get_job_avatar_index(existing_script_json)
+    avatar_options: list[dict[str, object]] = []
     if body.include_wf12_button:
-        _parse_heygen_avatar_options_from_env()
+        avatar_options = _parse_heygen_avatar_options_from_env()
     filename = _normalize_audio_filename(
         body.job_id,
         body.filename,
@@ -3144,6 +3152,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
                 audio_url=stored.presigned_url,
                 include_wf12_button=body.include_wf12_button,
                 selected_avatar_index=selected_avatar_index,
+                avatar_options=avatar_options,
             )
             attachment_url = stored.presigned_url
         except Exception as e:
@@ -3165,6 +3174,7 @@ async def send_audio(_: AuthDep, body: SendAudioRequest) -> dict:
                 filename=filename,
                 include_wf12_button=body.include_wf12_button,
                 selected_avatar_index=selected_avatar_index,
+                avatar_options=avatar_options,
             )
         except Exception as e:
             logger.error("[discord] send_tts_audio_message failed job_id=%s: %s", body.job_id, e)
@@ -3259,6 +3269,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             script_json=selected_script,
         )
         try:
+            avatar_options = _parse_heygen_avatar_options_from_env()
             selected_avatar_label = _get_job_avatar_label(script_json)
             approval_message_id = await _discord_adapter.send_tts_approval_message(
                 channel_id=channel_id,
@@ -3270,6 +3281,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
                     selected_avatar_label=selected_avatar_label,
                 ),
                 selected_avatar_index=_get_job_avatar_index(script_json),
+                avatar_options=avatar_options,
             )
         except Exception:
             rollback_script = _merge_script_json_with_media_names(_clear_tts_variant_metadata(script_json), tts_error_type="", tts_error_detail="")
@@ -3543,7 +3555,56 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
     user_id = job["messenger_user_id"]
 
     if body.action == "approved":
-        targets = _normalize_publish_targets(body.targets)
+        requested_targets = _normalize_publish_targets(body.targets)
+        existing_posts = await job_service.list_platform_posts(body.job_id)
+        published_targets: set[str] = set()
+        for post in existing_posts:
+            platform = str(post.get("platform") or "").strip().lower()
+            status_value = _normalized_platform_status(post.get("status"))
+            if platform in {"youtube", "instagram"} and status_value == "published":
+                published_targets.add(platform)
+        targets = [target for target in requested_targets if target not in published_targets]
+        skipped_targets = [target for target in requested_targets if target in published_targets]
+        if not targets:
+            logger.info(
+                "[discord] video_action=approved skipped_all_already_published job_id=%s requested=%s",
+                body.job_id,
+                ",".join(requested_targets),
+            )
+            await _discord_adapter.send_text_message(
+                channel_id,
+                "ℹ️ 선택한 플랫폼은 이미 업로드 완료 상태입니다. 중복 업로드를 건너뜁니다.",
+            )
+            return {
+                "job_id": body.job_id,
+                "action": "already_published",
+                "requested_targets": requested_targets,
+                "skipped_targets": skipped_targets,
+            }
+
+        current_status = str(job.get("status") or "")
+        if current_status == "PUBLISHING":
+            logger.info(
+                "[discord] video_action=approved skipped_already_publishing job_id=%s pending=%s",
+                body.job_id,
+                ",".join(targets),
+            )
+            await _discord_adapter.send_text_message(
+                channel_id,
+                "⏳ 이미 SNS 업로드가 진행 중입니다. 잠시 후 결과 메시지를 확인해주세요.",
+            )
+            return {
+                "job_id": body.job_id,
+                "action": "already_publishing",
+                "requested_targets": requested_targets,
+                "pending_targets": targets,
+                "skipped_targets": skipped_targets,
+            }
+
+        status_transitioned = False
+        if current_status != "PUBLISHING":
+            await job_service.transition_status(body.job_id, "PUBLISHING")
+            status_transitioned = True
         # 최종 승인 시점에는 gateway가 직접 업로드하지 않고 WF-08에 SNS 업로드를 위임한다.
         video_url = job.get("video_url", "")
         if isinstance(video_url, str) and video_url.startswith("s3://"):
@@ -3572,11 +3633,33 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
                 caption=publish_caption,
             )
         except Exception as e:
+            if status_transitioned:
+                rollback_status = current_status or "WAITING_VIDEO_APPROVAL"
+                try:
+                    await job_service.transition_status(body.job_id, rollback_status)
+                except Exception as rollback_error:
+                    logger.warning(
+                        "rollback status failed job_id=%s target_status=%s err=%s",
+                        body.job_id,
+                        rollback_status,
+                        rollback_error,
+                    )
             logger.error("call_wf08_sns_upload failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=502, detail=f"WF-08 trigger failed: {e}")
 
+        if skipped_targets:
+            await _discord_adapter.send_text_message(
+                channel_id,
+                f"ℹ️ 이미 게시된 플랫폼({', '.join(skipped_targets)})은 제외하고 업로드를 시작합니다.",
+            )
         logger.info("[discord] video_action=approved job_id=%s targets=%s", body.job_id, ",".join(targets))
-        return {"job_id": body.job_id, "action": "approved", "targets": targets}
+        return {
+            "job_id": body.job_id,
+            "action": "approved",
+            "requested_targets": requested_targets,
+            "targets": targets,
+            "skipped_targets": skipped_targets,
+        }
 
     elif body.action == "reject_select":
         try:

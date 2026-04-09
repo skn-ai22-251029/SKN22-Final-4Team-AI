@@ -359,22 +359,21 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 [Webhook 수신] ← discord-bot 영상 승인 버튼 클릭
       │
       ▼
-[요청 파싱] job_id, video_url
+[요청 파싱] job_id, video_url, targets(youtube|instagram)
       │
       ▼
 [DB 업데이트] status=PUBLISHING
       │
       ▼
-[병렬 업로드]
+[타깃별 업로드]
   ├─ YouTube 업로드
-  ├─ Instagram 업로드
-  └─ TikTok 업로드
+  └─ Instagram 업로드
       │
       ▼
 [platform_posts INSERT] 각 플랫폼 게시물 ID 저장
       │
       ▼
-[DB 업데이트] status=PUBLISHED
+[DB 업데이트] status=PUBLISHED | PARTIALLY_PUBLISHED | PUBLISH_FAILED
       │
       ▼
 [gateway /internal/send-text 호출]
@@ -620,6 +619,12 @@ nano .env   # 또는 vi .env
 | `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
 | `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/Wv5SdSdlPLwNzeqF/webhook/wf-11-tts-generate` |
 | `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
+| `YOUTUBE_CLIENT_ID` | YouTube 업로드 OAuth Client ID | |
+| `YOUTUBE_CLIENT_SECRET` | YouTube 업로드 OAuth Client Secret | |
+| `YOUTUBE_REFRESH_TOKEN` | YouTube 업로드 Refresh Token | |
+| `INSTAGRAM_PAGE_ACCESS_TOKEN` | Instagram Graph API 토큰 | |
+| `INSTAGRAM_IG_USER_ID` | Instagram 비즈니스 계정 ID | |
+| `INSTAGRAM_PAGE_ID` | (선택) 현재 업로드 경로에서는 미사용(운영 참고용) | |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
 | `TTS_API_URL_INTERNAL` | 도커 내부 서비스에서 사용할 TTS URL | `http://tts-router-service:8300` |
 | `TTS_ROUTER_MODE` | TTS Router 모드 (`legacy_http`/`runpod_serverless`) | `legacy_http` |
@@ -627,7 +632,7 @@ nano .env   # 또는 vi .env
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
 | `TTS_FIXED_SEEDS` | (선택) 채널 공통 고정 seed 3개(쉼표 구분) | `101,202,303` |
 | `HEYGEN_API_KEY` | HeyGen Direct API 키 | |
-| `HEYGEN_AVATAR_ID` | WF-12 마지막 fallback 아바타 ID | |
+| `HEYGEN_AVATAR_ID` | 아바타 ID 6개(쉼표 구분). 버튼 라벨은 각 ID 앞 6글자 | |
 | `HEYGEN_VIDEO_WIDTH` | WF-12 출력 영상 너비 | `1080` |
 | `HEYGEN_VIDEO_HEIGHT` | WF-12 출력 영상 높이 | `1920` |
 | `HEYGEN_CAPTION_ENABLED` | HeyGen caption 사용 여부 | `false` |

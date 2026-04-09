@@ -9,7 +9,6 @@ from .base import MessengerAdapter
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://discord.com/api/v10"
-_AVATAR_BUTTON_LABELS = ("정장", "후드", "셔츠")
 
 
 class DiscordAdapter(MessengerAdapter):
@@ -423,11 +422,13 @@ class DiscordAdapter(MessengerAdapter):
         filename: str,
         include_wf12_button: bool = True,
         selected_avatar_index: Optional[int] = None,
+        avatar_options: Optional[list[dict[str, object]]] = None,
     ) -> tuple[str, str]:
         components = self._build_tts_approval_components(
             job_id=job_id,
             include_wf12_button=include_wf12_button,
             selected_avatar_index=selected_avatar_index,
+            avatar_options=avatar_options,
         )
 
         payload_json = json.dumps({"content": caption, "components": components})
@@ -579,6 +580,7 @@ class DiscordAdapter(MessengerAdapter):
         job_id: str,
         caption: str,
         selected_avatar_index: Optional[int] = None,
+        avatar_options: Optional[list[dict[str, object]]] = None,
     ) -> str:
         payload = {
             "content": caption,
@@ -586,6 +588,7 @@ class DiscordAdapter(MessengerAdapter):
                 job_id=job_id,
                 include_wf12_button=True,
                 selected_avatar_index=selected_avatar_index,
+                avatar_options=avatar_options,
             ),
         }
         resp = await self._client.post(
@@ -607,11 +610,13 @@ class DiscordAdapter(MessengerAdapter):
         audio_url: str,
         include_wf12_button: bool = True,
         selected_avatar_index: Optional[int] = None,
+        avatar_options: Optional[list[dict[str, object]]] = None,
     ) -> str:
         components = self._build_tts_approval_components(
             job_id=job_id,
             include_wf12_button=include_wf12_button,
             selected_avatar_index=selected_avatar_index,
+            avatar_options=avatar_options,
         )
         prefix = (caption or "").strip() or "🔊 TTS 완료본입니다. 일반 승인 또는 고화질 승인을 선택한 뒤 최종 확인을 진행하세요."
         suffix = f"\n\n📎 TTS 링크(24시간 유효):\n{audio_url}"
@@ -637,12 +642,18 @@ class DiscordAdapter(MessengerAdapter):
         job_id: str,
         include_wf12_button: bool,
         selected_avatar_index: Optional[int],
+        avatar_options: Optional[list[dict[str, object]]],
     ) -> list[dict]:
         if not include_wf12_button:
             return []
         avatar_buttons = []
         normalized_index = selected_avatar_index if isinstance(selected_avatar_index, int) else None
-        for idx, label in enumerate(_AVATAR_BUTTON_LABELS):
+        options = avatar_options or []
+        for option in options:
+            idx = int(option.get("index", -1))
+            label = str(option.get("label") or "").strip()
+            if idx < 0 or not label:
+                continue
             is_selected = normalized_index == idx
             avatar_buttons.append(
                 {
@@ -652,11 +663,18 @@ class DiscordAdapter(MessengerAdapter):
                     "custom_id": f"tts_avatar_pick:{job_id}:{idx}",
                 }
             )
-        return [
-            {
-                "type": 1,
-                "components": avatar_buttons,
-            },
+        rows: list[dict] = []
+        for start in range(0, len(avatar_buttons), 5):
+            row_buttons = avatar_buttons[start : start + 5]
+            if not row_buttons:
+                continue
+            rows.append(
+                {
+                    "type": 1,
+                    "components": row_buttons,
+                }
+            )
+        rows.append(
             {
                 "type": 1,
                 "components": [
@@ -679,5 +697,6 @@ class DiscordAdapter(MessengerAdapter):
                         "custom_id": f"tts_reject:{job_id}",
                     },
                 ],
-            },
-        ]
+            }
+        )
+        return rows
