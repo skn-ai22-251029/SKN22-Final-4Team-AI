@@ -3617,7 +3617,12 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
         media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
         video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
         subtitle_script_text = _get_subtitle_script_text(script_json)
-        publish_title = _build_publish_title(body.job_id, video_filename, subtitle_script_text, str(job.get("concept_text") or ""))
+        requested_publish_title = str(body.publish_title or "").strip()
+        publish_title = (
+            requested_publish_title
+            if requested_publish_title
+            else _build_publish_title(body.job_id, video_filename, subtitle_script_text, str(job.get("concept_text") or ""))
+        )
         publish_description = _build_publish_description(subtitle_script_text)
         publish_caption = _build_publish_caption(subtitle_script_text)
 

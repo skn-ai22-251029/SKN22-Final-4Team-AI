@@ -125,6 +125,7 @@ class VideoActionRequest(BaseModel):
     action: str  # "approved" | "reject_select" | "reject_step"
     step: Optional[str] = None  # "script" | "tts" | "draft"
     targets: list[str] = []
+    publish_title: str = ""
 
 
 class ReportToVideoRequest(BaseModel):

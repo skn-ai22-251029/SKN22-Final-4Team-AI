@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import psycopg2
 import requests
@@ -11,6 +12,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from openai import OpenAI
 from pydantic import BaseModel, Field
 from psycopg2.extras import Json
 
@@ -21,7 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 INSTAGRAM_GRAPH_API_BASE = "https://graph.facebook.com"
 ALLOWED_TARGETS = {"youtube", "instagram"}
 REQUIRED_ENV_BY_TARGET = {
@@ -195,6 +198,257 @@ def _download_video_to_temp(video_url: str) -> str:
         temp_file.close()
 
 
+def _youtube_scopes() -> list[str]:
+    configured = [scope.strip() for scope in os.environ.get("YOUTUBE_SCOPES", "").split(",") if scope.strip()]
+    if configured:
+        return configured
+    return [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE]
+
+
+def _youtube_caption_enabled() -> bool:
+    return _env_bool("YOUTUBE_CAPTION_UPLOAD_ENABLED", True)
+
+
+def _youtube_caption_language() -> str:
+    return os.environ.get("YOUTUBE_CAPTION_LANGUAGE", "ko").strip() or "ko"
+
+
+def _youtube_caption_name() -> str:
+    return os.environ.get("YOUTUBE_CAPTION_NAME", "Korean").strip() or "Korean"
+
+
+def _youtube_caption_is_draft() -> bool:
+    return _env_bool("YOUTUBE_CAPTION_IS_DRAFT", False)
+
+
+def _asr_primary_model() -> str:
+    return os.environ.get("YOUTUBE_CAPTION_ASR_MODEL", "gpt-4o-transcribe").strip() or "gpt-4o-transcribe"
+
+
+def _openai_client() -> OpenAI:
+    return OpenAI(api_key=_require_env("OPENAI_API_KEY"))
+
+
+def _extract_subtitle_lines(text: str) -> list[str]:
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+def _clean_weight_text(text: str) -> str:
+    return "".join(ch for ch in str(text or "") if not ch.isspace())
+
+
+def _segment_weight(segment: dict[str, Any]) -> float:
+    text_weight = float(max(1, len(_clean_weight_text(segment.get("text", "")))))
+    duration_weight = float(max(1e-3, float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)))) * 6.0
+    return max(text_weight, duration_weight)
+
+
+def _normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_segments or []:
+        if isinstance(raw, dict):
+            start = float(raw.get("start", 0.0))
+            end = float(raw.get("end", 0.0))
+            text = str(raw.get("text", "")).strip()
+        else:
+            start = float(getattr(raw, "start", 0.0))
+            end = float(getattr(raw, "end", 0.0))
+            text = str(getattr(raw, "text", "")).strip()
+        if end <= start:
+            end = start + 0.01
+        normalized.append({"start": start, "end": end, "text": text})
+    normalized.sort(key=lambda seg: seg["start"])
+    return normalized
+
+
+def _transcribe_segments(media_path: str, language: str) -> tuple[list[dict[str, Any]], str]:
+    client = _openai_client()
+    model_candidates = [_asr_primary_model(), "whisper-1"]
+    seen: set[str] = set()
+    last_error = ""
+
+    for model_name in model_candidates:
+        if model_name in seen:
+            continue
+        seen.add(model_name)
+        try:
+            with open(media_path, "rb") as media_file:
+                response = client.audio.transcriptions.create(
+                    model=model_name,
+                    file=media_file,
+                    language=language,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            segments = _normalize_segments(getattr(response, "segments", None))
+            if not segments and hasattr(response, "model_dump"):
+                dumped = response.model_dump()
+                segments = _normalize_segments(dumped.get("segments"))
+            if not segments and isinstance(response, dict):
+                segments = _normalize_segments(response.get("segments"))
+            if segments:
+                return segments, model_name
+            last_error = f"ASR model={model_name} returned no segments"
+        except Exception as e:
+            last_error = f"ASR model={model_name} failed: {e}"
+    raise RuntimeError(last_error or "ASR transcription failed")
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    safe = max(0.0, float(seconds))
+    millis = int(round(safe * 1000))
+    hours = millis // 3_600_000
+    millis %= 3_600_000
+    minutes = millis // 60_000
+    millis %= 60_000
+    secs = millis // 1000
+    ms = millis % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def _time_at_weight(weight: float, segments: list[dict[str, Any]], cumulative: list[float]) -> float:
+    if not segments:
+        return 0.0
+    clamped = max(0.0, min(weight, cumulative[-1]))
+    prev_cum = 0.0
+    for idx, seg in enumerate(segments):
+        seg_cum = cumulative[idx]
+        if clamped <= seg_cum:
+            seg_weight = max(seg_cum - prev_cum, 1e-6)
+            ratio = (clamped - prev_cum) / seg_weight
+            start = float(seg["start"])
+            end = float(seg["end"])
+            return start + ((end - start) * ratio)
+        prev_cum = seg_cum
+    return float(segments[-1]["end"])
+
+
+def _build_srt_from_subtitle_lines(lines: list[str], segments: list[dict[str, Any]]) -> str:
+    if not lines:
+        raise RuntimeError("subtitle lines are empty")
+    if not segments:
+        raise RuntimeError("ASR segments are empty")
+
+    segment_weights: list[float] = []
+    cumulative: list[float] = []
+    running = 0.0
+    for seg in segments:
+        w = _segment_weight(seg)
+        segment_weights.append(w)
+        running += w
+        cumulative.append(running)
+    total_weight = cumulative[-1]
+
+    line_weights = [float(max(1, len(_clean_weight_text(line)))) for line in lines]
+    total_line_weight = sum(line_weights)
+    if total_line_weight <= 0:
+        total_line_weight = float(len(lines))
+
+    cues: list[tuple[float, float, str]] = []
+    line_running = 0.0
+    floor_start = float(segments[0]["start"])
+    global_end = float(segments[-1]["end"])
+
+    for idx, line in enumerate(lines):
+        start_weight = total_weight * (line_running / total_line_weight)
+        line_running += line_weights[idx]
+        end_weight = total_weight * (line_running / total_line_weight)
+
+        start_sec = _time_at_weight(start_weight, segments, cumulative)
+        end_sec = _time_at_weight(end_weight, segments, cumulative)
+        start_sec = max(start_sec, floor_start)
+        if end_sec <= start_sec:
+            end_sec = start_sec + 0.8
+        if idx == len(lines) - 1:
+            end_sec = max(end_sec, global_end)
+        floor_start = end_sec + 0.01
+        cues.append((start_sec, end_sec, line))
+
+    rows: list[str] = []
+    for idx, (start_sec, end_sec, text) in enumerate(cues, start=1):
+        rows.append(str(idx))
+        rows.append(f"{_format_srt_timestamp(start_sec)} --> {_format_srt_timestamp(end_sec)}")
+        rows.append(text)
+        rows.append("")
+    return "\n".join(rows).strip() + "\n"
+
+
+def _upload_youtube_caption(
+    *,
+    youtube: Any,
+    video_id: str,
+    subtitle_text: str,
+    media_path: str,
+) -> dict[str, Any]:
+    if not _youtube_caption_enabled():
+        return {
+            "status": "skipped",
+            "error_message": "",
+            "request_json": {"enabled": False},
+            "response_json": {},
+        }
+
+    subtitle_lines = _extract_subtitle_lines(subtitle_text)
+    if not subtitle_lines:
+        return {
+            "status": "skipped",
+            "error_message": "subtitle text is empty",
+            "request_json": {"enabled": True, "line_count": 0},
+            "response_json": {},
+        }
+
+    try:
+        language = _youtube_caption_language()
+        segments, asr_model = _transcribe_segments(media_path, language)
+        srt_content = _build_srt_from_subtitle_lines(subtitle_lines, segments)
+        caption_snippet = {
+            "videoId": video_id,
+            "language": language,
+            "name": _youtube_caption_name(),
+            "isDraft": _youtube_caption_is_draft(),
+        }
+
+        srt_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".srt", mode="w", encoding="utf-8") as srt_file:
+                srt_file.write(srt_content)
+                srt_path = srt_file.name
+
+            media = MediaFileUpload(srt_path, mimetype="application/octet-stream", resumable=False)
+            response = (
+                youtube.captions()
+                .insert(part="snippet", body={"snippet": caption_snippet}, media_body=media)
+                .execute()
+            )
+            return {
+                "status": "uploaded",
+                "error_message": "",
+                "request_json": {
+                    "enabled": True,
+                    "caption_snippet": caption_snippet,
+                    "line_count": len(subtitle_lines),
+                    "asr_model": asr_model,
+                },
+                "response_json": response if isinstance(response, dict) else {"raw": str(response)},
+            }
+        finally:
+            if srt_path:
+                try:
+                    os.unlink(srt_path)
+                except OSError:
+                    logger.warning("[youtube] failed to remove temp srt: %s", srt_path)
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error_message": str(e),
+            "request_json": {
+                "enabled": True,
+                "line_count": len(subtitle_lines),
+            },
+            "response_json": {},
+        }
+
+
 def _youtube_credentials() -> Credentials:
     credentials = Credentials(
         token=None,
@@ -202,7 +456,7 @@ def _youtube_credentials() -> Credentials:
         token_uri="https://oauth2.googleapis.com/token",
         client_id=_require_env("YOUTUBE_CLIENT_ID"),
         client_secret=_require_env("YOUTUBE_CLIENT_SECRET"),
-        scopes=[YOUTUBE_SCOPE],
+        scopes=_youtube_scopes(),
     )
     credentials.refresh(GoogleAuthRequest())
     return credentials
@@ -239,13 +493,31 @@ def _publish_youtube(req: PublishRequest) -> dict:
         video_id = str(response.get("id") or "").strip()
         if not video_id:
             raise RuntimeError(f"YouTube upload returned no id: {response}")
+
+        caption_result = _upload_youtube_caption(
+            youtube=youtube,
+            video_id=video_id,
+            subtitle_text=_youtube_description(req),
+            media_path=temp_path,
+        )
+        caption_warning = ""
+        if caption_result.get("status") == "failed":
+            caption_warning = f"caption upload failed: {caption_result.get('error_message', '')}"
+
         return {
             "status": "published",
             "platform_post_id": video_id,
             "platform_post_url": f"https://www.youtube.com/watch?v={video_id}",
-            "error_message": "",
-            "request_json": upload_request_body,
-            "response_json": response,
+            "error_message": caption_warning.strip(),
+            "request_json": {
+                "video_insert": upload_request_body,
+                "caption_insert": caption_result.get("request_json", {}),
+            },
+            "response_json": {
+                "video_insert": response if isinstance(response, dict) else {"raw": str(response)},
+                "caption_insert": caption_result.get("response_json", {}),
+                "caption_status": caption_result.get("status"),
+            },
         }
     except Exception as e:
         return {
@@ -253,7 +525,7 @@ def _publish_youtube(req: PublishRequest) -> dict:
             "platform_post_id": "",
             "platform_post_url": "",
             "error_message": str(e),
-            "request_json": upload_request_body,
+            "request_json": {"video_insert": upload_request_body},
             "response_json": {},
         }
     finally:
@@ -428,7 +700,11 @@ def _build_summary_text(job_id: str, results: dict[str, dict]) -> tuple[str, str
         label = "YouTube" if platform == "youtube" else "Instagram"
         if result.get("status") == "published":
             url = str(result.get("platform_post_url") or "").strip()
-            lines.append(f"• {label}: 성공" + (f" ({url})" if url else ""))
+            line = f"• {label}: 성공" + (f" ({url})" if url else "")
+            warning = str(result.get("error_message") or "").strip()
+            if warning:
+                line += f" [경고: {warning[:200]}]"
+            lines.append(line)
         else:
             error = str(result.get("error_message") or "알 수 없는 오류").strip()
             lines.append(f"• {label}: 실패 - {error[:300]}")
