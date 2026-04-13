@@ -889,6 +889,13 @@ def _sanitize_prompt_text(text: str) -> str:
     return sanitized.encode("utf-8", "ignore").decode("utf-8")
 
 
+def _clip(text: str, *, limit: int = 260) -> str:
+    value = _sanitize_prompt_text((text or "").strip())
+    if not value:
+        return ""
+    return value if len(value) <= max(1, int(limit)) else value[: max(1, int(limit))]
+
+
 def _build_tts_request_body(script_text: str, *, seed: Optional[int] = None) -> dict:
     cleaned_script_text = (script_text or "").strip()
     if not cleaned_script_text:
@@ -2059,7 +2066,7 @@ def _spawn_tts_generation(
 ) -> None:
     # slash command/버튼 응답을 오래 붙잡지 않기 위해
     # 실제 TTS 생성은 background task로 분리한다.
-    asyncio.create_task(
+    _launch_bg_task(
         _run_tts_generation(
             job_id=job_id,
             script_text=script_text,
@@ -2067,7 +2074,9 @@ def _spawn_tts_generation(
             user_id=user_id,
             downstream_intent=downstream_intent,
             force_random_seeds=force_random_seeds,
-        )
+        ),
+        task_name="tts-generate",
+        job_id=job_id,
     )
 
 
