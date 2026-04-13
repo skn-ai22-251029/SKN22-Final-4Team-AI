@@ -1568,7 +1568,83 @@ def _resolve_tts_fixed_clip_paths() -> tuple[str, str]:
     return opening_path, ending_path
 
 
-def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[bytes, int]:
+def _ffprobe_audio_spec_sync(audio_path: str) -> dict[str, Any]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name,sample_rate,channels,sample_fmt,bits_per_sample",
+        "-of",
+        "json",
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"ffprobe failed for {audio_path}: {stderr or 'unknown error'}")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except Exception as e:
+        raise RuntimeError(f"ffprobe returned invalid json for {audio_path}: {e}") from e
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError(f"ffprobe returned no audio streams for {audio_path}")
+    stream = streams[0]
+    codec_name = str(stream.get("codec_name") or "").strip()
+    sample_fmt = str(stream.get("sample_fmt") or "").strip()
+    try:
+        sample_rate = int(str(stream.get("sample_rate") or "0"))
+    except Exception:
+        sample_rate = 0
+    try:
+        channels = int(str(stream.get("channels") or "0"))
+    except Exception:
+        channels = 0
+    if not codec_name or sample_rate <= 0 or channels <= 0:
+        raise RuntimeError(f"invalid audio spec from ffprobe for {audio_path}: {stream}")
+    return {
+        "codec_name": codec_name,
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "sample_fmt": sample_fmt,
+    }
+
+
+def _normalize_clip_to_spec_sync(
+    *,
+    src_path: str,
+    dst_path: str,
+    sample_rate: int,
+    channels: int,
+    codec_name: str,
+    sample_fmt: str = "",
+) -> None:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        src_path,
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+    ]
+    if sample_fmt:
+        cmd.extend(["-sample_fmt", sample_fmt])
+    cmd.extend(["-c:a", codec_name, dst_path])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"ffmpeg normalize failed for {src_path}: {stderr or 'unknown error'}")
+
+
+def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[bytes, int, dict[str, Any], dict[str, Any]]:
     if not body_audio_bytes:
         raise RuntimeError("empty body audio")
 
@@ -1581,9 +1657,38 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
         try:
             with tempfile.TemporaryDirectory(prefix="tts-concat-") as workdir:
                 body_path = os.path.join(workdir, "body.wav")
+                opening_norm_path = os.path.join(workdir, "opening.norm.wav")
+                ending_norm_path = os.path.join(workdir, "ending.norm.wav")
+                concat_list_path = os.path.join(workdir, "concat.txt")
                 output_path = os.path.join(workdir, "merged.wav")
                 with open(body_path, "wb") as f:
                     f.write(body_audio_bytes)
+
+                body_spec = _ffprobe_audio_spec_sync(body_path)
+                # body(본문 TTS)의 원본 스펙을 기준으로 opening/ending만 맞춘다.
+                body_codec = str(body_spec.get("codec_name") or "pcm_s16le")
+                target_codec = body_codec if body_codec.startswith("pcm_") else "pcm_s16le"
+                target_sample_fmt = str(body_spec.get("sample_fmt") or "")
+                _normalize_clip_to_spec_sync(
+                    src_path=opening_path,
+                    dst_path=opening_norm_path,
+                    sample_rate=int(body_spec["sample_rate"]),
+                    channels=int(body_spec["channels"]),
+                    codec_name=target_codec,
+                    sample_fmt=target_sample_fmt,
+                )
+                _normalize_clip_to_spec_sync(
+                    src_path=ending_path,
+                    dst_path=ending_norm_path,
+                    sample_rate=int(body_spec["sample_rate"]),
+                    channels=int(body_spec["channels"]),
+                    codec_name=target_codec,
+                    sample_fmt=target_sample_fmt,
+                )
+
+                with open(concat_list_path, "w", encoding="utf-8") as concat_file:
+                    for p in (opening_norm_path, body_path, ending_norm_path):
+                        concat_file.write(f"file '{p}'\n")
 
                 cmd = [
                     "ffmpeg",
@@ -1591,32 +1696,35 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
                     "-loglevel",
                     "error",
                     "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
                     "-i",
-                    opening_path,
-                    "-i",
-                    body_path,
-                    "-i",
-                    ending_path,
-                    "-filter_complex",
-                    "[0:a]aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono[a0];"
-                    "[1:a]aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono[a1];"
-                    "[2:a]aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono[a2];"
-                    "[a0][a1][a2]concat=n=3:v=0:a=1[a]",
-                    "-map",
-                    "[a]",
-                    "-c:a",
-                    "pcm_s16le",
+                    concat_list_path,
+                    "-c",
+                    "copy",
                     output_path,
                 ]
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode != 0:
                     stderr = (result.stderr or "").strip()
                     raise RuntimeError(f"ffmpeg concat failed (attempt {attempt}/{max_attempts}): {stderr or 'unknown error'}")
+                final_spec = _ffprobe_audio_spec_sync(output_path)
+                if (
+                    int(final_spec.get("sample_rate") or 0) != int(body_spec.get("sample_rate") or 0)
+                    or int(final_spec.get("channels") or 0) != int(body_spec.get("channels") or 0)
+                    or str(final_spec.get("codec_name") or "").strip() != target_codec
+                ):
+                    raise RuntimeError(
+                        "concat output spec mismatch: "
+                        f"body={body_spec} final={final_spec} target_codec={target_codec}"
+                    )
                 with open(output_path, "rb") as f:
                     merged_audio = f.read()
                 if not merged_audio:
                     raise RuntimeError(f"ffmpeg concat produced empty audio (attempt {attempt}/{max_attempts})")
-                return merged_audio, attempt
+                return merged_audio, attempt, body_spec, final_spec
         except Exception as e:
             last_error = e
             logger.warning("[tts-concat] attempt=%s/%s failed: %s", attempt, max_attempts, e)
@@ -1624,7 +1732,9 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
     raise RuntimeError(f"TTS fixed-clip concat failed after {max_attempts} attempts: {last_error}")
 
 
-async def _concat_tts_audio_with_fixed_clips(body_audio_bytes: bytes) -> tuple[bytes, int]:
+async def _concat_tts_audio_with_fixed_clips(
+    body_audio_bytes: bytes,
+) -> tuple[bytes, int, dict[str, Any], dict[str, Any]]:
     return await asyncio.to_thread(_concat_tts_audio_with_fixed_clips_sync, body_audio_bytes)
 
 
@@ -1927,7 +2037,9 @@ async def _run_tts_generation(
         for variant_index, seed in enumerate(seeds):
             try:
                 body_audio_bytes = await _generate_tts_audio_content(job_id, body_script_text, seed=seed)
-                audio_bytes, concat_attempts = await _concat_tts_audio_with_fixed_clips(body_audio_bytes)
+                audio_bytes, concat_attempts, body_audio_spec, final_audio_spec = await _concat_tts_audio_with_fixed_clips(
+                    body_audio_bytes
+                )
                 variant_info = await _store_and_send_tts_variant(
                     job_id=job_id,
                     channel_id=channel_id,
@@ -1940,6 +2052,8 @@ async def _run_tts_generation(
                 variant_info["seed"] = seed
                 variant_info["tts_body_audio_bytes"] = len(body_audio_bytes)
                 variant_info["tts_final_audio_bytes"] = len(audio_bytes)
+                variant_info["tts_body_audio_spec"] = body_audio_spec
+                variant_info["tts_final_audio_spec"] = final_audio_spec
                 variants.append(variant_info)
                 success_count += 1
             except Exception as e:
