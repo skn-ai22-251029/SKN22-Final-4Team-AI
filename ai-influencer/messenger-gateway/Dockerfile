@@ -2,6 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # 의존성을 먼저 복사해 레이어 캐싱 활용
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -2,6 +2,7 @@ import logging
 import os
 import tempfile
 import time
+import hashlib
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -27,6 +28,7 @@ YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 INSTAGRAM_GRAPH_API_BASE = "https://graph.facebook.com"
 ALLOWED_TARGETS = {"youtube", "instagram"}
+OPENAI_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
 REQUIRED_ENV_BY_TARGET = {
     "youtube": [
         "YOUTUBE_CLIENT_ID",
@@ -43,10 +45,12 @@ REQUIRED_ENV_BY_TARGET = {
 class PublishRequest(BaseModel):
     job_id: str
     video_url: str
+    audio_url: str = ""
     targets: list[str] = Field(default_factory=list)
     title: str = ""
     description: str = ""
     caption: str = ""
+    subtitle_script_text: str = ""
     video_filename: str = ""
 
 
@@ -108,6 +112,16 @@ def _youtube_description(req: PublishRequest) -> str:
 
 def _instagram_caption(req: PublishRequest) -> str:
     return (req.caption or req.description or "").strip()
+
+
+def _youtube_subtitle_source(req: PublishRequest) -> str:
+    # Caption text must come from subtitle_script_text only.
+    return (req.subtitle_script_text or "").strip()
+
+
+def _subtitle_sha256(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _open_db_conn():
@@ -183,11 +197,10 @@ def _persist_platform_result(job_id: str, platform: str, result: dict) -> None:
         conn.close()
 
 
-def _download_video_to_temp(video_url: str) -> str:
-    suffix = ".mp4"
+def _download_binary_to_temp(url: str, *, suffix: str, timeout: tuple[int, int] = (15, 300)) -> str:
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        with requests.get(video_url, stream=True, timeout=(15, 300)) as resp:
+        with requests.get(url, stream=True, timeout=timeout) as resp:
             resp.raise_for_status()
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
@@ -196,6 +209,14 @@ def _download_video_to_temp(video_url: str) -> str:
         return temp_file.name
     finally:
         temp_file.close()
+
+
+def _download_video_to_temp(video_url: str) -> str:
+    return _download_binary_to_temp(video_url, suffix=".mp4")
+
+
+def _download_audio_to_temp(audio_url: str) -> str:
+    return _download_binary_to_temp(audio_url, suffix=".wav")
 
 
 def _youtube_scopes() -> list[str]:
@@ -219,6 +240,10 @@ def _youtube_caption_name() -> str:
 
 def _youtube_caption_is_draft() -> bool:
     return _env_bool("YOUTUBE_CAPTION_IS_DRAFT", False)
+
+
+def _youtube_caption_failure_blocks_publish() -> bool:
+    return _env_bool("YOUTUBE_CAPTION_FAILURE_BLOCKS_PUBLISH", True)
 
 
 def _asr_primary_model() -> str:
@@ -266,6 +291,7 @@ def _transcribe_segments(media_path: str, language: str) -> tuple[list[dict[str,
     model_candidates = [_asr_primary_model(), "whisper-1"]
     seen: set[str] = set()
     last_error = ""
+    attempt_errors: list[str] = []
 
     for model_name in model_candidates:
         if model_name in seen:
@@ -289,9 +315,12 @@ def _transcribe_segments(media_path: str, language: str) -> tuple[list[dict[str,
             if segments:
                 return segments, model_name
             last_error = f"ASR model={model_name} returned no segments"
+            attempt_errors.append(last_error)
         except Exception as e:
             last_error = f"ASR model={model_name} failed: {e}"
-    raise RuntimeError(last_error or "ASR transcription failed")
+            attempt_errors.append(last_error)
+    details = " | ".join(attempt_errors) if attempt_errors else (last_error or "ASR transcription failed")
+    raise RuntimeError(details)
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -378,7 +407,7 @@ def _upload_youtube_caption(
     youtube: Any,
     video_id: str,
     subtitle_text: str,
-    media_path: str,
+    audio_path: str,
 ) -> dict[str, Any]:
     if not _youtube_caption_enabled():
         return {
@@ -389,17 +418,29 @@ def _upload_youtube_caption(
         }
 
     subtitle_lines = _extract_subtitle_lines(subtitle_text)
+    subtitle_hash = _subtitle_sha256(subtitle_text)
     if not subtitle_lines:
         return {
-            "status": "skipped",
-            "error_message": "subtitle text is empty",
-            "request_json": {"enabled": True, "line_count": 0},
+            "status": "failed",
+            "error_message": "subtitle_script_text is empty",
+            "request_json": {
+                "enabled": True,
+                "subtitle_source": "subtitle_script_text",
+                "line_count": 0,
+                "subtitle_sha256": subtitle_hash,
+            },
             "response_json": {},
         }
 
+    audio_size_bytes = 0
     try:
         language = _youtube_caption_language()
-        segments, asr_model = _transcribe_segments(media_path, language)
+        audio_size_bytes = int(os.path.getsize(audio_path))
+        if audio_size_bytes > OPENAI_TRANSCRIBE_MAX_BYTES:
+            raise RuntimeError(
+                f"audio input too large for ASR: {audio_size_bytes} bytes > {OPENAI_TRANSCRIBE_MAX_BYTES} bytes"
+            )
+        segments, asr_model = _transcribe_segments(audio_path, language)
         srt_content = _build_srt_from_subtitle_lines(subtitle_lines, segments)
         caption_snippet = {
             "videoId": video_id,
@@ -425,9 +466,14 @@ def _upload_youtube_caption(
                 "error_message": "",
                 "request_json": {
                     "enabled": True,
+                    "subtitle_source": "subtitle_script_text",
                     "caption_snippet": caption_snippet,
                     "line_count": len(subtitle_lines),
+                    "subtitle_sha256": subtitle_hash,
                     "asr_model": asr_model,
+                    "input_source": "audio_url",
+                    "audio_size_bytes": audio_size_bytes,
+                    "segment_count": len(segments),
                 },
                 "response_json": response if isinstance(response, dict) else {"raw": str(response)},
             }
@@ -440,10 +486,14 @@ def _upload_youtube_caption(
     except Exception as e:
         return {
             "status": "failed",
-            "error_message": str(e),
+            "error_message": f"input_source=audio_url; {e}",
             "request_json": {
                 "enabled": True,
+                "subtitle_source": "subtitle_script_text",
                 "line_count": len(subtitle_lines),
+                "subtitle_sha256": subtitle_hash,
+                "input_source": "audio_url",
+                "audio_size_bytes": audio_size_bytes,
             },
             "response_json": {},
         }
@@ -475,11 +525,16 @@ def _publish_youtube(req: PublishRequest) -> dict:
         },
     }
 
-    temp_path = ""
+    temp_video_path = ""
+    temp_audio_path = ""
     try:
-        temp_path = _download_video_to_temp(req.video_url)
+        audio_url = str(req.audio_url or "").strip()
+        if not audio_url:
+            raise RuntimeError("audio_url is required for youtube caption ASR")
+        temp_audio_path = _download_audio_to_temp(audio_url)
+        temp_video_path = _download_video_to_temp(req.video_url)
         youtube = build("youtube", "v3", credentials=_youtube_credentials(), cache_discovery=False)
-        media = MediaFileUpload(temp_path, mimetype="video/mp4", resumable=True)
+        media = MediaFileUpload(temp_video_path, mimetype="video/mp4", resumable=True)
         upload = youtube.videos().insert(
             part="snippet,status",
             body=upload_request_body,
@@ -497,12 +552,32 @@ def _publish_youtube(req: PublishRequest) -> dict:
         caption_result = _upload_youtube_caption(
             youtube=youtube,
             video_id=video_id,
-            subtitle_text=_youtube_description(req),
-            media_path=temp_path,
+            subtitle_text=_youtube_subtitle_source(req),
+            audio_path=temp_audio_path,
         )
+        caption_status = str(caption_result.get("status") or "").strip()
+        caption_error = str(caption_result.get("error_message") or "").strip()
         caption_warning = ""
-        if caption_result.get("status") == "failed":
-            caption_warning = f"caption upload failed: {caption_result.get('error_message', '')}"
+        if caption_status != "uploaded" and _youtube_caption_enabled():
+            caption_warning = f"caption upload failed: {caption_error or caption_status or 'unknown'}"
+
+        if caption_warning and _youtube_caption_failure_blocks_publish():
+            return {
+                "status": "failed",
+                "platform_post_id": video_id,
+                "platform_post_url": f"https://www.youtube.com/watch?v={video_id}",
+                "error_message": caption_warning,
+                "request_json": {
+                    "video_insert": upload_request_body,
+                    "audio_url": audio_url,
+                    "caption_insert": caption_result.get("request_json", {}),
+                },
+                "response_json": {
+                    "video_insert": response if isinstance(response, dict) else {"raw": str(response)},
+                    "caption_insert": caption_result.get("response_json", {}),
+                    "caption_status": caption_result.get("status"),
+                },
+            }
 
         return {
             "status": "published",
@@ -511,6 +586,7 @@ def _publish_youtube(req: PublishRequest) -> dict:
             "error_message": caption_warning.strip(),
             "request_json": {
                 "video_insert": upload_request_body,
+                "audio_url": audio_url,
                 "caption_insert": caption_result.get("request_json", {}),
             },
             "response_json": {
@@ -525,15 +601,20 @@ def _publish_youtube(req: PublishRequest) -> dict:
             "platform_post_id": "",
             "platform_post_url": "",
             "error_message": str(e),
-            "request_json": {"video_insert": upload_request_body},
+            "request_json": {"video_insert": upload_request_body, "audio_url": str(req.audio_url or "").strip()},
             "response_json": {},
         }
     finally:
-        if temp_path:
+        if temp_video_path:
             try:
-                os.unlink(temp_path)
+                os.unlink(temp_video_path)
             except OSError:
-                logger.warning("[youtube] failed to remove temp file: %s", temp_path)
+                logger.warning("[youtube] failed to remove temp video file: %s", temp_video_path)
+        if temp_audio_path:
+            try:
+                os.unlink(temp_audio_path)
+            except OSError:
+                logger.warning("[youtube] failed to remove temp audio file: %s", temp_audio_path)
 
 
 def _graph_version() -> str:

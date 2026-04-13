@@ -658,6 +658,28 @@ async def on_interaction(interaction: discord.Interaction) -> None:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
         return
 
+    # 구형 확인 버튼(legacy custom_id)도 제목 모달 경로로 강제한다.
+    if action in {"video_publish_confirm_youtube", "video_publish_confirm_both"}:
+        try:
+            if action == "video_publish_confirm_youtube":
+                targets = ["youtube"]
+                label = "유튜브"
+            else:
+                targets = ["youtube", "instagram"]
+                label = "유튜브 + 인스타그램"
+            token = uuid.uuid4().hex[:12]
+            publish_title_pending[token] = {
+                "user_id": user_id,
+                "job_id": job_id,
+                "targets": targets,
+                "label": label,
+                "publish_title": "",
+            }
+            await interaction.response.send_modal(_YoutubeTitleModal(token))
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+        return
+
     # Discord 컴포넌트는 3초 안에 응답해야 하므로 먼저 defer하고 실제 처리는 뒤에서 한다.
     await _safe_defer(interaction, ephemeral=True)
 
@@ -776,17 +798,11 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
-    elif action in {"video_publish_confirm_youtube", "video_publish_confirm_instagram", "video_publish_confirm_both"}:
+    elif action in {"video_publish_confirm_instagram"}:
         try:
-            if action == "video_publish_confirm_youtube":
-                targets = ["youtube"]
-                label = "유튜브"
-            elif action == "video_publish_confirm_instagram":
+            if action == "video_publish_confirm_instagram":
                 targets = ["instagram"]
                 label = "인스타그램"
-            else:
-                targets = ["youtube", "instagram"]
-                label = "유튜브 + 인스타그램"
             result = await gateway_call(
                 "/internal/video-action",
                 {"job_id": job_id, "action": "approved", "targets": targets},

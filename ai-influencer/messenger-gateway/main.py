@@ -2,8 +2,11 @@ import asyncio
 import logging
 import base64
 import json
+import os
 import re
 import secrets
+import subprocess
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -532,6 +535,19 @@ def _get_tts_script_text(script_json: dict) -> str:
     ).strip()
 
 
+def _strip_fixed_intro_outro_lines(script_text: str) -> tuple[str, bool, bool]:
+    raw_lines = [line.strip() for line in (script_text or "").splitlines() if line.strip()]
+    removed_opening = False
+    removed_ending = False
+    if raw_lines and raw_lines[0] == TTS_SCRIPT_OPENING_LINE:
+        raw_lines = raw_lines[1:]
+        removed_opening = True
+    if raw_lines and raw_lines[-1] == SCRIPT_ENDING_LINE:
+        raw_lines = raw_lines[:-1]
+        removed_ending = True
+    return "\n".join(raw_lines).strip(), removed_opening, removed_ending
+
+
 def _get_job_avatar_override(script_json: dict) -> str:
     return (
         script_json.get("heygen_avatar_id")
@@ -615,6 +631,31 @@ def _normalize_publish_targets(raw_targets: list[str]) -> list[str]:
 
 def _normalized_platform_status(value: object) -> str:
     return str(value or "").strip().lower()
+
+
+def _coerce_utc_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _publish_age_seconds(updated_at: object) -> Optional[float]:
+    updated = _coerce_utc_datetime(updated_at)
+    if updated is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - updated).total_seconds())
 
 
 def _build_publish_title(job_id: str, video_filename: str, subtitle_script_text: str, concept_text: str) -> str:
@@ -832,8 +873,8 @@ def _extract_supporting_facts(raw_report_text: str) -> list[str]:
     return facts
 
 
-_SCRIPT_MIN_CHARS = 320
-_SCRIPT_MAX_CHARS = 400
+_SCRIPT_MIN_CHARS = 280
+_SCRIPT_MAX_CHARS = 350
 _SCRIPT_REWRITE_MAX_ATTEMPTS = 5
 _REPORT_SCRIPT_RETRY_MAX_ATTEMPTS = 15
 
@@ -1051,19 +1092,12 @@ def _validate_subtitle_script(
         )
     if not subtitle_lines:
         raise RuntimeError("subtitle_script_text is empty")
-    if not subtitle_lines[0].startswith(SUBTITLE_SCRIPT_OPENING_LINE):
-        raise RuntimeError("subtitle_script_text opening line mismatch")
-    if not subtitle_lines[-1].endswith(SCRIPT_ENDING_LINE):
-        raise RuntimeError("subtitle_script_text ending line mismatch")
-    if tts_lines:
-        if not tts_lines[0].startswith(TTS_SCRIPT_OPENING_LINE):
-            raise RuntimeError("tts_script_text opening line mismatch before subtitle conversion")
-        if subtitle_lines[0] != tts_lines[0]:
-            raise RuntimeError("subtitle_script_text first line does not preserve tts line")
-        if not tts_lines[-1].endswith(SCRIPT_ENDING_LINE):
-            raise RuntimeError("tts_script_text ending line mismatch before subtitle conversion")
     if enforce_difference and subtitle_script_text.strip() == tts_script_text.strip():
         raise RuntimeError("subtitle_script_text must not be identical to tts_script_text")
+    if TTS_SCRIPT_OPENING_LINE in subtitle_script_text:
+        raise RuntimeError("subtitle_script_text must not include fixed opening line")
+    if SCRIPT_ENDING_LINE in subtitle_script_text:
+        raise RuntimeError("subtitle_script_text must not include fixed ending line")
     report_has_alnum = bool(re.search(r"[A-Za-z0-9]", raw_report_text or ""))
     subtitle_has_alnum = bool(re.search(r"[A-Za-z0-9]", subtitle_script_text or ""))
     if report_has_alnum and not subtitle_has_alnum:
@@ -1092,10 +1126,10 @@ def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
     tts_lines = [line.strip() for line in tts_script_text.splitlines() if line.strip()]
     if not tts_lines:
         raise RuntimeError("tts_script_text is empty")
-    if not tts_lines[0].startswith(TTS_SCRIPT_OPENING_LINE):
-        raise RuntimeError("tts_script_text opening line mismatch")
-    if not tts_lines[-1].endswith(SCRIPT_ENDING_LINE):
-        raise RuntimeError("tts_script_text ending line mismatch")
+    if TTS_SCRIPT_OPENING_LINE in tts_script_text:
+        raise RuntimeError("tts_script_text must not include fixed opening line")
+    if SCRIPT_ENDING_LINE in tts_script_text:
+        raise RuntimeError("tts_script_text must not include fixed ending line")
     return warning_message
 
 
@@ -1298,7 +1332,7 @@ async def _rewrite_report_to_script(
                     tts_script_text,
                     subtitle_script_text,
                     raw_report_text=raw_report_text,
-                    enforce_difference=True,
+                    enforce_difference=False,
                 )
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 prompt_log["rewrite"]["final"] = {
@@ -1515,10 +1549,83 @@ def _upload_subtitle_report_file(
     return stored, upload_error, is_link_only_report
 
 
-def _build_tts_variant_caption(variant_index: int, seed: Optional[int]) -> str:
+def _resolve_tts_fixed_clip_paths() -> tuple[str, str]:
+    opening_path = (settings.tts_opening_audio_path or "").strip()
+    ending_path = (settings.tts_ending_audio_path or "").strip()
+    if not opening_path or not ending_path:
+        raise RuntimeError("TTS_OPENING_AUDIO_PATH and TTS_ENDING_AUDIO_PATH must be configured")
+    if not os.path.isfile(opening_path):
+        raise RuntimeError(f"TTS opening clip not found: {opening_path}")
+    if not os.path.isfile(ending_path):
+        raise RuntimeError(f"TTS ending clip not found: {ending_path}")
+    return opening_path, ending_path
+
+
+def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[bytes, int]:
+    if not body_audio_bytes:
+        raise RuntimeError("empty body audio")
+
+    opening_path, ending_path = _resolve_tts_fixed_clip_paths()
+    retries = max(0, int(settings.tts_concat_retries))
+    max_attempts = 1 + retries
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with tempfile.TemporaryDirectory(prefix="tts-concat-") as workdir:
+                body_path = os.path.join(workdir, "body.wav")
+                output_path = os.path.join(workdir, "merged.wav")
+                with open(body_path, "wb") as f:
+                    f.write(body_audio_bytes)
+
+                cmd = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    opening_path,
+                    "-i",
+                    body_path,
+                    "-i",
+                    ending_path,
+                    "-filter_complex",
+                    "[0:a]aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono[a0];"
+                    "[1:a]aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono[a1];"
+                    "[2:a]aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono[a2];"
+                    "[a0][a1][a2]concat=n=3:v=0:a=1[a]",
+                    "-map",
+                    "[a]",
+                    "-c:a",
+                    "pcm_s16le",
+                    output_path,
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    stderr = (result.stderr or "").strip()
+                    raise RuntimeError(f"ffmpeg concat failed (attempt {attempt}/{max_attempts}): {stderr or 'unknown error'}")
+                with open(output_path, "rb") as f:
+                    merged_audio = f.read()
+                if not merged_audio:
+                    raise RuntimeError(f"ffmpeg concat produced empty audio (attempt {attempt}/{max_attempts})")
+                return merged_audio, attempt
+        except Exception as e:
+            last_error = e
+            logger.warning("[tts-concat] attempt=%s/%s failed: %s", attempt, max_attempts, e)
+
+    raise RuntimeError(f"TTS fixed-clip concat failed after {max_attempts} attempts: {last_error}")
+
+
+async def _concat_tts_audio_with_fixed_clips(body_audio_bytes: bytes) -> tuple[bytes, int]:
+    return await asyncio.to_thread(_concat_tts_audio_with_fixed_clips_sync, body_audio_bytes)
+
+
+def _build_tts_variant_caption(variant_index: int, seed: Optional[int], *, concat_attempts: int) -> str:
     seed_text = f" (seed={seed})" if seed is not None else ""
     return (
         f"🔊 TTS 후보 {variant_index + 1}/{_TTS_VARIANT_COUNT}{seed_text}입니다.\n"
+        f"고정 오프닝/엔딩 결합 완료 (concat attempt={concat_attempts}).\n"
         "마음에 들면 아래 버튼으로 이 버전을 선택하세요."
     )
 
@@ -1636,6 +1743,7 @@ async def _store_and_send_tts_variant(
     batch_id: str,
     variant_index: int,
     seed: Optional[int],
+    concat_attempts: int,
     audio_bytes: bytes,
 ) -> dict:
     filename = _build_tts_variant_filename(job_id, variant_index)
@@ -1650,7 +1758,7 @@ async def _store_and_send_tts_variant(
     except Exception as e:
         logger.error("[storage] tts variant upload failed job_id=%s variant=%s: %s", job_id, variant_index, e)
 
-    caption = _build_tts_variant_caption(variant_index, seed)
+    caption = _build_tts_variant_caption(variant_index, seed, concat_attempts=concat_attempts)
     delivery_url = ""
     if stored and stored.size_bytes > _discord_attachment_limit_bytes():
         message_id = await _discord_adapter.send_tts_variant_link_message(
@@ -1683,6 +1791,8 @@ async def _store_and_send_tts_variant(
         "attachment_or_presigned_url": delivery_url,
         "discord_message_id": message_id,
         "status": "ready",
+        "tts_concat_applied": True,
+        "tts_concat_attempts": int(concat_attempts),
     }
 
 
@@ -1776,6 +1886,9 @@ async def _run_tts_generation(
     try:
         # 1) 같은 대본으로 TTS 후보 3개를 순차 생성 2) Discord/S3 저장 3) 사용자가 1개를 선택한 뒤 승인 단계로 이동한다.
         await job_service.transition_status(job_id, "GENERATING")
+        body_script_text, removed_opening, removed_ending = _strip_fixed_intro_outro_lines(script_text)
+        if not body_script_text:
+            raise RuntimeError("tts body script is empty after removing fixed opening/ending lines")
         current_job = await job_service.get_job(job_id)
         cleaned_script = _clear_tts_variant_metadata(current_job.get("script_json") if current_job else {})
         await job_service.update_job(
@@ -1788,31 +1901,38 @@ async def _run_tts_generation(
                 audio_filename="",
                 tts_error_type="",
                 tts_error_detail="",
+                tts_script_text=body_script_text,
             ),
         )
         batch_id = _next_tts_batch_id()
         seeds, seed_strategy = _resolve_tts_variant_seeds(channel_id, force_random=force_random_seeds)
         logger.info(
-            "[tts-seed] resolved channel_id=%s strategy=%s seeds=%s",
+            "[tts-seed] resolved channel_id=%s strategy=%s seeds=%s removed_opening=%s removed_ending=%s",
             channel_id,
             seed_strategy,
             ",".join(str(seed) for seed in seeds),
+            removed_opening,
+            removed_ending,
         )
         variants: list[dict] = []
         success_count = 0
         failure_count = 0
         for variant_index, seed in enumerate(seeds):
             try:
-                audio_bytes = await _generate_tts_audio_content(job_id, script_text, seed=seed)
+                body_audio_bytes = await _generate_tts_audio_content(job_id, body_script_text, seed=seed)
+                audio_bytes, concat_attempts = await _concat_tts_audio_with_fixed_clips(body_audio_bytes)
                 variant_info = await _store_and_send_tts_variant(
                     job_id=job_id,
                     channel_id=channel_id,
                     batch_id=batch_id,
                     variant_index=variant_index,
                     seed=seed,
+                    concat_attempts=concat_attempts,
                     audio_bytes=audio_bytes,
                 )
                 variant_info["seed"] = seed
+                variant_info["tts_body_audio_bytes"] = len(body_audio_bytes)
+                variant_info["tts_final_audio_bytes"] = len(audio_bytes)
                 variants.append(variant_info)
                 success_count += 1
             except Exception as e:
@@ -1881,6 +2001,10 @@ async def _run_tts_generation(
         merged_script["tts_seed_strategy"] = seed_strategy
         merged_script["tts_seed_values"] = [int(seed) for seed in seeds]
         merged_script["selected_tts_seed"] = None
+        merged_script["tts_body_script_text"] = body_script_text
+        merged_script["tts_fixed_clips_enabled"] = True
+        merged_script["tts_fixed_clips_removed_opening"] = removed_opening
+        merged_script["tts_fixed_clips_removed_ending"] = removed_ending
         if variant_failures:
             merged_script["tts_variant_failures"] = variant_failures
             merged_script["tts_failure_summary"] = _build_tts_failure_summary(variant_failures)
@@ -2213,10 +2337,26 @@ def _launch_bg_task(coro: Awaitable[None], *, task_name: str, job_id: str) -> No
     task.add_done_callback(_done_callback)
 
 
+def _validate_request_contracts() -> None:
+    # 런타임 모델/핸들러 스키마가 어긋나면 시작 시점에 명시적으로 로그를 남긴다.
+    required_fields = {"job_id", "action", "targets", "publish_title"}
+    model_fields = set(getattr(VideoActionRequest, "model_fields", {}).keys())
+    missing = sorted(required_fields - model_fields)
+    if missing:
+        logger.error(
+            "[startup] VideoActionRequest contract mismatch missing_fields=%s current_fields=%s",
+            ",".join(missing),
+            ",".join(sorted(model_fields)),
+        )
+    else:
+        logger.info("[startup] VideoActionRequest contract OK fields=%s", ",".join(sorted(model_fields)))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http_client, _discord_adapter
 
+    _validate_request_contracts()
     await job_service.get_db_pool()
 
     _http_client = httpx.AsyncClient(timeout=10.0)
@@ -3584,6 +3724,27 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
 
         current_status = str(job.get("status") or "")
         if current_status == "PUBLISHING":
+            stale_minutes = max(1, int(settings.publish_stale_minutes))
+            age_seconds = _publish_age_seconds(job.get("updated_at"))
+            is_stale = age_seconds is not None and age_seconds >= (stale_minutes * 60)
+            if is_stale:
+                logger.warning(
+                    "[discord] video_action=approved stale_publishing_recovered job_id=%s age_seconds=%s",
+                    body.job_id,
+                    int(age_seconds or 0),
+                )
+                await job_service.transition_status(body.job_id, "WAITING_VIDEO_APPROVAL")
+                await _discord_adapter.send_text_message(
+                    channel_id,
+                    "⚠️ 이전 SNS 업로드가 지연 상태로 감지되어 복구했습니다. 플랫폼 버튼을 다시 눌러 업로드를 시작해주세요.",
+                )
+                return {
+                    "job_id": body.job_id,
+                    "action": "publishing_recovered",
+                    "requested_targets": requested_targets,
+                    "pending_targets": targets,
+                    "stale_age_seconds": int(age_seconds or 0),
+                }
             logger.info(
                 "[discord] video_action=approved skipped_already_publishing job_id=%s pending=%s",
                 body.job_id,
@@ -3602,44 +3763,54 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
             }
 
         status_transitioned = False
+        rollback_status = current_status or "WAITING_VIDEO_APPROVAL"
         if current_status != "PUBLISHING":
             await job_service.transition_status(body.job_id, "PUBLISHING")
             status_transitioned = True
-        # 최종 승인 시점에는 gateway가 직접 업로드하지 않고 WF-08에 SNS 업로드를 위임한다.
-        video_url = job.get("video_url", "")
-        if isinstance(video_url, str) and video_url.startswith("s3://"):
-            try:
-                video_url = presign_s3_uri(video_url)
-            except Exception as e:
-                logger.error("[storage] presign video s3 uri failed job_id=%s: %s", body.job_id, e)
-                raise HTTPException(status_code=500, detail=f"video presign failed: {e}")
-        script_json = _as_script_json(job.get("script_json"))
-        media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
-        video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
-        subtitle_script_text = _get_subtitle_script_text(script_json)
-        requested_publish_title = str(body.publish_title or "").strip()
-        publish_title = (
-            requested_publish_title
-            if requested_publish_title
-            else _build_publish_title(body.job_id, video_filename, subtitle_script_text, str(job.get("concept_text") or ""))
-        )
-        publish_description = _build_publish_description(subtitle_script_text)
-        publish_caption = _build_publish_caption(subtitle_script_text)
 
         try:
+            # 최종 승인 시점에는 gateway가 직접 업로드하지 않고 WF-08에 SNS 업로드를 위임한다.
+            video_url = job.get("video_url", "")
+            if isinstance(video_url, str) and video_url.startswith("s3://"):
+                video_url = presign_s3_uri(video_url)
+            audio_url = job.get("audio_url", "")
+            if not str(audio_url or "").strip():
+                raise HTTPException(status_code=400, detail="No audio_url found in job")
+            if isinstance(audio_url, str) and audio_url.startswith("s3://"):
+                audio_url = presign_s3_uri(audio_url)
+
+            script_json = _as_script_json(job.get("script_json"))
+            media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
+            video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
+            subtitle_script_text = str(script_json.get("subtitle_script_text") or "").strip()
+            if not subtitle_script_text:
+                raise HTTPException(
+                    status_code=400,
+                    detail="subtitle_script_text is required for youtube caption text",
+                )
+            requested_publish_title = str(getattr(body, "publish_title", "") or "").strip()
+            publish_title = (
+                requested_publish_title
+                if requested_publish_title
+                else _build_publish_title(body.job_id, video_filename, subtitle_script_text, str(job.get("concept_text") or ""))
+            )
+            publish_description = _build_publish_description(subtitle_script_text)
+            publish_caption = _build_publish_caption(subtitle_script_text)
+
             await n8n_service.call_wf08_sns_upload(
                 body.job_id,
                 video_url,
+                str(audio_url),
                 channel_id,
                 targets,
                 video_filename=video_filename,
                 title=publish_title,
                 description=publish_description,
                 caption=publish_caption,
+                subtitle_script_text=subtitle_script_text,
             )
         except Exception as e:
             if status_transitioned:
-                rollback_status = current_status or "WAITING_VIDEO_APPROVAL"
                 try:
                     await job_service.transition_status(body.job_id, rollback_status)
                 except Exception as rollback_error:
@@ -3649,6 +3820,9 @@ async def video_action(_: AuthDep, body: VideoActionRequest) -> dict:
                         rollback_status,
                         rollback_error,
                     )
+            if isinstance(e, HTTPException):
+                logger.error("video_action approved failed job_id=%s detail=%s", body.job_id, e.detail)
+                raise
             logger.error("call_wf08_sns_upload failed job_id=%s: %s", body.job_id, e)
             raise HTTPException(status_code=502, detail=f"WF-08 trigger failed: {e}")
 

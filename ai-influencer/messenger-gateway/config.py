@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     auto_report_discord_delivery_enabled: bool = True
     auto_report_max_attempts_per_day: int = 3
     auto_report_stale_minutes: int = 45
+    publish_stale_minutes: int = 10
     openai_api_key: str = ""
     script_rewrite_model: str = "gpt-5.4"
     script_rewrite_topic_keyword_guard_enabled: bool = False
@@ -39,6 +40,9 @@ class Settings(BaseSettings):
     tts_super_sampling: bool = True
     tts_fragment_interval: float = 0.4
     tts_fixed_seeds: str = ""
+    tts_opening_audio_path: str = ""
+    tts_ending_audio_path: str = ""
+    tts_concat_retries: int = 2
     heygen_api_key: str = ""
     heygen_avatar_id: str = ""
     heygen_api_base_url: str = "https://api.heygen.com"
