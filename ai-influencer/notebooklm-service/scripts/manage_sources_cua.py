@@ -42,9 +42,16 @@ NOTEBOOKLM_HOME = "https://notebooklm.google.com"
 
 
 def _build_openai_client() -> OpenAI:
-    api_key = os.environ.get("OPENAI_CUA_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = (
+        os.environ.get("OPENAI_API_KEY_CUA_MANAGE_SOURCES", "").strip()
+        or os.environ.get("OPENAI_FALLBACK_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
     if not api_key:
-        raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+        raise RuntimeError(
+            "OPENAI_API_KEY_CUA_MANAGE_SOURCES 또는 OPENAI_FALLBACK_API_KEY "
+            "(legacy OPENAI_API_KEY 포함)가 필요합니다."
+        )
     return OpenAI(api_key=api_key)
 
 

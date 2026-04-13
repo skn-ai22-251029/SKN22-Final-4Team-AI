@@ -1118,7 +1118,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
         return;
       }}
       if (!serverConfig.openai_configured) {{
-        aiHint.textContent = "OPENAI_API_KEY 미설정(또는 quickstart env 미전달): 자동 AI 평가는 비활성 상태입니다.";
+        aiHint.textContent = "OPENAI_API_KEY_SEEDLAB_ASR / OPENAI_API_KEY_SEEDLAB_JUDGE 미설정(또는 quickstart env 미전달): 자동 AI 평가는 비활성 상태입니다.";
         return;
       }}
       if (!serverConfig.auto_eval_on_add) {{
@@ -1610,11 +1610,33 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _openai_api_key(explicit_key: str) -> str:
-    key = (explicit_key or "").strip() or (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY is required for auto-eval")
-    return key
+def _resolve_openai_keys(
+    *,
+    explicit_shared_key: str,
+    explicit_asr_key: str,
+    explicit_judge_key: str,
+) -> tuple[str, str]:
+    fallback_key = (
+        (explicit_shared_key or "").strip()
+        or (os.getenv("OPENAI_FALLBACK_API_KEY") or "").strip()
+        or (os.getenv("OPENAI_API_KEY") or "").strip()
+    )
+    asr_key = (
+        (explicit_asr_key or "").strip()
+        or (os.getenv("OPENAI_API_KEY_SEEDLAB_ASR") or "").strip()
+        or fallback_key
+    )
+    judge_key = (
+        (explicit_judge_key or "").strip()
+        or (os.getenv("OPENAI_API_KEY_SEEDLAB_JUDGE") or "").strip()
+        or fallback_key
+    )
+    if not asr_key or not judge_key:
+        raise RuntimeError(
+            "OpenAI key missing: set OPENAI_API_KEY_SEEDLAB_ASR and OPENAI_API_KEY_SEEDLAB_JUDGE "
+            "(or OPENAI_FALLBACK_API_KEY / OPENAI_API_KEY)."
+        )
+    return asr_key, judge_key
 
 
 def _resolve_asr_model_for_transcription(requested: str) -> tuple[str, str]:
@@ -1891,7 +1913,8 @@ def _auto_eval_single_record(
     *,
     run_dir: Path,
     rec: dict[str, Any],
-    api_key: str,
+    asr_api_key: str,
+    judge_api_key: str,
     asr_model: str,
     judge_model: str,
     language: str,
@@ -1920,7 +1943,7 @@ def _auto_eval_single_record(
 
     try:
         transcript_text = _openai_transcribe_audio(
-            api_key=api_key,
+            api_key=asr_api_key,
             audio_path=audio_path,
             asr_model=asr_model,
             language=language,
@@ -1934,7 +1957,7 @@ def _auto_eval_single_record(
         chars_per_sec = (len(hyp_norm) / duration) if duration > 0 else 0.0
 
         judged = _openai_judge_scores(
-            api_key=api_key,
+            api_key=judge_api_key,
             judge_model=judge_model,
             timeout_seconds=timeout_seconds,
             script_text=script_text,
@@ -2029,7 +2052,11 @@ def cmd_auto_eval(args: argparse.Namespace) -> int:
     if not ready_records:
         raise RuntimeError("no ready records found in manifest")
 
-    api_key = _openai_api_key(args.openai_api_key)
+    asr_api_key, judge_api_key = _resolve_openai_keys(
+        explicit_shared_key=str(args.openai_api_key),
+        explicit_asr_key=str(args.openai_api_key_asr),
+        explicit_judge_key=str(args.openai_api_key_judge),
+    )
     asr_model_requested = str(args.asr_model)
     asr_model_resolved, asr_warning = _resolve_asr_model_for_transcription(asr_model_requested)
     if asr_warning:
@@ -2049,7 +2076,8 @@ def cmd_auto_eval(args: argparse.Namespace) -> int:
                     _auto_eval_single_record,
                     run_dir=run_dir,
                     rec=rec,
-                    api_key=api_key,
+                    asr_api_key=asr_api_key,
+                    judge_api_key=judge_api_key,
                     asr_model=asr_model_resolved,
                     judge_model=judge_model,
                     language=str(args.language),
@@ -2152,7 +2180,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if sample_id:
             manifest_by_id[sample_id] = rec
 
-    openai_api_key = (args.openai_api_key or os.getenv("OPENAI_API_KEY") or "").strip()
+    asr_api_key = ""
+    judge_api_key = ""
+    openai_configured = False
+    try:
+        asr_api_key, judge_api_key = _resolve_openai_keys(
+            explicit_shared_key=str(args.openai_api_key),
+            explicit_asr_key=str(args.openai_api_key_asr),
+            explicit_judge_key=str(args.openai_api_key_judge),
+        )
+        openai_configured = True
+    except Exception:
+        openai_configured = False
     asr_model_requested = str(args.asr_model)
     asr_model_resolved, asr_warning = _resolve_asr_model_for_transcription(asr_model_requested)
     judge_model = str(args.judge_model)
@@ -2228,7 +2267,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         "run_id": run_id,
                         "tts_endpoint": endpoint,
                         "auto_eval_on_add": auto_eval_on_add,
-                        "openai_configured": bool(openai_api_key),
+                        "openai_configured": openai_configured,
                     },
                 )
 
@@ -2240,7 +2279,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         "tts_endpoint": endpoint,
                         "default_tts_params": default_tts_params,
                         "auto_eval_on_add": auto_eval_on_add,
-                        "openai_configured": bool(openai_api_key),
+                        "openai_configured": openai_configured,
                         "asr_model": asr_model_resolved,
                         "asr_model_requested": asr_model_requested,
                         "judge_model": judge_model,
@@ -2332,11 +2371,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         with write_lock:
                             _append_jsonl_object(live_records_path, record)
 
-                        if auto_eval_on_add and openai_api_key:
+                        if auto_eval_on_add and openai_configured:
                             sample_id_eval, eval_obj, debug_obj = _auto_eval_single_record(
                                 run_dir=run_dir,
                                 rec=record,
-                                api_key=openai_api_key,
+                                asr_api_key=asr_api_key,
+                                judge_api_key=judge_api_key,
                                 asr_model=asr_model_resolved,
                                 judge_model=judge_model,
                                 language=str(args.language),
@@ -2372,8 +2412,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
             if route == "/api/ai-eval-one":
                 try:
-                    if not openai_api_key:
-                        raise RuntimeError("OPENAI_API_KEY is required for /api/ai-eval-one")
+                    if not openai_configured:
+                        raise RuntimeError(
+                            "OPENAI_API_KEY_SEEDLAB_ASR and OPENAI_API_KEY_SEEDLAB_JUDGE "
+                            "(or OPENAI_FALLBACK_API_KEY / OPENAI_API_KEY) are required for /api/ai-eval-one"
+                        )
                     body = self._read_json()
                     sample_id = str(body.get("sample_id") or "").strip()
                     if not sample_id:
@@ -2384,7 +2427,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     sample_id_eval, eval_obj, debug_obj = _auto_eval_single_record(
                         run_dir=run_dir,
                         rec=rec,
-                        api_key=openai_api_key,
+                        asr_api_key=asr_api_key,
+                        judge_api_key=judge_api_key,
                         asr_model=asr_model_resolved,
                         judge_model=judge_model,
                         language=str(args.language),
@@ -2416,7 +2460,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f"[seed-lab] WARN: {asr_warning}")
     print(f"[seed-lab] asr_model={asr_model_resolved} (requested={asr_model_requested})")
     print(f"[seed-lab] judge_model={judge_model}")
-    print(f"[seed-lab] auto_eval_on_add={auto_eval_on_add} openai_configured={bool(openai_api_key)}")
+    print(f"[seed-lab] auto_eval_on_add={auto_eval_on_add} openai_configured={openai_configured}")
     print("")
     try:
         server.serve_forever()
@@ -2651,7 +2695,9 @@ def build_parser() -> argparse.ArgumentParser:
     auto_p.add_argument("--language", default="ko", help="ASR language hint")
     auto_p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     auto_p.add_argument("--timeout", type=int, default=DEFAULT_AUTO_EVAL_TIMEOUT)
-    auto_p.add_argument("--openai-api-key", default="", help="optional; fallback to OPENAI_API_KEY")
+    auto_p.add_argument("--openai-api-key", default="", help="optional shared key; fallback to OPENAI_FALLBACK_API_KEY/OPENAI_API_KEY")
+    auto_p.add_argument("--openai-api-key-asr", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_ASR")
+    auto_p.add_argument("--openai-api-key-judge", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_JUDGE")
     auto_p.add_argument("--top", type=int, default=DEFAULT_STAGE_B_TOP, help="only used in printed next-step command")
     auto_p.set_defaults(func=cmd_auto_eval)
 
@@ -2662,7 +2708,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=DEFAULT_SERVE_PORT)
     serve_p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="TTS generate timeout seconds")
     serve_p.add_argument("--disable-auto-eval-on-add", action="store_true")
-    serve_p.add_argument("--openai-api-key", default="", help="optional; fallback to OPENAI_API_KEY")
+    serve_p.add_argument("--openai-api-key", default="", help="optional shared key; fallback to OPENAI_FALLBACK_API_KEY/OPENAI_API_KEY")
+    serve_p.add_argument("--openai-api-key-asr", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_ASR")
+    serve_p.add_argument("--openai-api-key-judge", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_JUDGE")
     serve_p.add_argument("--asr-model", default=DEFAULT_AUTO_EVAL_ASR_MODEL)
     serve_p.add_argument("--judge-model", default=DEFAULT_AUTO_EVAL_JUDGE_MODEL)
     serve_p.add_argument("--language", default="ko")

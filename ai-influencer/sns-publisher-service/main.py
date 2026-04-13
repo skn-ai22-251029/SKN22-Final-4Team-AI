@@ -251,7 +251,17 @@ def _asr_primary_model() -> str:
 
 
 def _openai_client() -> OpenAI:
-    return OpenAI(api_key=_require_env("OPENAI_API_KEY"))
+    api_key = (
+        os.environ.get("OPENAI_API_KEY_YOUTUBE_ASR", "").strip()
+        or os.environ.get("OPENAI_FALLBACK_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY_YOUTUBE_ASR or OPENAI_FALLBACK_API_KEY "
+            "(or legacy OPENAI_API_KEY) is required"
+        )
+    return OpenAI(api_key=api_key)
 
 
 def _extract_subtitle_lines(text: str) -> list[str]:

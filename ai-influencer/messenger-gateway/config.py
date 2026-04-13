@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     auto_report_max_attempts_per_day: int = 3
     auto_report_stale_minutes: int = 45
     publish_stale_minutes: int = 10
-    openai_api_key: str = ""
+    openai_fallback_api_key: str = ""
+    openai_api_key_rewrite: str = ""
     script_rewrite_model: str = "gpt-5.4"
     script_rewrite_topic_keyword_guard_enabled: bool = False
 

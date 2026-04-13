@@ -40,12 +40,36 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _openai_client() -> OpenAI:
-    return OpenAI(api_key=_require_env("OPENAI_API_KEY"))
+def _openai_client_for_metadata() -> OpenAI:
+    api_key = (
+        os.environ.get("OPENAI_API_KEY_CONTENT_METADATA", "").strip()
+        or os.environ.get("OPENAI_FALLBACK_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY_CONTENT_METADATA or OPENAI_FALLBACK_API_KEY "
+            "(or legacy OPENAI_API_KEY) is required"
+        )
+    return OpenAI(api_key=api_key)
+
+
+def _openai_client_for_embedding() -> OpenAI:
+    api_key = (
+        os.environ.get("OPENAI_API_KEY_CONTENT_EMBEDDING", "").strip()
+        or os.environ.get("OPENAI_FALLBACK_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY_CONTENT_EMBEDDING or OPENAI_FALLBACK_API_KEY "
+            "(or legacy OPENAI_API_KEY) is required"
+        )
+    return OpenAI(api_key=api_key)
 
 
 def _generate_metadata(script_text: str) -> dict:
-    client = _openai_client()
+    client = _openai_client_for_metadata()
     response = client.beta.chat.completions.parse(
         model="gpt-5.4-mini",
         temperature=0,
@@ -71,7 +95,7 @@ def _generate_metadata(script_text: str) -> dict:
 
 
 def _build_content_vector(summary: str, script_text: str) -> str:
-    client = _openai_client()
+    client = _openai_client_for_embedding()
     # Keep existing intent: vectorize summary + script_text together.
     embed_input = f"{summary}\n{script_text}"
     embed_resp = client.embeddings.create(model="text-embedding-3-small", input=embed_input)

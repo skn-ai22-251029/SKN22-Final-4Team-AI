@@ -1140,6 +1140,22 @@ def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
     return warning_message
 
 
+def _resolve_openai_api_key_for_rewrite() -> str:
+    primary = (settings.openai_api_key_rewrite or "").strip()
+    if primary:
+        return primary
+    fallback = (settings.openai_fallback_api_key or "").strip()
+    if fallback:
+        return fallback
+    legacy = os.environ.get("OPENAI_API_KEY", "").strip()
+    if legacy:
+        return legacy
+    raise RuntimeError(
+        "OPENAI_API_KEY_REWRITE or OPENAI_FALLBACK_API_KEY "
+        "(or legacy OPENAI_API_KEY) is not configured for script rewrite"
+    )
+
+
 async def _rewrite_report_to_script(
     raw_report_text: str,
     rewrite_instruction: str,
@@ -1151,9 +1167,7 @@ async def _rewrite_report_to_script(
 ) -> tuple[str, str]:
     # NotebookLM 원문 보고서를 한 번 더 정제해
     # 자막용/ TTS용 스크립트를 동시에 만든다.
-    api_key = settings.openai_api_key.strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured for script rewrite")
+    api_key = _resolve_openai_api_key_for_rewrite()
 
     client = AsyncOpenAI(api_key=api_key)
     try:

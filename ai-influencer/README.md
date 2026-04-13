@@ -643,8 +643,17 @@ nano .env   # 또는 vi .env
 | `HEYGEN_MOCK_VIDEO_URL` | mock 모드 샘플 mp4 URL | `https://samplelib.com/lib/preview/mp4/sample-5s.mp4` |
 | `GOOGLE_EMAIL` | NotebookLM 구글 계정 | |
 | `GOOGLE_PASSWORD` | NotebookLM 구글 비밀번호 | |
-| `OPENAI_API_KEY` | OpenAI API 키 | |
-| `OPENAI_CUA_API_KEY` | CUA 자동화 전용 OpenAI 키 (권장) | |
+| `OPENAI_FALLBACK_API_KEY` | OpenAI 공통 fallback 키(미설정 기능에서 공통 사용) | |
+| `OPENAI_API_KEY` | 레거시 fallback 키(하위 호환용, 가능하면 `OPENAI_FALLBACK_API_KEY` 사용 권장) | |
+| `OPENAI_API_KEY_REWRITE` | 대본 Rewrite 전용 키 (TTS/SUBTITLE 동시 생성 기능) | |
+| `OPENAI_API_KEY_CUA_CREATE_NOTEBOOK` | CUA 노트북 생성 전용 키 | |
+| `OPENAI_API_KEY_CUA_MANAGE_SOURCES` | CUA 소스 관리 전용 키 | |
+| `OPENAI_API_KEY_CUA_GENERATE_REPORT` | CUA 보고서 생성 전용 키 | |
+| `OPENAI_API_KEY_YOUTUBE_ASR` | YouTube 자막 ASR 전용 키 | |
+| `OPENAI_API_KEY_CONTENT_METADATA` | 콘텐츠 메타데이터 생성 전용 키 | |
+| `OPENAI_API_KEY_CONTENT_EMBEDDING` | 콘텐츠 임베딩 생성 전용 키 | |
+| `OPENAI_API_KEY_SEEDLAB_ASR` | Seed Lab ASR 전용 키 | |
+| `OPENAI_API_KEY_SEEDLAB_JUDGE` | Seed Lab Judge 전용 키 | |
 
 기본 경로: WF-11은 앞선 워크플로에서 전달된 `script_text`를 그대로 TTS 입력으로 사용합니다.  
 음색 클론이 필요할 때만 `TTS_REF_AUDIO_PATH` + `TTS_PROMPT_TEXT`를 **둘 다** 설정하세요.
@@ -1045,7 +1054,7 @@ python3 scripts/seed_lab.py run \
   --concurrency 4
 ```
 
-빠른 실행( `.env`의 `TTS_API_URL`, `OPENAI_API_KEY` 자동 사용 ):
+빠른 실행( `.env`의 `TTS_API_URL`, `OPENAI_API_KEY_SEEDLAB_ASR`, `OPENAI_API_KEY_SEEDLAB_JUDGE` 자동 사용 ):
 
 ```bash
 ./scripts/seed_lab_quickstart.sh
@@ -1071,8 +1080,8 @@ python3 scripts/seed_lab.py serve \
 
 - 접속: `http://127.0.0.1:8765`
 - `평가 테이블에 추가` 체크 후 생성하면 기존 평가 테이블에 샘플이 추가됩니다.
-- `OPENAI_API_KEY`가 있으면 추가 즉시 AI 평가를 수행해 `AI 평가(자동)` 표에 반영합니다.
-- AI 표가 비어 있으면 보통 `OPENAI_API_KEY` 미설정/미전달이거나 아직 `평가 테이블에 추가`로 생성한 샘플이 없는 상태입니다.
+- `OPENAI_API_KEY_SEEDLAB_ASR`, `OPENAI_API_KEY_SEEDLAB_JUDGE`가 있으면 추가 즉시 AI 평가를 수행해 `AI 평가(자동)` 표에 반영합니다.
+- AI 표가 비어 있으면 보통 Seed Lab OpenAI 키 미설정/미전달이거나 아직 `평가 테이블에 추가`로 생성한 샘플이 없는 상태입니다.
 - `SEED_LAB_ASR_MODEL`이 전사용 모델이 아니면 자동으로 `gpt-4o-transcribe`로 폴백합니다(예: `gpt-5.4` 입력 시).
 
 자동평가 관련 환경변수(quickstart):
@@ -1087,7 +1096,8 @@ SEED_LAB_AUTO_EVAL_TIMEOUT=120
 자동 평가(ASR + LLM, 하이브리드 추천):
 
 ```bash
-export OPENAI_API_KEY="<your_openai_key>"
+export OPENAI_API_KEY_SEEDLAB_ASR="<your_openai_key>"
+export OPENAI_API_KEY_SEEDLAB_JUDGE="<your_openai_key>"
 python3 scripts/seed_lab.py auto-eval \
   --run-dir seed-lab-runs/<run_id> \
   --asr-model gpt-4o-transcribe \
@@ -1161,7 +1171,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | n8n Postgres 연결 실패 | `postgres` 컨테이너 healthy 상태 대기 (`docker-compose ps`) |
 | n8n `$env.*` 접근 거부 | `docker-compose.yml`에 `N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"` 추가 후 재시작 |
 | n8n 환경변수 미반영 | `docker-compose up -d --force-recreate n8n` (재빌드 아닌 재생성) |
-| Seed Lab `AI 평가(자동)`이 계속 `OPENAI_API_KEY 미설정` | quickstart 로그에서 `OPENAI_API_KEY loaded: yes`와 `OPENAI_API_KEY exported to serve env: yes` 확인. 이후 serve 시작 로그가 `openai_configured=True`인지 확인 |
+| Seed Lab `AI 평가(자동)`이 계속 키 미설정으로 표시됨 | quickstart 로그에서 `OPENAI_API_KEY_SEEDLAB_ASR loaded: yes`, `OPENAI_API_KEY_SEEDLAB_JUDGE loaded: yes` 확인. 이후 serve 시작 로그가 `openai_configured=True`인지 확인 |
 | Seed Lab auto-eval이 전부 `Invalid URL (POST /v1/audio/transcriptions)` 실패 | ASR 모델이 전사용 모델인지 확인. quickstart에서는 `SEED_LAB_ASR_MODEL`을 transcribe 계열로 설정하거나 기본값(`gpt-4o-transcribe`) 사용 |
 | n8n 워크플로 import 오류 | `docker-compose logs n8n`에서 `workflow-sync`/credential 매핑 에러 먼저 확인 |
 | n8n `http://IP:5678` 접속 불가 | EC2 보안그룹 인바운드 5678 포트 오픈 확인 |
@@ -1186,7 +1196,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 | 아침 노트북에 소스만 있고 보고서가 계속 비어 있음 | WF-09 최신 워크플로 재임포트 후 `결과 로깅` 노드에서 `recovery-no-report` 로그 확인. `AUTO_REPORT_MAX_ATTEMPTS_PER_DAY`, `AUTO_REPORT_STALE_MINUTES` 설정도 점검 |
 | 자동 보고서가 예상 채널이 아닌 곳에 옴 | auto-report는 `DISCORD_ALLOWED_CHANNEL_IDS`의 첫 번째 채널만 사용함. 순서 변경 후 gateway 재기동 필요 |
 | TTS 승인 버튼 눌러도 WF-12 미실행 | `.env`의 `N8N_WF12_WEBHOOK_URL` 확인 + `docker-compose up -d --build messenger-gateway discord-bot` 재배포 |
-| CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | `OPENAI_CUA_API_KEY` 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |
+| CUA가 잘못된 페이지로 이동하거나 키 노출 우려 | CUA 기능별 키(`OPENAI_API_KEY_CUA_CREATE_NOTEBOOK`, `OPENAI_API_KEY_CUA_MANAGE_SOURCES`, `OPENAI_API_KEY_CUA_GENERATE_REPORT`) 분리 사용 + NotebookLM/Google 로그인 외 도메인 접근 차단(최신 코드) |
 | Gateway DB 연결 실패 | postgres healthcheck 통과 여부 및 환경변수 확인 |
 
 ---

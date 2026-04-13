@@ -93,8 +93,11 @@ def _cua_subprocess_env() -> dict:
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "NO_PROXY",
-        "OPENAI_CUA_API_KEY",
-        "OPENAI_API_KEY",      # fallback only
+        "OPENAI_FALLBACK_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_API_KEY_CUA_CREATE_NOTEBOOK",
+        "OPENAI_API_KEY_CUA_MANAGE_SOURCES",
+        "OPENAI_API_KEY_CUA_GENERATE_REPORT",
         "GOOGLE_EMAIL",
         "GOOGLE_PASSWORD",
         "NOTEBOOKLM_DATA_DIR",
