@@ -75,6 +75,47 @@ _TTS_VARIANT_COUNT = 3
 _HEYGEN_AVATAR_OPTION_COUNT = 6
 _HEYGEN_AVATAR_LABEL_PREFIX_LEN = 6
 _http_basic = HTTPBasic()
+_HARDBURN_FONT_NAME = "Noto Sans CJK KR"
+_HARDBURN_FONT_DIRS = (
+    "/usr/share/fonts/opentype/noto",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts",
+)
+_HARDBURN_FORCE_STYLE = (
+    "FontName=Noto Sans CJK KR,"
+    "FontSize=13,"
+    "PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00000000,"
+    "BackColour=&H80000000,"
+    "Outline=2,"
+    "Shadow=0,"
+    "MarginV=30,"
+    "Alignment=2"
+)
+
+
+def _ffmpeg_filter_escape(value: str) -> str:
+    escaped = str(value or "")
+    escaped = escaped.replace("\\", r"\\")
+    escaped = escaped.replace(":", r"\:")
+    escaped = escaped.replace("'", r"\'")
+    escaped = escaped.replace("[", r"\[")
+    escaped = escaped.replace("]", r"\]")
+    escaped = escaped.replace(",", r"\,")
+    return escaped
+
+
+def _resolve_hardburn_font_dir() -> str:
+    for candidate in _HARDBURN_FONT_DIRS:
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            entries = os.listdir(candidate)
+        except OSError:
+            continue
+        if any(entry.lower().endswith((".ttf", ".otf", ".ttc")) for entry in entries):
+            return candidate
+    raise RuntimeError(f"hardburn font directory not found: {_HARDBURN_FONT_DIRS}")
 
 
 def _estimate_script_rewrite_cost_usd(usage: dict[str, Any]) -> Optional[float]:
@@ -183,6 +224,42 @@ def _normalize_video_filename(
     existing_script_json: object = None,
 ) -> str:
     return _normalize_filename(job_id, "mp4", candidate, existing_script_json)
+
+
+def _build_hardburn_video_filename(raw_video_filename: str) -> str:
+    stem, _ = raw_video_filename.rsplit(".", 1)
+    return f"{stem}.hardburn.mp4"
+
+
+def _build_srt_filename(raw_video_filename: str) -> str:
+    stem, _ = raw_video_filename.rsplit(".", 1)
+    return f"{stem}.srt"
+
+
+def _merge_script_json_with_hardburn_failure(
+    existing_script_json: dict[str, Any] | None,
+    *,
+    raw_video_filename: str,
+    hardburn_video_filename: str,
+    srt_filename: str,
+    raw_video_s3_uri: str,
+    srt_s3_uri: str,
+    error: str,
+) -> dict[str, Any]:
+    merged_script = _as_script_json(existing_script_json)
+    media_names = merged_script.get("media_names") if isinstance(merged_script.get("media_names"), dict) else {}
+    media_names["raw_video_filename"] = raw_video_filename
+    media_names["hardburn_video_filename"] = hardburn_video_filename
+    media_names["srt_filename"] = srt_filename
+    merged_script["media_names"] = media_names
+    merged_script["video_hardburn"] = {
+        "status": "failed",
+        "error": str(error or ""),
+        "raw_video_s3_uri": raw_video_s3_uri,
+        "hardburn_video_s3_uri": "",
+        "srt_s3_uri": srt_s3_uri,
+    }
+    return merged_script
 
 
 def _normalize_log_filename(
@@ -487,6 +564,7 @@ def _clear_tts_variant_metadata(script_json: dict) -> dict:
         "active_tts_batch_id",
         "selected_tts_variant_index",
         "selected_tts_seed",
+        "selected_tts_timing",
         "tts_variant_control_message_id",
         "tts_variant_action_message_id",
         "tts_downstream_intent",
@@ -722,6 +800,48 @@ async def _register_generated_content(
         return "", str(e)
 
 
+def _resolve_internal_media_url(media_url: str) -> str:
+    cleaned = str(media_url or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith("s3://"):
+        return presign_s3_uri(cleaned)
+    return cleaned
+
+
+async def _build_caption_artifacts(
+    *,
+    job_id: str,
+    audio_url: str,
+    subtitle_script_text: str,
+    tts_script_text: str,
+) -> dict[str, Any]:
+    service_base_url = settings.sns_publisher_service_url.rstrip("/")
+    if not service_base_url:
+        raise RuntimeError("SNS_PUBLISHER_SERVICE_URL is not configured")
+    resolved_audio_url = _resolve_internal_media_url(audio_url)
+    if not resolved_audio_url:
+        raise RuntimeError("audio_url is required for caption artifacts")
+    resp = await _http_client.post(
+        f"{service_base_url}/internal/caption-artifacts",
+        json={
+            "job_id": job_id,
+            "audio_url": resolved_audio_url,
+            "subtitle_script_text": subtitle_script_text,
+            "tts_script_text": tts_script_text,
+        },
+        timeout=300.0,
+    )
+    resp.raise_for_status()
+    payload = resp.json() if resp.content else {}
+    if str(payload.get("status") or "").strip() != "ready":
+        raise RuntimeError(f"caption artifacts not ready: {payload}")
+    srt_content = str(payload.get("srt_content") or "")
+    if not srt_content.strip():
+        raise RuntimeError("caption artifacts returned empty srt_content")
+    return payload
+
+
 async def _resolve_heygen_avatar_id(_: dict) -> tuple[str, str]:
     # 기본 avatar fallback은 env 첫 번째 항목을 사용한다.
     # 실제 WF-12 승인 경로에서는 반드시 사용자가 선택한 avatar를 사용한다.
@@ -876,7 +996,7 @@ def _extract_supporting_facts(raw_report_text: str) -> list[str]:
 _SCRIPT_MIN_CHARS = 280
 _SCRIPT_MAX_CHARS = 350
 _SCRIPT_REWRITE_MAX_ATTEMPTS = 5
-_REPORT_SCRIPT_RETRY_MAX_ATTEMPTS = 15
+_REPORT_SCRIPT_RETRY_MAX_ATTEMPTS = 30
 
 
 def _script_char_count(script_text: str) -> int:
@@ -887,6 +1007,14 @@ def _script_char_count(script_text: str) -> int:
 def _sanitize_prompt_text(text: str) -> str:
     sanitized = (text or "").replace("\x00", "")
     return sanitized.encode("utf-8", "ignore").decode("utf-8")
+
+
+def _split_script_sentences(script_text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", (script_text or "").replace("\n", " ")).strip()
+    if not normalized:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", normalized)
+    return [part.strip() for part in parts if part.strip()]
 
 
 def _clip(text: str, *, limit: int = 260) -> str:
@@ -1130,6 +1258,9 @@ def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
         raise RuntimeError(
             f"tts_script_text length out of range: {tts_len} (expected {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
         )
+    sentences = _split_script_sentences(tts_script_text)
+    if len(sentences) < 6:
+        raise RuntimeError("tts_script_text must contain at least 6 sentences")
     tts_lines = [line.strip() for line in tts_script_text.splitlines() if line.strip()]
     if not tts_lines:
         raise RuntimeError("tts_script_text is empty")
@@ -1627,6 +1758,122 @@ def _ffprobe_audio_spec_sync(audio_path: str) -> dict[str, Any]:
     }
 
 
+def _ffprobe_audio_duration_sync(audio_path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"ffprobe duration failed for {audio_path}: {stderr or 'unknown error'}")
+    try:
+        duration = float((result.stdout or "").strip())
+    except Exception as e:
+        raise RuntimeError(f"ffprobe returned invalid duration for {audio_path}: {e}") from e
+    if duration <= 0.0:
+        raise RuntimeError(f"ffprobe returned non-positive duration for {audio_path}: {duration}")
+    return duration
+
+
+def _ffprobe_video_dimensions_sync(video_path: str) -> tuple[int, int]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "json",
+        video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"ffprobe video dimensions failed for {video_path}: {stderr or 'unknown error'}")
+    try:
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams") or []
+        stream = streams[0] if streams else {}
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+    except Exception as e:
+        raise RuntimeError(f"ffprobe video dimensions returned invalid json for {video_path}: {e}") from e
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"invalid video dimensions for {video_path}: {payload}")
+    return width, height
+
+
+def _subtitles_filter_arg(*, srt_path: str, width: int, height: int) -> str:
+    fontsdir = _ffmpeg_filter_escape(_resolve_hardburn_font_dir())
+    style = _HARDBURN_FORCE_STYLE.replace("'", r"\'")
+    srt_value = _ffmpeg_filter_escape(srt_path)
+    return (
+        f"subtitles=filename='{srt_value}':fontsdir='{fontsdir}':"
+        f"original_size={width}x{height}:force_style='{style}'"
+    )
+
+
+def _render_hardburn_video_sync(*, raw_video_bytes: bytes, srt_content: str) -> bytes:
+    if not raw_video_bytes:
+        raise RuntimeError("empty raw video bytes")
+    if not srt_content.strip():
+        raise RuntimeError("empty srt content")
+
+    with tempfile.TemporaryDirectory(prefix="video-hardburn-") as workdir:
+        raw_path = os.path.join(workdir, "raw.mp4")
+        srt_path = os.path.join(workdir, "captions.srt")
+        output_path = os.path.join(workdir, "hardburn.mp4")
+        with open(raw_path, "wb") as f:
+            f.write(raw_video_bytes)
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        width, height = _ffprobe_video_dimensions_sync(raw_path)
+        filter_arg = _subtitles_filter_arg(srt_path=srt_path, width=width, height=height)
+        base_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            raw_path,
+            "-vf",
+            filter_arg,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+        attempts = (
+            base_cmd + ["-c:a", "copy", output_path],
+            base_cmd + ["-c:a", "aac", "-b:a", "192k", output_path],
+        )
+        last_error = ""
+        for cmd in attempts:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                with open(output_path, "rb") as f:
+                    return f.read()
+            last_error = (result.stderr or "").strip() or "unknown error"
+        raise RuntimeError(f"ffmpeg hardburn failed: {last_error}")
+
+
 def _normalize_clip_to_spec_sync(
     *,
     src_path: str,
@@ -1658,12 +1905,55 @@ def _normalize_clip_to_spec_sync(
         raise RuntimeError(f"ffmpeg normalize failed for {src_path}: {stderr or 'unknown error'}")
 
 
-def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[bytes, int, dict[str, Any], dict[str, Any]]:
+def _build_silence_clip_to_spec_sync(
+    *,
+    dst_path: str,
+    seconds: float,
+    sample_rate: int,
+    channels: int,
+    codec_name: str,
+    sample_fmt: str = "",
+) -> None:
+    safe_seconds = max(0.0, float(seconds))
+    if safe_seconds <= 0.0:
+        raise RuntimeError("silence seconds must be > 0")
+    channel_layout = "mono" if int(channels) == 1 else "stereo"
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"anullsrc=r={int(sample_rate)}:cl={channel_layout}",
+        "-t",
+        f"{safe_seconds:.3f}",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+    ]
+    if sample_fmt:
+        cmd.extend(["-sample_fmt", sample_fmt])
+    cmd.extend(["-c:a", codec_name, dst_path])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"ffmpeg silence generation failed: {stderr or 'unknown error'}")
+
+
+def _concat_tts_audio_with_fixed_clips_sync(
+    body_audio_bytes: bytes,
+) -> tuple[bytes, int, dict[str, Any], dict[str, Any], dict[str, Any]]:
     if not body_audio_bytes:
         raise RuntimeError("empty body audio")
 
     opening_path, ending_path = _resolve_tts_fixed_clip_paths()
     retries = max(0, int(settings.tts_concat_retries))
+    opening_gap_seconds = max(0.0, float(getattr(settings, "tts_opening_gap_seconds", 0.5) or 0.0))
+    ending_gap_seconds = max(0.0, float(getattr(settings, "tts_ending_gap_seconds", 0.5) or 0.0))
     max_attempts = 1 + retries
     last_error: Exception | None = None
 
@@ -1673,6 +1963,8 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
                 body_path = os.path.join(workdir, "body.wav")
                 opening_norm_path = os.path.join(workdir, "opening.norm.wav")
                 ending_norm_path = os.path.join(workdir, "ending.norm.wav")
+                opening_gap_path = os.path.join(workdir, "opening.gap.wav")
+                ending_gap_path = os.path.join(workdir, "ending.gap.wav")
                 concat_list_path = os.path.join(workdir, "concat.txt")
                 output_path = os.path.join(workdir, "merged.wav")
                 with open(body_path, "wb") as f:
@@ -1699,9 +1991,36 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
                     codec_name=target_codec,
                     sample_fmt=target_sample_fmt,
                 )
+                opening_duration_sec = _ffprobe_audio_duration_sync(opening_norm_path)
+                body_duration_sec = _ffprobe_audio_duration_sync(body_path)
+                ending_duration_sec = _ffprobe_audio_duration_sync(ending_norm_path)
+
+                concat_inputs: list[str] = [opening_norm_path]
+                if opening_gap_seconds > 0.0:
+                    _build_silence_clip_to_spec_sync(
+                        dst_path=opening_gap_path,
+                        seconds=opening_gap_seconds,
+                        sample_rate=int(body_spec["sample_rate"]),
+                        channels=int(body_spec["channels"]),
+                        codec_name=target_codec,
+                        sample_fmt=target_sample_fmt,
+                    )
+                    concat_inputs.append(opening_gap_path)
+                concat_inputs.append(body_path)
+                if ending_gap_seconds > 0.0:
+                    _build_silence_clip_to_spec_sync(
+                        dst_path=ending_gap_path,
+                        seconds=ending_gap_seconds,
+                        sample_rate=int(body_spec["sample_rate"]),
+                        channels=int(body_spec["channels"]),
+                        codec_name=target_codec,
+                        sample_fmt=target_sample_fmt,
+                    )
+                    concat_inputs.append(ending_gap_path)
+                concat_inputs.append(ending_norm_path)
 
                 with open(concat_list_path, "w", encoding="utf-8") as concat_file:
-                    for p in (opening_norm_path, body_path, ending_norm_path):
+                    for p in concat_inputs:
                         concat_file.write(f"file '{p}'\n")
 
                 cmd = [
@@ -1738,7 +2057,22 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
                     merged_audio = f.read()
                 if not merged_audio:
                     raise RuntimeError(f"ffmpeg concat produced empty audio (attempt {attempt}/{max_attempts})")
-                return merged_audio, attempt, body_spec, final_spec
+                final_duration_sec = _ffprobe_audio_duration_sync(output_path)
+                body_start_sec = opening_duration_sec + opening_gap_seconds
+                body_end_sec = body_start_sec + body_duration_sec
+                ending_start_sec = body_end_sec + ending_gap_seconds
+                tts_timing = {
+                    "opening_duration_sec": round(opening_duration_sec, 6),
+                    "opening_gap_sec": round(opening_gap_seconds, 6),
+                    "body_duration_sec": round(body_duration_sec, 6),
+                    "ending_gap_sec": round(ending_gap_seconds, 6),
+                    "ending_duration_sec": round(ending_duration_sec, 6),
+                    "body_start_sec": round(body_start_sec, 6),
+                    "body_end_sec": round(body_end_sec, 6),
+                    "ending_start_sec": round(ending_start_sec, 6),
+                    "final_duration_sec": round(final_duration_sec, 6),
+                }
+                return merged_audio, attempt, body_spec, final_spec, tts_timing
         except Exception as e:
             last_error = e
             logger.warning("[tts-concat] attempt=%s/%s failed: %s", attempt, max_attempts, e)
@@ -1748,7 +2082,7 @@ def _concat_tts_audio_with_fixed_clips_sync(body_audio_bytes: bytes) -> tuple[by
 
 async def _concat_tts_audio_with_fixed_clips(
     body_audio_bytes: bytes,
-) -> tuple[bytes, int, dict[str, Any], dict[str, Any]]:
+) -> tuple[bytes, int, dict[str, Any], dict[str, Any], dict[str, Any]]:
     return await asyncio.to_thread(_concat_tts_audio_with_fixed_clips_sync, body_audio_bytes)
 
 
@@ -1876,6 +2210,7 @@ async def _store_and_send_tts_variant(
     seed: Optional[int],
     concat_attempts: int,
     audio_bytes: bytes,
+    tts_timing: dict[str, Any],
 ) -> dict:
     filename = _build_tts_variant_filename(job_id, variant_index)
     stored = None
@@ -1924,6 +2259,7 @@ async def _store_and_send_tts_variant(
         "status": "ready",
         "tts_concat_applied": True,
         "tts_concat_attempts": int(concat_attempts),
+        "tts_timing": dict(tts_timing or {}),
     }
 
 
@@ -2051,9 +2387,13 @@ async def _run_tts_generation(
         for variant_index, seed in enumerate(seeds):
             try:
                 body_audio_bytes = await _generate_tts_audio_content(job_id, body_script_text, seed=seed)
-                audio_bytes, concat_attempts, body_audio_spec, final_audio_spec = await _concat_tts_audio_with_fixed_clips(
-                    body_audio_bytes
-                )
+                (
+                    audio_bytes,
+                    concat_attempts,
+                    body_audio_spec,
+                    final_audio_spec,
+                    tts_timing,
+                ) = await _concat_tts_audio_with_fixed_clips(body_audio_bytes)
                 variant_info = await _store_and_send_tts_variant(
                     job_id=job_id,
                     channel_id=channel_id,
@@ -2062,6 +2402,7 @@ async def _run_tts_generation(
                     seed=seed,
                     concat_attempts=concat_attempts,
                     audio_bytes=audio_bytes,
+                    tts_timing=tts_timing,
                 )
                 variant_info["seed"] = seed
                 variant_info["tts_body_audio_bytes"] = len(body_audio_bytes)
@@ -2136,6 +2477,7 @@ async def _run_tts_generation(
         merged_script["tts_seed_strategy"] = seed_strategy
         merged_script["tts_seed_values"] = [int(seed) for seed in seeds]
         merged_script["selected_tts_seed"] = None
+        merged_script["selected_tts_timing"] = {}
         merged_script["tts_body_script_text"] = body_script_text
         merged_script["tts_fixed_clips_enabled"] = True
         merged_script["tts_fixed_clips_removed_opening"] = removed_opening
@@ -3534,6 +3876,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
         selected_script["active_tts_batch_id"] = active_batch_id
         selected_script["selected_tts_variant_index"] = int(body.variant_index)
         selected_script["selected_tts_seed"] = selected_seed
+        selected_script["selected_tts_timing"] = dict(chosen_variant.get("tts_timing") or {})
         selected_script["tts_variant_control_message_id"] = str(script_json.get("tts_variant_control_message_id") or "").strip()
         selected_script["tts_variant_action_message_id"] = ""
         selected_script["tts_downstream_intent"] = _get_tts_downstream_intent(script_json)
@@ -3566,6 +3909,7 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             rollback_script["active_tts_batch_id"] = active_batch_id
             rollback_script["selected_tts_variant_index"] = None
             rollback_script["selected_tts_seed"] = None
+            rollback_script["selected_tts_timing"] = {}
             rollback_script["tts_variant_control_message_id"] = str(script_json.get("tts_variant_control_message_id") or "").strip()
             rollback_script["tts_variant_action_message_id"] = ""
             rollback_script["tts_downstream_intent"] = _get_tts_downstream_intent(script_json)
@@ -3715,14 +4059,19 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
 @app.post("/internal/send-video-preview")
 async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     """WF-12 완료 후 호출 — Discord로 영상 미리보기 + 승인/반려 버튼을 전송한다."""
-    # WF-12가 준 video_url을 다시 내려받아 S3에 통일 저장한 뒤,
-    # Discord에는 presigned preview 링크와 승인/반려 버튼을 보낸다.
+    # WF-12가 준 raw video를 내려받아 raw/hardburn/SRT를 모두 S3에 저장한 뒤,
+    # Discord에는 hardburn preview 링크와 승인/반려 버튼을 보낸다.
     existing_job = await job_service.get_job(body.job_id)
+    if existing_job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    existing_script_json = _as_script_json(existing_job.get("script_json"))
     normalized_video_filename = _normalize_video_filename(
         body.job_id,
         body.video_filename,
-        existing_job.get("script_json") if existing_job else None,
+        existing_script_json,
     )
+    hardburn_video_filename = _build_hardburn_video_filename(normalized_video_filename)
+    srt_filename = _build_srt_filename(normalized_video_filename)
     video_started_at = datetime.now(timezone.utc)
     try:
         video_resp = await _http_client.get(body.video_url, timeout=300.0)
@@ -3732,7 +4081,7 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         raise HTTPException(status_code=500, detail=f"Video download failed: {e}")
 
     try:
-        stored = put_bytes_and_presign(
+        raw_stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_videos,
             filename=normalized_video_filename,
             content=video_resp.content,
@@ -3742,23 +4091,89 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         logger.error("[storage] video upload failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=f"Video upload failed: {e}")
 
+    subtitle_script_text = _get_subtitle_script_text(existing_script_json)
+    tts_script_text = _get_tts_script_text(existing_script_json)
+    audio_url = str(existing_job.get("audio_url") or "").strip()
+    if not subtitle_script_text:
+        raise HTTPException(status_code=400, detail="subtitle_script_text is required for hardburn")
+    if not tts_script_text:
+        raise HTTPException(status_code=400, detail="tts_script_text is required for hardburn")
+    if not audio_url:
+        raise HTTPException(status_code=400, detail="audio_url is required for hardburn")
+
+    hardburn_started_at = datetime.now(timezone.utc)
+    try:
+        caption_artifacts = await _build_caption_artifacts(
+            job_id=body.job_id,
+            audio_url=audio_url,
+            subtitle_script_text=subtitle_script_text,
+            tts_script_text=tts_script_text,
+        )
+    except Exception as e:
+        logger.error("[hardburn] caption artifact generation failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"Caption artifact generation failed: {e}")
+
+    srt_content = str(caption_artifacts.get("srt_content") or "")
+    try:
+        srt_stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_srt,
+            filename=srt_filename,
+            content=srt_content.encode("utf-8"),
+            content_type="application/x-subrip; charset=utf-8",
+        )
+    except Exception as e:
+        logger.error("[storage] srt upload failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"SRT upload failed: {e}")
+
+    try:
+        hardburn_video_bytes = await asyncio.to_thread(
+            _render_hardburn_video_sync,
+            raw_video_bytes=video_resp.content,
+            srt_content=srt_content,
+        )
+    except Exception as e:
+        logger.error("[hardburn] ffmpeg render failed job_id=%s: %s", body.job_id, e)
+        await job_service.update_job(
+            body.job_id,
+            script_json=_merge_script_json_with_hardburn_failure(
+                existing_script_json,
+                raw_video_filename=normalized_video_filename,
+                hardburn_video_filename=hardburn_video_filename,
+                srt_filename=srt_filename,
+                raw_video_s3_uri=raw_stored.s3_uri,
+                srt_s3_uri=srt_stored.s3_uri,
+                error=str(e),
+            ),
+            error_message=f"Hardburn render failed: {e}",
+        )
+        raise HTTPException(status_code=500, detail=f"Hardburn render failed: {e}")
+
+    try:
+        hardburn_stored = put_bytes_and_presign(
+            prefix=settings.media_s3_prefix_videos_with_subtitle,
+            filename=hardburn_video_filename,
+            content=hardburn_video_bytes,
+            content_type="video/mp4",
+        )
+    except Exception as e:
+        logger.error("[storage] hardburn video upload failed job_id=%s: %s", body.job_id, e)
+        raise HTTPException(status_code=500, detail=f"Hardburn video upload failed: {e}")
+
     try:
         message_id = await _discord_adapter.send_video_preview(
             channel_id=body.channel_id,
             user_id=body.user_id,
             job_id=body.job_id,
-            video_url=stored.presigned_url,
+            video_url=hardburn_stored.presigned_url,
         )
     except Exception as e:
         logger.error("[discord] send_video_preview failed job_id=%s: %s", body.job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    existing_script_json = _as_script_json(existing_job.get("script_json") if existing_job else None)
-    subtitle_script_text = _get_subtitle_script_text(existing_script_json)
     generated_content_id, generated_content_error = await _register_generated_content(
         job_id=body.job_id,
         script_text=subtitle_script_text,
-        content_url=stored.s3_uri,
+        content_url=hardburn_stored.s3_uri,
     )
 
     heygen_usage_json = body.heygen_usage_json if isinstance(body.heygen_usage_json, dict) else {}
@@ -3780,26 +4195,87 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
             "avatar_id": body.heygen_avatar_id,
             "use_avatar_iv_model": body.heygen_use_avatar_iv_model,
             "status": body.heygen_status or "completed",
+            "raw_video_s3_uri": raw_stored.s3_uri,
+            "hardburn_video_s3_uri": hardburn_stored.s3_uri,
         },
         raw_response_json={
             "request_snapshot": request_snapshot,
             "response_snapshot": response_snapshot,
             "video_url": body.video_url,
             "video_filename": normalized_video_filename,
+            "raw_video_s3_uri": raw_stored.s3_uri,
+            "hardburn_video_s3_uri": hardburn_stored.s3_uri,
+            "srt_s3_uri": srt_stored.s3_uri,
         },
         cost_usd=_estimate_heygen_cost_usd(body.heygen_cost_usd),
         error_type="",
         error_message="",
         idempotency_key=f"video:heygen:{body.job_id}:{body.heygen_video_id or normalized_video_filename}",
     )
+    await _record_cost_event_safe(
+        job_id=body.job_id,
+        topic_text=str(existing_job.get("concept_text") or ""),
+        stage="video",
+        process="hardburn_subtitle",
+        provider="ffmpeg",
+        attempt_no=1,
+        status="success",
+        started_at=hardburn_started_at,
+        ended_at=datetime.now(timezone.utc),
+        usage_json={
+            "preview_asset": "hardburn",
+            "publish_asset": "hardburn",
+            "subtitle_sha256": caption_artifacts.get("subtitle_sha256"),
+            "asr_model": caption_artifacts.get("asr_model"),
+            "word_count": caption_artifacts.get("word_count"),
+            "matched_sentence_count": caption_artifacts.get("matched_sentence_count"),
+            "raw_video_bytes": len(video_resp.content),
+            "hardburn_video_bytes": len(hardburn_video_bytes),
+        },
+        raw_response_json={
+            "caption_request_json": caption_artifacts.get("request_json") or {},
+            "srt_filename": srt_filename,
+            "hardburn_video_filename": hardburn_video_filename,
+        },
+        cost_usd=0.0,
+        error_type="",
+        error_message="",
+        idempotency_key=f"video:hardburn:{body.job_id}:{hardburn_video_filename}",
+    )
 
     merged_script = _merge_script_json_with_media_names(
         existing_script_json,
-        video_filename=normalized_video_filename,
+        video_filename=hardburn_video_filename,
         generated_content_id=generated_content_id if generated_content_id else None,
         generated_content_error=generated_content_error,
     )
-    video_storage_url = stored.s3_uri
+    media_names = merged_script.get("media_names") if isinstance(merged_script.get("media_names"), dict) else {}
+    media_names["raw_video_filename"] = normalized_video_filename
+    media_names["hardburn_video_filename"] = hardburn_video_filename
+    media_names["srt_filename"] = srt_filename
+    merged_script["media_names"] = media_names
+    merged_script["video_assets"] = {
+        "raw_video_s3_uri": raw_stored.s3_uri,
+        "hardburn_video_s3_uri": hardburn_stored.s3_uri,
+        "srt_s3_uri": srt_stored.s3_uri,
+        "preview_asset": "hardburn",
+        "publish_asset": "hardburn",
+    }
+    merged_script["video_hardburn"] = {
+        "status": "ready",
+        "error": "",
+        "raw_video_s3_uri": raw_stored.s3_uri,
+        "hardburn_video_s3_uri": hardburn_stored.s3_uri,
+        "srt_s3_uri": srt_stored.s3_uri,
+        "subtitle_sha256": caption_artifacts.get("subtitle_sha256"),
+        "cue_count": caption_artifacts.get("display_sentence_count"),
+        "asr_model": caption_artifacts.get("asr_model"),
+        "matched_sentence_count": caption_artifacts.get("matched_sentence_count"),
+        "word_count": caption_artifacts.get("word_count"),
+        "alignment_status": caption_artifacts.get("alignment_status"),
+        "request_json": caption_artifacts.get("request_json") or {},
+    }
+    video_storage_url = hardburn_stored.s3_uri
     await job_service.update_job(
         body.job_id,
         confirm_message_id=message_id,
@@ -3815,9 +4291,13 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     return {
         "job_id": body.job_id,
         "message_id": message_id,
-        "video_filename": normalized_video_filename,
-        "video_url": stored.presigned_url,
+        "video_filename": hardburn_video_filename,
+        "video_url": hardburn_stored.presigned_url,
         "s3_uri": video_storage_url,
+        "raw_s3_uri": raw_stored.s3_uri,
+        "hardburn_s3_uri": hardburn_stored.s3_uri,
+        "srt_s3_uri": srt_stored.s3_uri,
+        "preview_asset_type": "hardburn",
     }
 
 

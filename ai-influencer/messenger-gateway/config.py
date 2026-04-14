@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     tts_fixed_seeds: str = ""
     tts_opening_audio_path: str = ""
     tts_ending_audio_path: str = ""
+    tts_opening_gap_seconds: float = 0.5
+    tts_ending_gap_seconds: float = 0.5
     tts_concat_retries: int = 2
     heygen_api_key: str = ""
     heygen_avatar_id: str = ""
@@ -58,6 +60,7 @@ class Settings(BaseSettings):
     heygen_mock_video_url: str = "https://samplelib.com/lib/preview/mp4/sample-5s.mp4"
     heygen_pipeline_service_url: str = "http://heygen-pipeline-service:8100"
     heygen_pipeline_service_timeout_seconds: float = 120.0
+    sns_publisher_service_url: str = "http://sns-publisher-service:8200"
 
     # Cross-account S3 (AssumeRole)
     media_s3_bucket: str = ""
@@ -75,6 +78,8 @@ class Settings(BaseSettings):
     media_s3_prefix_scripts: str = "scripts"
     media_s3_prefix_tts: str = "tts"
     media_s3_prefix_videos: str = "videos"
+    media_s3_prefix_srt: str = "srt"
+    media_s3_prefix_videos_with_subtitle: str = "Video_with_Subtitle"
 
     # Cost tracking
     cost_viewer_basic_user: str = ""
