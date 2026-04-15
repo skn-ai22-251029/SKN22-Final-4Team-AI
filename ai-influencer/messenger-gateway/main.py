@@ -57,6 +57,9 @@ from models.job import (
     SendVideoPreviewRequest,
     TtsActionRequest,
     VideoActionRequest,
+    Wf13RunBatchRequest,
+    Wf13PreflightRequest,
+    Wf13RunJobRequest,
 )
 from services import cost_service, job_service, n8n_service
 
@@ -72,6 +75,10 @@ _discord_adapter: Optional[DiscordAdapter] = None
 _DISCORD_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
 _HEYGEN_REQUEST_TIMEOUT_SECONDS = 30.0
 _TTS_VARIANT_COUNT = 3
+_WF13_TTS_MAX_ATTEMPTS = 3
+_WF13_TTS_RETRY_BACKOFF_SECONDS = (20, 60)
+_WF13_PUBLISH_MAX_ATTEMPTS = 3
+_WF13_PUBLISH_RETRY_BACKOFF_SECONDS = (10, 30)
 _HEYGEN_AVATAR_OPTION_COUNT = 6
 _HEYGEN_AVATAR_LABEL_PREFIX_LEN = 6
 _http_basic = HTTPBasic()
@@ -92,6 +99,27 @@ _HARDBURN_FORCE_STYLE = (
     "MarginV=30,"
     "Alignment=2"
 )
+
+
+class Wf13PipelineError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "",
+        failure_stage: str = "",
+        retryable: bool = False,
+        should_stop_workflow: bool = False,
+        blocked_reason: str = "",
+        user_notified: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = str(error_type or "").strip()
+        self.failure_stage = str(failure_stage or "").strip()
+        self.retryable = bool(retryable)
+        self.should_stop_workflow = bool(should_stop_workflow)
+        self.blocked_reason = str(blocked_reason or "").strip()
+        self.user_notified = bool(user_notified)
 
 
 def _ffmpeg_filter_escape(value: str) -> str:
@@ -301,6 +329,32 @@ async def _heygen_get_json(path: str, *, base_url: Optional[str] = None) -> dict
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="HeyGen API returned a non-JSON response")
     return payload
+
+
+async def _heygen_post_json(path: str, *, payload: dict[str, Any], base_url: Optional[str] = None) -> dict:
+    if _http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client is not initialized")
+    target_base = (base_url or settings.heygen_api_base_url).rstrip("/")
+    url = f"{target_base}/{path.lstrip('/')}"
+    try:
+        resp = await _http_client.post(
+            url,
+            headers={**_heygen_api_headers(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=max(_HEYGEN_REQUEST_TIMEOUT_SECONDS, 300.0),
+        )
+        resp.raise_for_status()
+        response_payload = resp.json()
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text.strip() or str(e)
+        raise HTTPException(status_code=502, detail=f"HeyGen API request failed: {detail}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"HeyGen API request failed: {e}") from e
+    if not isinstance(response_payload, dict):
+        raise HTTPException(status_code=502, detail="HeyGen API returned a non-JSON response")
+    return response_payload
 
 
 def _as_script_json(value: object) -> dict:
@@ -594,6 +648,55 @@ def _get_tts_downstream_intent(script_json: dict) -> str:
     return intent or "tts_only"
 
 
+def _get_wf13_state(script_json: dict) -> dict[str, Any]:
+    raw = script_json.get("wf13_auto")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _merge_script_json_with_wf13_state(
+    existing: object,
+    *,
+    state: str,
+    seed: int,
+    avatar_id: str,
+    use_avatar_iv_model: bool,
+    targets: list[str],
+    last_completed_stage: str = "",
+    last_error: str = "",
+    retryable: Optional[bool] = None,
+    blocked_reason: str = "",
+    tts_attempts: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    merged = _as_script_json(existing)
+    wf13_state = _get_wf13_state(merged)
+    wf13_state["state"] = state
+    wf13_state["seed"] = int(seed)
+    wf13_state["avatar_id"] = str(avatar_id or "").strip()
+    wf13_state["use_avatar_iv_model"] = bool(use_avatar_iv_model)
+    wf13_state["targets"] = [str(target).strip().lower() for target in targets if str(target).strip()]
+    if not wf13_state.get("started_at"):
+        wf13_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    if last_completed_stage:
+        wf13_state["last_completed_stage"] = last_completed_stage
+    if last_error:
+        wf13_state["last_error"] = str(last_error)
+        wf13_state.pop("finished_at", None)
+    else:
+        wf13_state["last_error"] = ""
+        if state in {"completed", "skipped"}:
+            wf13_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+    if retryable is not None:
+        wf13_state["retryable"] = bool(retryable)
+    if blocked_reason:
+        wf13_state["blocked_reason"] = str(blocked_reason)
+    elif state != "blocked":
+        wf13_state.pop("blocked_reason", None)
+    if tts_attempts is not None:
+        wf13_state["tts_attempts"] = list(tts_attempts)
+    merged["wf13_auto"] = wf13_state
+    return merged
+
+
 def _get_subtitle_script_text(script_json: dict) -> str:
     return (
         script_json.get("subtitle_script_text")
@@ -842,6 +945,796 @@ async def _build_caption_artifacts(
     return payload
 
 
+async def _wf13_notify(channel_id: str, text: str) -> None:
+    try:
+        await _discord_adapter.send_text_message(channel_id, text)
+    except Exception as e:
+        logger.warning("[wf13] notify failed channel=%s err=%s", channel_id, e)
+
+
+def _wf13_distinct_channel_ids(raw_channel_ids: list[str]) -> list[str]:
+    channel_ids: list[str] = []
+    for raw in raw_channel_ids or []:
+        value = str(raw or "").strip()
+        if value and value not in channel_ids:
+            channel_ids.append(value)
+    return channel_ids
+
+
+def _wf13_extract_heygen_api_quota(payload: dict[str, Any]) -> Optional[float]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    details = data.get("details") if isinstance(data.get("details"), dict) else {}
+    for candidate in (details.get("api"), data.get("remaining_quota")):
+        try:
+            if candidate is None or candidate == "":
+                continue
+            return float(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _wf13_is_heygen_quota_error(detail: str) -> bool:
+    normalized = (detail or "").lower()
+    return "movio_payment_insufficient_credit" in normalized or "insufficient credit" in normalized
+
+
+def _wf13_should_retry_tts_error(detail: str) -> bool:
+    error_type = _extract_tts_error_type(detail)
+    status_code = _extract_http_status_code_from_tts_error(detail)
+    return error_type == "tts_network_error" or status_code in {408, 429, 502, 503, 504, 524}
+
+
+def _wf13_extract_publish_error(result_payload: dict[str, Any]) -> str:
+    if not isinstance(result_payload, dict):
+        return ""
+    results = result_payload.get("results") if isinstance(result_payload.get("results"), dict) else {}
+    youtube = results.get("youtube") if isinstance(results.get("youtube"), dict) else {}
+    for candidate in (youtube.get("error_message"), result_payload.get("summary_text")):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _wf13_is_upload_limit_error(detail: str) -> bool:
+    normalized = (detail or "").lower()
+    return (
+        "uploadlimitexceeded" in normalized
+        or "the user has exceeded the number of videos they may upload" in normalized
+    )
+
+
+def _wf13_is_transient_publish_error(detail: str, *, status_code: Optional[int] = None) -> bool:
+    normalized = (detail or "").lower()
+    transient_markers = (
+        "backenderror",
+        "internalerror",
+        "ratelimitexceeded",
+        "too many requests",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection lost",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    )
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
+    return any(marker in normalized for marker in transient_markers)
+
+
+async def _wf13_notify_publish_limit(channel_id: str, job_id: str, video_url: str) -> None:
+    await _wf13_notify(
+        channel_id,
+        "\n".join(
+            [
+                "🎬 WF-13 자동 영상 생성은 완료되었습니다.",
+                "",
+                video_url,
+                "",
+                "⚠️ YouTube 자동업로드는 한도 초과로 실패했습니다.",
+                f"Job ID: {job_id[:8]}",
+            ]
+        ),
+    )
+
+
+async def _wf13_check_heygen_quota(*, channel_ids: list[str], notify: bool) -> dict[str, Any]:
+    payload = await _heygen_get_json("/v2/user/remaining_quota")
+    api_quota = _wf13_extract_heygen_api_quota(payload)
+    ok = api_quota is None or api_quota > 0
+    notified_channel_ids: list[str] = []
+    blocked_reason = ""
+    if not ok:
+        blocked_reason = "heygen_insufficient_credit"
+        if notify:
+            message = "⚠️ WF-13 자동 영상 생성이 중단되었습니다. HeyGen API credit이 부족합니다. 충전 후 다시 실행해야 합니다."
+            for channel_id in _wf13_distinct_channel_ids(channel_ids):
+                await _wf13_notify(channel_id, message)
+                notified_channel_ids.append(channel_id)
+    return {
+        "ok": ok,
+        "blocked_reason": blocked_reason,
+        "remaining_quota": api_quota,
+        "api_quota": api_quota,
+        "notified_channel_ids": notified_channel_ids,
+        "raw": payload,
+    }
+
+
+async def _list_wf13_candidate_jobs() -> list[dict[str, Any]]:
+    pool = await job_service.get_db_pool()
+    rows = await pool.fetch(
+        """
+        SELECT
+            j.id::text AS job_id,
+            COALESCE(j.messenger_channel_id, '') AS channel_id,
+            COALESCE(j.status, '') AS status,
+            COALESCE(j.script_json->'wf13_auto'->>'state', '') AS wf13_state,
+            j.created_at
+        FROM jobs j
+        WHERE j.messenger_user_id = 'system:auto-report'
+          AND COALESCE(j.status, '') IN ('PUBLISHED', 'PUBLISH_FAILED')
+          AND COALESCE(j.script_json->>'subtitle_script_text', '') <> ''
+          AND COALESCE(j.script_json->>'tts_script_text', '') <> ''
+          AND j.created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Seoul') AT TIME ZONE 'Asia/Seoul')
+          AND j.created_at < ((date_trunc('day', now() AT TIME ZONE 'Asia/Seoul') + interval '1 day') AT TIME ZONE 'Asia/Seoul')
+          AND COALESCE(j.script_json->'wf13_auto'->>'state', '') NOT IN ('running_tts', 'running_video', 'running_publish', 'completed', 'skipped')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM platform_posts p
+            WHERE p.job_id = j.id
+              AND p.platform = 'youtube'
+              AND COALESCE(p.status, '') = 'published'
+          )
+          AND (COALESCE(j.status, '') <> 'PUBLISH_FAILED' OR COALESCE(j.script_json->'wf13_auto'->>'state', '') IN ('failed', 'blocked'))
+        ORDER BY j.created_at ASC, j.id ASC
+        """
+    )
+    return [dict(row) for row in rows]
+
+
+async def _generate_fixed_seed_tts_for_job(
+    *,
+    job_id: str,
+    existing_job: dict[str, Any],
+    script_json: dict[str, Any],
+    seed: int,
+    avatar_id: str,
+    use_avatar_iv_model: bool,
+    targets: list[str],
+) -> dict[str, Any]:
+    body_script_text = _get_tts_script_text(script_json)
+    if not body_script_text:
+        raise RuntimeError("tts_script_text is missing")
+    body_script_text, removed_opening, removed_ending = _strip_fixed_intro_outro_lines(body_script_text)
+    if not body_script_text:
+        raise RuntimeError("tts body script is empty after removing fixed opening/ending lines")
+
+    tts_attempts: list[dict[str, Any]] = []
+    body_audio_bytes: bytes | None = None
+    last_tts_error: Optional[Exception] = None
+    for attempt_no in range(1, _WF13_TTS_MAX_ATTEMPTS + 1):
+        attempt_started_at = datetime.now(timezone.utc)
+        try:
+            body_audio_bytes = await _generate_tts_audio_content(job_id, body_script_text, seed=seed)
+            tts_attempts.append(
+                {
+                    "attempt_no": attempt_no,
+                    "status": "success",
+                    "error_type": "",
+                    "status_code": 200,
+                    "started_at": attempt_started_at.isoformat(),
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            break
+        except Exception as e:
+            detail = str(e)
+            status_code = _extract_http_status_code_from_tts_error(detail)
+            error_type = _extract_tts_error_type(detail)
+            tts_attempts.append(
+                {
+                    "attempt_no": attempt_no,
+                    "status": "failed",
+                    "error_type": error_type,
+                    "status_code": status_code,
+                    "started_at": attempt_started_at.isoformat(),
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            last_tts_error = e
+            if attempt_no >= _WF13_TTS_MAX_ATTEMPTS or not _wf13_should_retry_tts_error(detail):
+                break
+            backoff_seconds = _WF13_TTS_RETRY_BACKOFF_SECONDS[min(attempt_no - 1, len(_WF13_TTS_RETRY_BACKOFF_SECONDS) - 1)]
+            logger.warning(
+                "[wf13] retrying TTS job_id=%s attempt=%s/%s wait=%ss err=%s",
+                job_id,
+                attempt_no,
+                _WF13_TTS_MAX_ATTEMPTS,
+                backoff_seconds,
+                detail,
+            )
+            await asyncio.sleep(backoff_seconds)
+    if body_audio_bytes is None:
+        detail = str(last_tts_error or "unknown tts error")
+        raise Wf13PipelineError(
+            detail,
+            error_type=_extract_tts_error_type(detail),
+            failure_stage="tts",
+            retryable=_wf13_should_retry_tts_error(detail),
+            should_stop_workflow=False,
+        )
+
+    audio_bytes, concat_attempts, body_audio_spec, final_audio_spec, tts_timing = await _concat_tts_audio_with_fixed_clips(
+        body_audio_bytes
+    )
+    filename = _normalize_audio_filename(job_id, None, script_json)
+    stored = put_bytes_and_presign(
+        prefix=settings.media_s3_prefix_tts,
+        filename=filename,
+        content=audio_bytes,
+        content_type="audio/wav",
+    )
+    merged_script = _merge_script_json_with_media_names(
+        script_json,
+        audio_filename=filename,
+        tts_script_text=body_script_text,
+        tts_error_type="",
+        tts_error_detail="",
+    )
+    merged_script["selected_tts_seed"] = int(seed)
+    merged_script["selected_tts_timing"] = dict(tts_timing or {})
+    merged_script["tts_seed_strategy"] = "wf13_fixed"
+    merged_script["tts_seed_values"] = [int(seed)]
+    merged_script["tts_body_script_text"] = body_script_text
+    merged_script["tts_fixed_clips_enabled"] = True
+    merged_script["tts_fixed_clips_removed_opening"] = removed_opening
+    merged_script["tts_fixed_clips_removed_ending"] = removed_ending
+    merged_script["tts_downstream_intent"] = "wf13_auto"
+    merged_script = _merge_script_json_with_wf13_state(
+        merged_script,
+        state="tts_done",
+        seed=seed,
+        avatar_id=avatar_id,
+        use_avatar_iv_model=use_avatar_iv_model,
+        targets=targets,
+        last_completed_stage="tts",
+        last_error="",
+        retryable=False,
+        tts_attempts=tts_attempts,
+    )
+    await job_service.update_job(
+        job_id,
+        audio_url=stored.s3_uri,
+        final_url=stored.s3_uri,
+        error_message="",
+        script_json=merged_script,
+    )
+    return {
+        "audio_s3_uri": stored.s3_uri,
+        "audio_url": stored.presigned_url,
+        "audio_filename": filename,
+        "selected_tts_seed": int(seed),
+        "selected_tts_timing": dict(tts_timing or {}),
+        "tts_concat_attempts": int(concat_attempts),
+        "tts_body_audio_spec": body_audio_spec,
+        "tts_final_audio_spec": final_audio_spec,
+        "tts_attempts": tts_attempts,
+    }
+
+
+async def _run_wf13_heygen_generate(
+    *,
+    job_id: str,
+    channel_id: str,
+    user_id: str,
+    audio_url: str,
+    avatar_id: str,
+    use_avatar_iv_model: bool,
+) -> dict[str, Any]:
+    if not audio_url:
+        raise RuntimeError("audio_url is required")
+    if not avatar_id:
+        raise RuntimeError("avatar_id is required")
+
+    avatar_payload = await _heygen_get_json(f"/v2/avatar/{avatar_id}/details")
+    avatar_data = avatar_payload.get("data") if isinstance(avatar_payload.get("data"), dict) else {}
+    avatar_type = str(avatar_data.get("type") or avatar_data.get("avatar", {}).get("type") or "avatar")
+    applied_avatar_iv_model = avatar_type == "talking_photo" and bool(use_avatar_iv_model)
+    character = (
+        {
+            "type": "talking_photo",
+            "talking_photo_id": avatar_id,
+            **({"use_avatar_iv_model": True} if applied_avatar_iv_model else {}),
+        }
+        if avatar_type == "talking_photo"
+        else {
+            "type": "avatar",
+            "avatar_id": avatar_id,
+            "avatar_style": "normal",
+        }
+    )
+    request_snapshot = {
+        "avatar_id": avatar_id,
+        "use_avatar_iv_model": applied_avatar_iv_model,
+        "voice_type": "audio",
+        "has_audio_url": bool(audio_url),
+        "audio_url_host": (lambda value: (value.split("/")[2] if "://" in value else ""))(audio_url),
+        "speed": float(settings.heygen_speed),
+        "dimension": {"width": int(settings.heygen_video_width), "height": int(settings.heygen_video_height)},
+        "caption": bool(settings.heygen_caption_enabled),
+    }
+    payload = {
+        "video_inputs": [
+            {
+                "character": character,
+                "voice": {
+                    "type": "audio",
+                    "audio_url": audio_url,
+                    "speed": float(settings.heygen_speed),
+                },
+            }
+        ],
+        "dimension": {"width": int(settings.heygen_video_width), "height": int(settings.heygen_video_height)},
+        "caption": bool(settings.heygen_caption_enabled),
+    }
+    create_started_at = datetime.now(timezone.utc)
+    try:
+        response_payload = await _heygen_post_json("/v2/video/generate", payload=payload)
+    except Exception as e:
+        detail = str(e)
+        if _wf13_is_heygen_quota_error(detail):
+            raise Wf13PipelineError(
+                detail,
+                error_type="heygen_insufficient_credit",
+                failure_stage="video",
+                retryable=False,
+                should_stop_workflow=True,
+                blocked_reason="heygen_insufficient_credit",
+            ) from e
+        raise
+    video_id = str((response_payload.get("data") or {}).get("video_id") or "").strip()
+    if not video_id:
+        raise RuntimeError(f"HeyGen create returned no video_id: {response_payload}")
+
+    poll_deadline = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(settings.heygen_max_wait_seconds)))
+    video_url = ""
+    status_value = "processing"
+    poll_payload: dict[str, Any] = {}
+    while datetime.now(timezone.utc) < poll_deadline:
+        await asyncio.sleep(max(1, int(settings.heygen_poll_interval_seconds)))
+        poll_payload = await _heygen_get_json(f"/v1/video_status.get?video_id={video_id}")
+        poll_data = poll_payload.get("data") if isinstance(poll_payload.get("data"), dict) else {}
+        status_value = str(poll_data.get("status") or "processing").strip().lower()
+        if status_value == "completed":
+            video_url = str(poll_data.get("video_url") or "").strip()
+            break
+        if status_value == "failed":
+            error_obj = poll_data.get("error")
+            detail = f"HeyGen failed: {json.dumps(error_obj, ensure_ascii=False) if error_obj is not None else status_value}"
+            if _wf13_is_heygen_quota_error(detail):
+                raise Wf13PipelineError(
+                    detail,
+                    error_type="heygen_insufficient_credit",
+                    failure_stage="video",
+                    retryable=False,
+                    should_stop_workflow=True,
+                    blocked_reason="heygen_insufficient_credit",
+                )
+            raise RuntimeError(detail)
+    if not video_url:
+        raise RuntimeError(f"HeyGen video generation incomplete: {status_value}")
+
+    await _record_cost_event_safe(
+        job_id=job_id,
+        topic_text="",
+        stage="video",
+        process="heygen_generate",
+        provider="heygen",
+        attempt_no=1,
+        status="success",
+        started_at=create_started_at,
+        ended_at=datetime.now(timezone.utc),
+        usage_json={
+            "video_id": video_id,
+            "avatar_id": avatar_id,
+            "use_avatar_iv_model": applied_avatar_iv_model,
+            "status": status_value,
+        },
+        raw_response_json={
+            "request_snapshot": request_snapshot,
+            "create_response": response_payload,
+            "poll_response": poll_payload,
+        },
+        cost_usd=_estimate_heygen_cost_usd(None),
+        error_type="",
+        error_message="",
+        idempotency_key=f"wf13:heygen:{job_id}:{video_id}",
+    )
+    kst_date = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d")
+    return {
+        "job_id": job_id,
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "video_url": video_url,
+        "video_id": video_id,
+        "video_filename": f"{kst_date}-{job_id}.mp4",
+        "avatar_id": avatar_id,
+        "use_avatar_iv_model": applied_avatar_iv_model,
+        "status": status_value,
+        "request_snapshot": request_snapshot,
+        "response_snapshot": poll_payload or response_payload,
+    }
+
+
+async def _finalize_video_auto(
+    *,
+    job_id: str,
+    video_url: str,
+    video_filename: str,
+    heygen_status: str,
+    heygen_video_id: str,
+    heygen_avatar_id: str,
+    heygen_use_avatar_iv_model: bool,
+    heygen_request_snapshot: dict[str, Any],
+    heygen_response_snapshot: dict[str, Any],
+    seed: int,
+    avatar_id: str,
+    use_avatar_iv_model: bool,
+    targets: list[str],
+) -> dict[str, Any]:
+    existing_job = await job_service.get_job(job_id)
+    if existing_job is None:
+        raise RuntimeError("Job not found")
+    existing_script_json = _as_script_json(existing_job.get("script_json"))
+    normalized_video_filename = _normalize_video_filename(job_id, video_filename, existing_script_json)
+    hardburn_video_filename = _build_hardburn_video_filename(normalized_video_filename)
+    srt_filename = _build_srt_filename(normalized_video_filename)
+
+    video_resp = await _http_client.get(video_url, timeout=300.0)
+    video_resp.raise_for_status()
+    raw_stored = put_bytes_and_presign(
+        prefix=settings.media_s3_prefix_videos,
+        filename=normalized_video_filename,
+        content=video_resp.content,
+        content_type=video_resp.headers.get("content-type") or "video/mp4",
+    )
+    subtitle_script_text = _get_subtitle_script_text(existing_script_json)
+    tts_script_text = _get_tts_script_text(existing_script_json)
+    audio_url = str(existing_job.get("audio_url") or "").strip()
+    caption_artifacts = await _build_caption_artifacts(
+        job_id=job_id,
+        audio_url=audio_url,
+        subtitle_script_text=subtitle_script_text,
+        tts_script_text=tts_script_text,
+    )
+    srt_content = str(caption_artifacts.get("srt_content") or "")
+    srt_stored = put_bytes_and_presign(
+        prefix=settings.media_s3_prefix_srt,
+        filename=srt_filename,
+        content=srt_content.encode("utf-8"),
+        content_type="application/x-subrip; charset=utf-8",
+    )
+    hardburn_video_bytes = await asyncio.to_thread(
+        _render_hardburn_video_sync,
+        raw_video_bytes=video_resp.content,
+        srt_content=srt_content,
+    )
+    hardburn_stored = put_bytes_and_presign(
+        prefix=settings.media_s3_prefix_videos_with_subtitle,
+        filename=hardburn_video_filename,
+        content=hardburn_video_bytes,
+        content_type="video/mp4",
+    )
+    generated_content_id, generated_content_error = await _register_generated_content(
+        job_id=job_id,
+        script_text=subtitle_script_text,
+        content_url=hardburn_stored.s3_uri,
+    )
+    await _record_cost_event_safe(
+        job_id=job_id,
+        topic_text=str(existing_job.get("concept_text") or ""),
+        stage="video",
+        process="hardburn_subtitle",
+        provider="ffmpeg",
+        attempt_no=1,
+        status="success",
+        started_at=datetime.now(timezone.utc),
+        ended_at=datetime.now(timezone.utc),
+        usage_json={
+            "preview_asset": "hardburn",
+            "publish_asset": "hardburn",
+            "subtitle_sha256": caption_artifacts.get("subtitle_sha256"),
+            "asr_model": caption_artifacts.get("asr_model"),
+            "word_count": caption_artifacts.get("word_count"),
+            "matched_sentence_count": caption_artifacts.get("matched_sentence_count"),
+            "raw_video_bytes": len(video_resp.content),
+            "hardburn_video_bytes": len(hardburn_video_bytes),
+        },
+        raw_response_json={
+            "caption_request_json": caption_artifacts.get("request_json") or {},
+            "srt_filename": srt_filename,
+            "hardburn_video_filename": hardburn_video_filename,
+        },
+        cost_usd=0.0,
+        error_type="",
+        error_message="",
+        idempotency_key=f"wf13:hardburn:{job_id}:{hardburn_video_filename}",
+    )
+    merged_script = _merge_script_json_with_media_names(
+        existing_script_json,
+        video_filename=hardburn_video_filename,
+        generated_content_id=generated_content_id if generated_content_id else None,
+        generated_content_error=generated_content_error,
+    )
+    media_names = merged_script.get("media_names") if isinstance(merged_script.get("media_names"), dict) else {}
+    media_names["raw_video_filename"] = normalized_video_filename
+    media_names["hardburn_video_filename"] = hardburn_video_filename
+    media_names["srt_filename"] = srt_filename
+    merged_script["media_names"] = media_names
+    merged_script["video_assets"] = {
+        "raw_video_s3_uri": raw_stored.s3_uri,
+        "hardburn_video_s3_uri": hardburn_stored.s3_uri,
+        "srt_s3_uri": srt_stored.s3_uri,
+        "preview_asset": "hardburn",
+        "publish_asset": "hardburn",
+    }
+    merged_script["video_hardburn"] = {
+        "status": "ready",
+        "error": "",
+        "raw_video_s3_uri": raw_stored.s3_uri,
+        "hardburn_video_s3_uri": hardburn_stored.s3_uri,
+        "srt_s3_uri": srt_stored.s3_uri,
+        "subtitle_sha256": caption_artifacts.get("subtitle_sha256"),
+        "cue_count": caption_artifacts.get("cue_count") or caption_artifacts.get("display_sentence_count"),
+        "asr_model": caption_artifacts.get("asr_model"),
+        "matched_sentence_count": caption_artifacts.get("matched_sentence_count"),
+        "word_count": caption_artifacts.get("word_count"),
+    }
+    merged_script = _merge_script_json_with_wf13_state(
+        merged_script,
+        state="video_ready",
+        seed=seed,
+        avatar_id=avatar_id,
+        use_avatar_iv_model=use_avatar_iv_model,
+        targets=targets,
+        last_completed_stage="video",
+        last_error="",
+    )
+    await job_service.update_job(
+        job_id,
+        final_url=hardburn_stored.s3_uri,
+        video_url=hardburn_stored.s3_uri,
+        error_message="",
+        script_json=merged_script,
+    )
+    return {
+        "video_url": hardburn_stored.presigned_url,
+        "video_s3_uri": hardburn_stored.s3_uri,
+        "video_filename": hardburn_video_filename,
+        "srt_s3_uri": srt_stored.s3_uri,
+        "raw_video_s3_uri": raw_stored.s3_uri,
+        "audio_url": _resolve_internal_media_url(audio_url),
+        "subtitle_script_text": subtitle_script_text,
+        "title": _build_publish_title(job_id, hardburn_video_filename, subtitle_script_text, str(existing_job.get("concept_text") or "")),
+        "description": _build_publish_description(subtitle_script_text),
+        "caption": _build_publish_caption(subtitle_script_text),
+        "heygen_status": heygen_status,
+        "heygen_video_id": heygen_video_id,
+        "heygen_avatar_id": heygen_avatar_id,
+        "heygen_use_avatar_iv_model": heygen_use_avatar_iv_model,
+        "heygen_request_snapshot": heygen_request_snapshot,
+        "heygen_response_snapshot": heygen_response_snapshot,
+    }
+
+
+async def _publish_auto_video(
+    *,
+    job_id: str,
+    channel_id: str,
+    video_url: str,
+    audio_url: str,
+    video_filename: str,
+    title: str,
+    description: str,
+    caption: str,
+    subtitle_script_text: str,
+) -> dict[str, Any]:
+    service_base_url = settings.sns_publisher_service_url.rstrip("/")
+    if not service_base_url:
+        raise RuntimeError("SNS_PUBLISHER_SERVICE_URL is not configured")
+    await job_service.transition_status(job_id, "PUBLISHING")
+    resp = await _http_client.post(
+        f"{service_base_url}/publish",
+        json={
+            "job_id": job_id,
+            "video_url": video_url,
+            "audio_url": audio_url,
+            "targets": ["youtube"],
+            "title": title,
+            "description": description,
+            "caption": caption,
+            "subtitle_script_text": subtitle_script_text,
+            "video_filename": video_filename,
+        },
+        timeout=300.0,
+    )
+    resp.raise_for_status()
+    payload = resp.json() if resp.content else {}
+    final_status = str(payload.get("final_status") or "PUBLISH_FAILED").strip() or "PUBLISH_FAILED"
+    summary_text = str(payload.get("summary_text") or "").strip()
+    await job_service.transition_status(job_id, final_status)
+    return {
+        "final_status": final_status,
+        "summary_text": summary_text,
+        "response_json": payload,
+    }
+
+
+async def _wf13_publish_auto_with_retry(
+    *,
+    job_id: str,
+    channel_id: str,
+    video_url: str,
+    audio_url: str,
+    video_filename: str,
+    title: str,
+    description: str,
+    caption: str,
+    subtitle_script_text: str,
+    script_json: dict[str, Any],
+    seed: int,
+    avatar_id: str,
+    use_avatar_iv_model: bool,
+    targets: list[str],
+) -> dict[str, Any]:
+    publish_attempts: list[dict[str, Any]] = []
+    last_error_message = ""
+    last_status_code: Optional[int] = None
+
+    async def _persist_publish_attempts() -> None:
+        merged_script = _merge_script_json_with_wf13_state(
+            script_json,
+            state="running_publish",
+            seed=seed,
+            avatar_id=avatar_id,
+            use_avatar_iv_model=use_avatar_iv_model,
+            targets=targets,
+            last_error="",
+        )
+        wf13_state = _get_wf13_state(merged_script)
+        wf13_state["publish_attempts"] = publish_attempts
+        merged_script["wf13_auto"] = wf13_state
+        await job_service.update_job(job_id, script_json=merged_script, error_message="")
+
+    for attempt_no in range(1, _WF13_PUBLISH_MAX_ATTEMPTS + 1):
+        attempt_started_at = datetime.now(timezone.utc)
+        try:
+            result = await _publish_auto_video(
+                job_id=job_id,
+                channel_id=channel_id,
+                video_url=video_url,
+                audio_url=audio_url,
+                video_filename=video_filename,
+                title=title,
+                description=description,
+                caption=caption,
+                subtitle_script_text=subtitle_script_text,
+            )
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            detail = str(e)
+            publish_attempts.append(
+                {
+                    "attempt_no": attempt_no,
+                    "status": "failed",
+                    "status_code": status_code,
+                    "error_message": _clip(detail, limit=220),
+                    "started_at": attempt_started_at.isoformat(),
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await _persist_publish_attempts()
+            last_error_message = detail
+            last_status_code = status_code
+            if attempt_no >= _WF13_PUBLISH_MAX_ATTEMPTS or not _wf13_is_transient_publish_error(detail, status_code=status_code):
+                break
+            backoff_seconds = _WF13_PUBLISH_RETRY_BACKOFF_SECONDS[min(attempt_no - 1, len(_WF13_PUBLISH_RETRY_BACKOFF_SECONDS) - 1)]
+            logger.warning(
+                "[wf13] retrying publish job_id=%s attempt=%s/%s wait=%ss err=%s",
+                job_id,
+                attempt_no,
+                _WF13_PUBLISH_MAX_ATTEMPTS,
+                backoff_seconds,
+                detail,
+            )
+            await asyncio.sleep(backoff_seconds)
+            continue
+        except httpx.RequestError as e:
+            detail = str(e)
+            publish_attempts.append(
+                {
+                    "attempt_no": attempt_no,
+                    "status": "failed",
+                    "status_code": None,
+                    "error_message": _clip(detail, limit=220),
+                    "started_at": attempt_started_at.isoformat(),
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await _persist_publish_attempts()
+            last_error_message = detail
+            last_status_code = None
+            if attempt_no >= _WF13_PUBLISH_MAX_ATTEMPTS:
+                break
+            backoff_seconds = _WF13_PUBLISH_RETRY_BACKOFF_SECONDS[min(attempt_no - 1, len(_WF13_PUBLISH_RETRY_BACKOFF_SECONDS) - 1)]
+            logger.warning(
+                "[wf13] retrying publish request job_id=%s attempt=%s/%s wait=%ss err=%s",
+                job_id,
+                attempt_no,
+                _WF13_PUBLISH_MAX_ATTEMPTS,
+                backoff_seconds,
+                detail,
+            )
+            await asyncio.sleep(backoff_seconds)
+            continue
+
+        detail = _wf13_extract_publish_error(result.get("response_json") if isinstance(result.get("response_json"), dict) else {})
+        final_status = str(result.get("final_status") or "").strip().upper()
+        publish_attempts.append(
+            {
+                "attempt_no": attempt_no,
+                "status": "success" if final_status == "PUBLISHED" else "failed",
+                "status_code": None,
+                "error_message": _clip(detail, limit=220),
+                "started_at": attempt_started_at.isoformat(),
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await _persist_publish_attempts()
+        if final_status == "PUBLISHED":
+            return result
+        if _wf13_is_upload_limit_error(detail):
+            raise Wf13PipelineError(
+                detail or "YouTube upload limit exceeded",
+                error_type="youtube_upload_limit_exceeded",
+                failure_stage="publish",
+                retryable=False,
+                should_stop_workflow=False,
+            )
+        if attempt_no >= _WF13_PUBLISH_MAX_ATTEMPTS or not _wf13_is_transient_publish_error(detail):
+            raise Wf13PipelineError(
+                detail or "YouTube publish failed",
+                error_type="youtube_publish_failed",
+                failure_stage="publish",
+                retryable=False,
+                should_stop_workflow=False,
+            )
+        backoff_seconds = _WF13_PUBLISH_RETRY_BACKOFF_SECONDS[min(attempt_no - 1, len(_WF13_PUBLISH_RETRY_BACKOFF_SECONDS) - 1)]
+        logger.warning(
+            "[wf13] retrying publish result job_id=%s attempt=%s/%s wait=%ss err=%s",
+            job_id,
+            attempt_no,
+            _WF13_PUBLISH_MAX_ATTEMPTS,
+            backoff_seconds,
+            detail,
+        )
+        await asyncio.sleep(backoff_seconds)
+
+    raise Wf13PipelineError(
+        last_error_message or "YouTube publish failed",
+        error_type="youtube_publish_failed",
+        failure_stage="publish",
+        retryable=False,
+        should_stop_workflow=False,
+    )
+
+
 async def _resolve_heygen_avatar_id(_: dict) -> tuple[str, str]:
     # 기본 avatar fallback은 env 첫 번째 항목을 사용한다.
     # 실제 WF-12 승인 경로에서는 반드시 사용자가 선택한 avatar를 사용한다.
@@ -1059,9 +1952,13 @@ def _classify_tts_error(detail: str, *, status_code: Optional[int] = None) -> st
     network_markers = (
         "name or service not known",
         "temporary failure in name resolution",
+        "network connection lost",
         "connecterror",
         "connection refused",
         "connection reset",
+        "socket hang up",
+        "upstream connect error",
+        "temporarily unavailable",
         "timed out",
         "readtimeout",
         "connecttimeout",
@@ -1092,7 +1989,7 @@ def _classify_tts_error(detail: str, *, status_code: Optional[int] = None) -> st
         return "tts_server_runtime_error"
     if any(marker in normalized for marker in request_markers):
         return "request_validation_error"
-    if status_code in {408, 429, 502, 503, 504}:
+    if status_code in {408, 429, 502, 503, 504, 524}:
         return "tts_network_error"
     if status_code is not None and status_code >= 500:
         return "tts_server_runtime_error"
@@ -4299,6 +5196,343 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         "srt_s3_uri": srt_stored.s3_uri,
         "preview_asset_type": "hardburn",
     }
+
+
+@app.post("/internal/wf13-preflight")
+async def wf13_preflight(_: AuthDep, body: Wf13PreflightRequest) -> dict:
+    channel_ids = _wf13_distinct_channel_ids(body.channel_ids)
+    try:
+        quota = await _wf13_check_heygen_quota(channel_ids=channel_ids, notify=True)
+        return {
+            "ok": bool(quota.get("ok")),
+            "blocked_reason": str(quota.get("blocked_reason") or ""),
+            "remaining_quota": quota.get("remaining_quota"),
+            "api_quota": quota.get("api_quota"),
+            "notified_channel_ids": list(quota.get("notified_channel_ids") or []),
+        }
+    except Exception as e:
+        logger.warning("[wf13] preflight quota check failed err=%s", e)
+        return {
+            "ok": True,
+            "blocked_reason": "",
+            "remaining_quota": None,
+            "api_quota": None,
+            "notified_channel_ids": [],
+            "preflight_error": _clip(str(e), limit=220),
+        }
+
+
+@app.post("/internal/wf13-run-batch")
+async def wf13_run_batch(_: AuthDep, body: Wf13RunBatchRequest) -> dict:
+    targets = _normalize_publish_targets(body.targets or ["youtube"])
+    candidates = await _list_wf13_candidate_jobs()
+    selected_job_count = len(candidates)
+    if selected_job_count == 0:
+        return {
+            "status": "skipped",
+            "selected_job_count": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "blocked_count": 0,
+            "blocked_reason": "",
+            "stopped_on_job_id": "",
+            "results": [],
+        }
+
+    channel_ids = _wf13_distinct_channel_ids([str(item.get("channel_id") or "") for item in candidates])
+    quota = await _wf13_check_heygen_quota(channel_ids=channel_ids, notify=True)
+    if not quota.get("ok"):
+        return {
+            "status": "blocked",
+            "selected_job_count": selected_job_count,
+            "completed_count": 0,
+            "failed_count": 0,
+            "blocked_count": selected_job_count,
+            "blocked_reason": str(quota.get("blocked_reason") or "heygen_insufficient_credit"),
+            "stopped_on_job_id": "",
+            "results": [],
+        }
+
+    results: list[dict[str, Any]] = []
+    completed_count = 0
+    failed_count = 0
+    blocked_count = 0
+    stopped_on_job_id = ""
+    final_status = "completed"
+    for candidate in candidates:
+        req = Wf13RunJobRequest(
+            job_id=str(candidate.get("job_id") or ""),
+            seed=body.seed,
+            avatar_id=body.avatar_id,
+            use_avatar_iv_model=body.use_avatar_iv_model,
+            targets=targets,
+        )
+        result = await wf13_run_job(None, req)
+        results.append(result)
+        status = str(result.get("status") or "")
+        if status == "completed":
+            completed_count += 1
+        elif status == "blocked":
+            blocked_count += 1
+            final_status = "blocked"
+        elif status == "skipped":
+            pass
+        else:
+            failed_count += 1
+            if final_status != "blocked":
+                final_status = "completed" if completed_count > 0 else "failed"
+        if result.get("should_stop_workflow") is True:
+            stopped_on_job_id = str(result.get("job_id") or "")
+            break
+
+    if stopped_on_job_id and final_status != "blocked":
+        final_status = "failed"
+    return {
+        "status": final_status,
+        "selected_job_count": selected_job_count,
+        "completed_count": completed_count,
+        "failed_count": failed_count,
+        "blocked_count": blocked_count,
+        "blocked_reason": (
+            str(next((item.get("blocked_reason") for item in results if item.get("blocked_reason")), "")) or ""
+        ),
+        "stopped_on_job_id": stopped_on_job_id,
+        "results": results,
+    }
+
+
+@app.post("/internal/wf13-run-job")
+async def wf13_run_job(_: AuthDep, body: Wf13RunJobRequest) -> dict:
+    job = await job_service.get_job(body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    script_json = _as_script_json(job.get("script_json"))
+    channel_id = str(job.get("messenger_channel_id") or "").strip()
+    user_id = str(job.get("messenger_user_id") or "").strip()
+    targets = _normalize_publish_targets(body.targets or ["youtube"])
+    if user_id != "system:auto-report":
+        raise HTTPException(status_code=400, detail="WF-13 only supports system:auto-report jobs")
+
+    existing_posts = await job_service.list_platform_posts(body.job_id)
+    for post in existing_posts:
+        if str(post.get("platform") or "").strip().lower() == "youtube" and _normalized_platform_status(post.get("status")) == "published":
+            skipped_script = _merge_script_json_with_wf13_state(
+                script_json,
+                state="skipped",
+                seed=body.seed,
+                avatar_id=body.avatar_id,
+                use_avatar_iv_model=body.use_avatar_iv_model,
+                targets=targets,
+                last_completed_stage="publish",
+                last_error="",
+            )
+            await job_service.update_job(body.job_id, script_json=skipped_script)
+            return {
+                "job_id": body.job_id,
+                "status": "skipped",
+                "reason": "already_published",
+                "failure_stage": "",
+                "error_type": "",
+                "retryable": False,
+                "should_stop_workflow": False,
+            }
+
+    try:
+        audio_url = str(job.get("audio_url") or "").strip()
+        selected_seed = script_json.get("selected_tts_seed")
+        audio_ready = bool(audio_url) and str(selected_seed) == str(body.seed)
+        video_hardburn = script_json.get("video_hardburn") if isinstance(script_json.get("video_hardburn"), dict) else {}
+        video_ready = str(video_hardburn.get("status") or "").strip() == "ready" and bool(str(job.get("video_url") or "").strip())
+
+        if not audio_ready:
+            running_tts_script = _merge_script_json_with_wf13_state(
+                script_json,
+                state="running_tts",
+                seed=body.seed,
+                avatar_id=body.avatar_id,
+                use_avatar_iv_model=body.use_avatar_iv_model,
+                targets=targets,
+                last_error="",
+            )
+            await job_service.update_job(body.job_id, script_json=running_tts_script, error_message="")
+            await _wf13_notify(channel_id, f"🔊 WF-13 자동 TTS 생성을 시작합니다. seed={body.seed}")
+            await _generate_fixed_seed_tts_for_job(
+                job_id=body.job_id,
+                existing_job=job,
+                script_json=script_json,
+                seed=body.seed,
+                avatar_id=body.avatar_id,
+                use_avatar_iv_model=body.use_avatar_iv_model,
+                targets=targets,
+            )
+            job = await job_service.get_job(body.job_id)
+            script_json = _as_script_json(job.get("script_json"))
+            audio_url = str(job.get("audio_url") or "").strip()
+
+        if not video_ready:
+            try:
+                quota = await _wf13_check_heygen_quota(channel_ids=[channel_id], notify=False)
+                if not quota.get("ok"):
+                    raise Wf13PipelineError(
+                        f"HeyGen API credit 부족 (remaining_quota={quota.get('remaining_quota')})",
+                        error_type="heygen_insufficient_credit",
+                        failure_stage="video",
+                        retryable=False,
+                        should_stop_workflow=True,
+                        blocked_reason="heygen_insufficient_credit",
+                    )
+            except Wf13PipelineError:
+                raise
+            except Exception as e:
+                logger.warning("[wf13] quota precheck failed job_id=%s err=%s", body.job_id, e)
+            running_video_script = _merge_script_json_with_wf13_state(
+                script_json,
+                state="running_video",
+                seed=body.seed,
+                avatar_id=body.avatar_id,
+                use_avatar_iv_model=body.use_avatar_iv_model,
+                targets=targets,
+                last_error="",
+            )
+            await job_service.update_job(body.job_id, script_json=running_video_script, error_message="")
+            await _wf13_notify(channel_id, "🎬 WF-13 자동 영상 생성을 시작합니다.")
+            resolved_audio_url = _resolve_internal_media_url(audio_url)
+            heygen_result = await _run_wf13_heygen_generate(
+                job_id=body.job_id,
+                channel_id=channel_id,
+                user_id=user_id,
+                audio_url=resolved_audio_url,
+                avatar_id=body.avatar_id,
+                use_avatar_iv_model=body.use_avatar_iv_model,
+            )
+            await _finalize_video_auto(
+                job_id=body.job_id,
+                video_url=str(heygen_result["video_url"]),
+                video_filename=str(heygen_result["video_filename"]),
+                heygen_status=str(heygen_result["status"]),
+                heygen_video_id=str(heygen_result["video_id"]),
+                heygen_avatar_id=str(heygen_result["avatar_id"]),
+                heygen_use_avatar_iv_model=bool(heygen_result["use_avatar_iv_model"]),
+                heygen_request_snapshot=dict(heygen_result.get("request_snapshot") or {}),
+                heygen_response_snapshot=dict(heygen_result.get("response_snapshot") or {}),
+                seed=body.seed,
+                avatar_id=body.avatar_id,
+                use_avatar_iv_model=body.use_avatar_iv_model,
+                targets=targets,
+            )
+            job = await job_service.get_job(body.job_id)
+            script_json = _as_script_json(job.get("script_json"))
+
+        running_publish_script = _merge_script_json_with_wf13_state(
+            script_json,
+            state="running_publish",
+            seed=body.seed,
+            avatar_id=body.avatar_id,
+            use_avatar_iv_model=body.use_avatar_iv_model,
+            targets=targets,
+            last_error="",
+        )
+        await job_service.update_job(body.job_id, script_json=running_publish_script, error_message="")
+        await _wf13_notify(channel_id, "📤 WF-13 자동 YouTube 업로드를 시작합니다.")
+        current_video_url = _resolve_internal_media_url(str(job.get("video_url") or ""))
+        current_audio_url = _resolve_internal_media_url(str(job.get("audio_url") or ""))
+        subtitle_script_text = _get_subtitle_script_text(script_json)
+        media_names = script_json.get("media_names") if isinstance(script_json.get("media_names"), dict) else {}
+        video_filename = _normalize_video_filename(body.job_id, media_names.get("video_filename"), script_json)
+        publish_result = await _wf13_publish_auto_with_retry(
+            job_id=body.job_id,
+            channel_id=channel_id,
+            video_url=current_video_url,
+            audio_url=current_audio_url,
+            video_filename=video_filename,
+            title=_build_publish_title(body.job_id, video_filename, subtitle_script_text, str(job.get("concept_text") or "")),
+            description=_build_publish_description(subtitle_script_text),
+            caption=_build_publish_caption(subtitle_script_text),
+            subtitle_script_text=subtitle_script_text,
+            script_json=script_json,
+            seed=body.seed,
+            avatar_id=body.avatar_id,
+            use_avatar_iv_model=body.use_avatar_iv_model,
+            targets=targets,
+        )
+        latest_job = await job_service.get_job(body.job_id)
+        latest_script_json = _as_script_json(latest_job.get("script_json") if latest_job else script_json)
+        completed_script = _merge_script_json_with_wf13_state(
+            latest_script_json,
+            state="completed",
+            seed=body.seed,
+            avatar_id=body.avatar_id,
+            use_avatar_iv_model=body.use_avatar_iv_model,
+            targets=targets,
+            last_completed_stage="publish",
+            last_error="",
+        )
+        await job_service.update_job(body.job_id, script_json=completed_script, error_message="")
+        if publish_result.get("summary_text"):
+            await _wf13_notify(channel_id, str(publish_result["summary_text"]))
+        return {
+            "job_id": body.job_id,
+            "status": "completed",
+            "final_status": publish_result.get("final_status", ""),
+            "failure_stage": "",
+            "error_type": "",
+            "retryable": False,
+            "should_stop_workflow": False,
+            "delivered_video_to_discord": False,
+        }
+    except Exception as e:
+        logger.exception("[wf13] failed job_id=%s", body.job_id)
+        wf13_error = e if isinstance(e, Wf13PipelineError) else None
+        failure_stage = wf13_error.failure_stage if wf13_error else ""
+        error_type = wf13_error.error_type if wf13_error else ""
+        retryable = wf13_error.retryable if wf13_error else False
+        should_stop_workflow = wf13_error.should_stop_workflow if wf13_error else False
+        blocked_reason = wf13_error.blocked_reason if wf13_error else ""
+        user_notified = wf13_error.user_notified if wf13_error else False
+        failed_state = "blocked" if blocked_reason else "failed"
+        latest_job = await job_service.get_job(body.job_id)
+        latest_script_json = _as_script_json(latest_job.get("script_json") if latest_job else script_json)
+        if error_type == "youtube_upload_limit_exceeded" and latest_job is not None:
+            try:
+                current_video_url = _resolve_internal_media_url(str(latest_job.get("video_url") or ""))
+                if current_video_url:
+                    await _wf13_notify_publish_limit(channel_id, body.job_id, current_video_url)
+                    user_notified = True
+            except Exception as notify_err:
+                logger.warning("[wf13] publish-limit notify failed job_id=%s err=%s", body.job_id, notify_err)
+        failed_script = _merge_script_json_with_wf13_state(
+            latest_script_json,
+            state=failed_state,
+            seed=body.seed,
+            avatar_id=body.avatar_id,
+            use_avatar_iv_model=body.use_avatar_iv_model,
+            targets=targets,
+            last_error=str(e),
+            last_completed_stage=failure_stage if failure_stage == "publish" else str(_get_wf13_state(latest_script_json).get("last_completed_stage") or ""),
+            retryable=retryable,
+            blocked_reason=blocked_reason,
+        )
+        if failure_stage == "publish":
+            await job_service.transition_status(body.job_id, "PUBLISH_FAILED")
+        else:
+            await job_service.transition_status(body.job_id, "PUBLISHED")
+        await job_service.update_job(body.job_id, script_json=failed_script, error_message=f"WF-13 failed: {e}")
+        if blocked_reason == "heygen_insufficient_credit":
+            await _wf13_notify(channel_id, "⚠️ WF-13 자동 영상 생성이 중단되었습니다. HeyGen API credit이 부족합니다. 충전 후 다시 실행해야 합니다.")
+        if not user_notified:
+            await _wf13_notify(channel_id, f"❌ WF-13 자동 파이프라인 실패\nJob ID: {body.job_id[:8]}\n사유: {_clip(str(e), limit=220)}")
+        return {
+            "job_id": body.job_id,
+            "status": failed_state,
+            "detail": str(e),
+            "failure_stage": failure_stage,
+            "error_type": error_type,
+            "retryable": retryable,
+            "should_stop_workflow": should_stop_workflow,
+            "blocked_reason": blocked_reason,
+            "delivered_video_to_discord": bool(user_notified and error_type == "youtube_upload_limit_exceeded"),
+        }
 
 
 @app.post("/internal/video-action")

@@ -181,6 +181,25 @@ class AutoReportRequest(BaseModel):
     source_title: str = ""
 
 
+class Wf13RunJobRequest(BaseModel):
+    job_id: str
+    seed: int = 1515076784
+    avatar_id: str = "b903a1fd1ec846e0ba2e89620bc0aaae"
+    use_avatar_iv_model: bool = False
+    targets: list[str] = ["youtube"]
+
+
+class Wf13PreflightRequest(BaseModel):
+    channel_ids: list[str] = []
+
+
+class Wf13RunBatchRequest(BaseModel):
+    seed: int = 1515076784
+    avatar_id: str = "b903a1fd1ec846e0ba2e89620bc0aaae"
+    use_avatar_iv_model: bool = False
+    targets: list[str] = ["youtube"]
+
+
 class CostEventIngestRequest(BaseModel):
     job_id: str
     topic_text: str = ""
