@@ -244,6 +244,51 @@ def _infer_module_device(obj: Any) -> str:
     return ""
 
 
+def _load_distillmos_predictor(resolved_device: str) -> Any:
+    global _DISTILLMOS_PREDICTORS
+    predictor = _DISTILLMOS_PREDICTORS.get(resolved_device)
+    if predictor is not None:
+        return predictor
+
+    import distillmos  # type: ignore
+
+    model_cls = getattr(distillmos, "ConvTransformerSQAModel", None)
+    if model_cls is None:
+        raise RuntimeError("distillmos.ConvTransformerSQAModel is unavailable")
+
+    model = model_cls()
+    if hasattr(model, "to"):
+        model.to(resolved_device)
+    if hasattr(model, "eval"):
+        model.eval()
+    _DISTILLMOS_PREDICTORS[resolved_device] = model
+    return model
+
+
+def _predict_distillmos_mos(audio_path: Path, resolved_device: str) -> tuple[float, str]:
+    runtime = _get_torch_runtime()
+    if not runtime.get("torch_available"):
+        raise RuntimeError("torch is unavailable")
+    if importlib.util.find_spec("torchaudio") is None:
+        raise RuntimeError("torchaudio is unavailable")
+
+    import torch  # type: ignore
+    import torchaudio  # type: ignore
+
+    model = _load_distillmos_predictor(resolved_device)
+    waveform, sample_rate = torchaudio.load(str(audio_path))
+    if waveform.shape[0] > 1:
+        waveform = waveform[:1, :]
+    if sample_rate != 16000:
+        waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+    waveform = waveform.to(resolved_device)
+    with torch.no_grad():
+        score = model(waveform)
+    value = float(score.reshape(-1)[0].item())
+    device = _infer_module_device(model) or resolved_device
+    return value, device
+
+
 def _seedlab_runtime_capabilities(
     *,
     reference_audio_local_path: str = "",
@@ -2663,30 +2708,8 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
     try:
         runtime = _resolve_seedlab_eval_runtime()
         resolved_device = str(runtime.get("resolved_device") or "cpu")
-        global _DISTILLMOS_PREDICTORS
-        predictor = _DISTILLMOS_PREDICTORS.get(resolved_device)
-        if predictor is None:
-            import distillmos  # type: ignore
-
-            predictor = distillmos.DistillMOS()
-            if hasattr(predictor, "to"):
-                predictor.to(resolved_device)
-            for attr_name in ("model", "_model", "net", "module"):
-                module = getattr(predictor, attr_name, None)
-                if hasattr(module, "to"):
-                    module.to(resolved_device)
-                    if hasattr(module, "eval"):
-                        module.eval()
-            for attr_name in ("device", "_device"):
-                if hasattr(predictor, attr_name):
-                    try:
-                        setattr(predictor, attr_name, resolved_device)
-                    except Exception:
-                        pass
-            _DISTILLMOS_PREDICTORS[resolved_device] = predictor
-        mos_pred = float(predictor.predict(str(audio_path)))
+        mos_pred, mos_device = _predict_distillmos_mos(audio_path, resolved_device)
         capabilities["mos_enabled"] = True
-        mos_device = _infer_module_device(predictor) or str(getattr(predictor, "device", "") or "")
         capabilities["mos_device"] = mos_device
         if _torch_device_is_cuda(mos_device):
             capabilities["gpu_acceleration_active"] = True
