@@ -68,6 +68,136 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 
 ---
 
+## 현재 자동화 파이프라인 상세 구조
+
+현재 실운영 자동화는 크게 두 단계입니다.
+
+1. 아침까지 `WF-09/10 -> auto-report -> WF-06` 경로로 `system:auto-report` 보고서 job을 만든다.
+2. 오전 9시 30분(KST) `WF-13`이 같은 날 생성된 `system:auto-report + PUBLISHED` job을 순차 처리해 TTS, HeyGen, hardburn, YouTube 업로드를 수행한다.
+
+중요한 점:
+
+- `WF-06`은 n8n UI에서 단독 실행하는 배치가 아니라, `messenger-gateway`가 webhook으로 호출하는 구조입니다.
+- `WF-13`은 n8n 내부 루프가 아니라, `messenger-gateway /internal/wf13-run-batch`가 실제 순차 실행과 재시도, quota 검사까지 담당합니다.
+
+### 1. 콘텐츠 생성 자동화 (`WF-09/10 -> auto-report -> WF-06`)
+
+```mermaid
+flowchart TD
+    subgraph N8N["n8n"]
+        WF10["WF-10<br/>매일 07:30 KST<br/>NotebookLM 노트북 생성"]
+        WF09["WF-09<br/>매시간 YouTube RSS 수집"]
+        WF06["WF-06<br/>POST /webhook/wf-06-report"]
+    end
+
+    subgraph Gateway["messenger-gateway"]
+        AR["/internal/auto-report<br/>auto-report 후보/중복/일일 제한 검사"]
+        SR["/internal/send-report<br/>S3 저장 + Discord 전송"]
+    end
+
+    subgraph Notebook["notebooklm-service"]
+        NS["/notebook-state<br/>active notebook/source 상태 조회"]
+        CAS["/check-and-add-source<br/>최신 소스 추가"]
+        GEN["/generate<br/>Playwright CUA로 보고서 생성"]
+    end
+
+    subgraph Storage["저장소"]
+        DB[(PostgreSQL jobs)]
+        S3[(S3 subtitle/scripts)]
+    end
+
+    Discord["Discord 채널"]
+    FAIL["보고서 생성 실패"]
+
+    WF10 --> NS
+    WF09 --> NS
+    NS -->|active notebook 비어 있음| CAS
+    CAS -->|added=true| AR
+    AR -->|job 생성<br/>messenger_user_id=system:auto-report| DB
+    AR --> WF06
+    WF06 -->|status=GENERATING| DB
+    WF06 --> GEN
+    GEN -->|성공| SR
+    SR --> S3
+    SR -->|보고서 텍스트 첨부/링크 전송| Discord
+    SR -->|status=PUBLISHED| DB
+
+    GEN -->|실패| FAIL
+    FAIL -->|status=FAILED| DB
+```
+
+운영 메모:
+
+- `WF-09`는 source 추가 성공 시에만 `messenger-gateway /internal/auto-report`를 호출합니다.
+- `auto-report`는 `system:auto-report` job을 만들고, 그 job이 이후 `WF-13`의 입력이 됩니다.
+- 보고서가 안 만들어지면 먼저 `jobs.status`, 그다음 `notebooklm-service`의 `/generate` 로그를 확인하면 됩니다.
+- 최근 실제 장애처럼 NotebookLM UI 변경이 있으면 `WF-06`은 호출되더라도 `notebooklm-service /generate` 단계에서 `FAILED`로 종료될 수 있습니다.
+
+### 2. 오전 9시 30분 자동 업로드 (`WF-13 -> wf13-run-batch -> WF-08`)
+
+```mermaid
+flowchart TD
+    subgraph N8N["n8n"]
+        WF13["WF-13<br/>매일 09:30 KST"]
+        WF08["WF-08<br/>POST /webhook/wf-08-sns-upload"]
+    end
+
+    subgraph Gateway["messenger-gateway"]
+        BATCH["/internal/wf13-run-batch<br/>후보 조회 + 순차 처리"]
+        PREFLIGHT["HeyGen quota preflight"]
+        TTS["고정 seed TTS 생성<br/>seed=1515076784"]
+        HEYGEN["HeyGen 영상 생성<br/>avatar_id=b903...aaae<br/>use_avatar_iv_model=false"]
+        FINALIZE["hardburn/SRT finalize<br/>raw mp4 다운로드<br/>caption-artifacts 생성<br/>ffmpeg hardburn"]
+    end
+
+    subgraph Services["내부 서비스"]
+        SNS["sns-publisher-service<br/>YouTube 업로드 + 캡션 업로드"]
+    end
+
+    subgraph Storage["저장소"]
+        DB[(PostgreSQL jobs/platform_posts)]
+        S3[(S3 tts/videos/srt/Video_with_Subtitle)]
+    end
+
+    Discord["Discord 채널"]
+    YouTube["YouTube"]
+
+    WF13 --> BATCH
+    BATCH -->|오늘 생성된<br/>system:auto-report + PUBLISHED<br/>YouTube 미게시 job 조회| DB
+    BATCH --> PREFLIGHT
+    PREFLIGHT -->|quota OK| TTS
+    PREFLIGHT -->|credit 부족| Discord
+
+    TTS -->|audio_url 저장| DB
+    TTS -->|TTS 시작/실패 알림| Discord
+    TTS --> HEYGEN
+
+    HEYGEN -->|영상 생성 성공| FINALIZE
+    HEYGEN -->|credit 부족/실패| Discord
+    HEYGEN -->|상태 기록| DB
+
+    FINALIZE --> S3
+    FINALIZE -->|video_url/final_url=hardburn 영상| DB
+    FINALIZE -->|영상 생성 완료 알림| Discord
+    FINALIZE --> WF08
+
+    WF08 --> SNS
+    SNS -->|YouTube 업로드/표준 캡션 업로드| YouTube
+    SNS -->|platform_posts 기록| DB
+    SNS -->|성공 또는 업로드 한도 초과| Discord
+    SNS -->|PUBLISHED / PUBLISH_FAILED| DB
+```
+
+운영 메모:
+
+- `WF-13` 자체는 단순히 `messenger-gateway /internal/wf13-run-batch`를 한 번 호출합니다.
+- 실제 순차 처리, TTS 재시도, HeyGen quota 중단, YouTube 업로드 재시도/예외 분류는 모두 gateway 내부 로직이 담당합니다.
+- publish 단계는 `WF-08 -> sns-publisher-service` 경로를 재사용합니다.
+- `uploadLimitExceeded`가 나면 자동 배치는 다음 job으로 진행하고, 이미 만든 hardburn 영상 링크만 Discord로 반환합니다.
+- 아침 보고서는 정상인데 영상/업로드가 안 생기면 `messenger-gateway`의 `wf13_run_batch/run_job` 로그와 `sns-publisher-service` 업로드 로그를 확인하면 됩니다.
+
+---
+
 ## Discord 명령어 사용 흐름 (실운영)
 
 ### `/report [prompt]` (공백 허용)
