@@ -79,6 +79,29 @@ class DiscordAdapter(MessengerAdapter):
         resp.raise_for_status()
         logger.info("[discord] send_text_message channel=%s", channel_id)
 
+    async def send_seedlab_progress_message(self, channel_id: str, text: str) -> str:
+        payload = {"content": text}
+        resp = await self._client.post(
+            f"{BASE_URL}/channels/{channel_id}/messages",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data["id"])
+        logger.info("[discord] send_seedlab_progress_message channel=%s message_id=%s", channel_id, message_id)
+        return message_id
+
+    async def edit_seedlab_progress_message(self, channel_id: str, message_id: str, text: str) -> None:
+        payload = {"content": text}
+        resp = await self._client.patch(
+            f"{BASE_URL}/channels/{channel_id}/messages/{message_id}",
+            json=payload,
+            headers=self._headers,
+        )
+        resp.raise_for_status()
+        logger.info("[discord] edit_seedlab_progress_message channel=%s message_id=%s", channel_id, message_id)
+
     async def remove_buttons(
         self,
         channel_id: str,

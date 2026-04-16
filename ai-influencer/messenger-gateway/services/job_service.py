@@ -116,6 +116,35 @@ async def _ensure_schema(pool: asyncpg.Pool) -> None:
             ADD CONSTRAINT platform_posts_platform_check CHECK (platform IN ('youtube','instagram','tiktok'))
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seed_lab_runs (
+                run_id                   TEXT PRIMARY KEY,
+                status                   TEXT NOT NULL DEFAULT 'queued',
+                messenger_source         TEXT NOT NULL DEFAULT 'discord',
+                discord_user_id          TEXT NOT NULL,
+                discord_channel_id       TEXT NOT NULL,
+                dataset_path             TEXT,
+                seed_list_raw            TEXT,
+                dup_mode                 BOOLEAN NOT NULL DEFAULT FALSE,
+                samples                  INT NOT NULL DEFAULT 30,
+                takes_per_seed           INT NOT NULL DEFAULT 1,
+                concurrency              INT NOT NULL DEFAULT 2,
+                run_dir                  TEXT,
+                signed_link_expires_at   TIMESTAMPTZ,
+                last_error               TEXT,
+                created_at               TIMESTAMPTZ DEFAULT NOW(),
+                updated_at               TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_message_id TEXT")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_stage TEXT")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_generated_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_evaluated_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_failed_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_total_count INT NOT NULL DEFAULT 0")
+        await conn.execute("CREATE INDEX IF NOT EXISTS seed_lab_runs_user_created_idx ON seed_lab_runs(discord_user_id, created_at DESC)")
 
 
 async def get_db_pool() -> asyncpg.Pool:
@@ -430,3 +459,70 @@ async def count_auto_report_attempts_today(
         notebook_url,
     )
     return int(count or 0)
+
+
+async def create_seed_lab_run(
+    *,
+    run_id: str,
+    discord_user_id: str,
+    discord_channel_id: str,
+    dataset_path: str,
+    seed_list_raw: str,
+    dup_mode: bool,
+    samples: int,
+    takes_per_seed: int,
+    concurrency: int,
+    run_dir: str = "",
+    signed_link_expires_at: Any = None,
+) -> dict[str, Any]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow(
+        """
+        INSERT INTO seed_lab_runs (
+            run_id, status, messenger_source, discord_user_id, discord_channel_id,
+            dataset_path, seed_list_raw, dup_mode, samples, takes_per_seed, concurrency,
+            run_dir, signed_link_expires_at
+        ) VALUES (
+            $1, 'queued', 'discord', $2, $3,
+            $4, $5, $6, $7, $8, $9,
+            $10, $11
+        )
+        RETURNING *
+        """,
+        run_id,
+        discord_user_id,
+        discord_channel_id,
+        dataset_path,
+        seed_list_raw,
+        dup_mode,
+        samples,
+        takes_per_seed,
+        concurrency,
+        run_dir,
+        signed_link_expires_at,
+    )
+    return dict(row)
+
+
+async def get_seed_lab_run(run_id: str) -> Optional[dict[str, Any]]:
+    pool = await get_db_pool()
+    row = await pool.fetchrow("SELECT * FROM seed_lab_runs WHERE run_id = $1", run_id)
+    return dict(row) if row is not None else None
+
+
+async def update_seed_lab_run(run_id: str, **kwargs: Any) -> Optional[dict[str, Any]]:
+    if not kwargs:
+        return await get_seed_lab_run(run_id)
+    set_clauses = []
+    values = []
+    for i, (key, value) in enumerate(kwargs.items(), start=1):
+        set_clauses.append(f"{key} = ${i}")
+        values.append(value)
+    values.append(run_id)
+    query = (
+        f"UPDATE seed_lab_runs SET {', '.join(set_clauses)}, updated_at = NOW() "
+        f"WHERE run_id = ${len(values)} RETURNING *"
+    )
+    pool = await get_db_pool()
+    row = await pool.fetchrow(query, *values)
+    return dict(row) if row is not None else None

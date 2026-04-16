@@ -442,6 +442,54 @@ async def tts_command(
         await _safe_reply(interaction, f"❌ /tts 실패: {_clip_text(str(e), 500)}", ephemeral=True)
 
 
+@bot.tree.command(name="seedlab", description="AWS Seed Lab run을 시작하고 웹 링크를 반환합니다")
+@app_commands.describe(
+    seeds="쉼표로 구분한 seed 목록. 비우면 랜덤으로 채웁니다.",
+    dup="켜면 seed당 3개씩(10 x 3), 끄면 30 x 1입니다.",
+)
+async def seedlab_command(
+    interaction: discord.Interaction,
+    seeds: str = "",
+    dup: bool = False,
+) -> None:
+    user_id = str(interaction.user.id)
+    logger.info("[/seedlab] invoked user=%s channel=%s dup=%s seeds=%s", user_id, interaction.channel_id, dup, (seeds or "").strip())
+
+    try:
+        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
+            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+            return
+
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+            return
+
+        await _safe_defer(interaction, ephemeral=True)
+        result = await gateway_call(
+            "/internal/seedlab-start",
+            {
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+                "seeds": (seeds or "").strip(),
+                "dup": bool(dup),
+            },
+        )
+        await _safe_reply(
+            interaction,
+            _clip_text(
+                "🧪 Seed Lab run 생성 완료\n"
+                f"Run ID: `{str(result.get('run_id') or '')}`\n"
+                f"mode: {int(result.get('samples') or (10 if dup else 30))} x {int(result.get('takes_per_seed') or (3 if dup else 1))}\n"
+                f"link: {str(result.get('seedlab_url') or '')}\n"
+                "진행 상황은 채널 메시지에서 계속 갱신됩니다."
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.exception("[/seedlab] failed user=%s channel=%s", user_id, interaction.channel_id)
+        await _safe_reply(interaction, f"❌ /seedlab 실패: {_clip_text(str(e), 500)}", ephemeral=True)
+
+
 @bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
 async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)

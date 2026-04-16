@@ -62,6 +62,7 @@ OPENAI_API_KEY_SEEDLAB_ASR="${OPENAI_API_KEY_SEEDLAB_ASR:-}"
 OPENAI_API_KEY_SEEDLAB_JUDGE="${OPENAI_API_KEY_SEEDLAB_JUDGE:-}"
 OPENAI_FALLBACK_API_KEY="${OPENAI_FALLBACK_API_KEY:-}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+SEEDLAB_BASE_SCRIPT_TEXT="${SEEDLAB_BASE_SCRIPT_TEXT:-}"
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -111,6 +112,26 @@ fi
 if [[ -z "${OPENAI_API_KEY:-}" ]] && [[ -f ".env" ]]; then
   OPENAI_API_KEY="$(grep -E '^[[:space:]]*OPENAI_API_KEY=' .env | head -n1 | cut -d'=' -f2- || true)"
 fi
+if [[ -z "${SEEDLAB_BASE_SCRIPT_TEXT:-}" ]] && [[ -f ".env" ]]; then
+  SEEDLAB_BASE_SCRIPT_TEXT="$(python3 - <<'PY'
+from pathlib import Path
+key = "SEEDLAB_BASE_SCRIPT_TEXT="
+text = Path(".env").read_text(encoding="utf-8")
+lines = text.splitlines()
+for i, line in enumerate(lines):
+    if not line.startswith(key):
+        continue
+    value = line[len(key):]
+    collected = [value]
+    for nxt in lines[i + 1:]:
+        if "=" in nxt and not nxt.startswith((" ", "\t")):
+            break
+        collected.append(nxt)
+    print("\n".join(collected).rstrip())
+    break
+PY
+)"
+fi
 
 # .env 값이 따옴표로 감싸진 경우 제거
 TTS_API_URL="${TTS_API_URL%\"}"
@@ -127,6 +148,9 @@ OPENAI_FALLBACK_API_KEY="$(printf '%s' "${OPENAI_FALLBACK_API_KEY}" | tr -d '\r'
 OPENAI_API_KEY="${OPENAI_API_KEY%\"}"
 OPENAI_API_KEY="${OPENAI_API_KEY#\"}"
 OPENAI_API_KEY="$(printf '%s' "${OPENAI_API_KEY}" | tr -d '\r')"
+SEEDLAB_BASE_SCRIPT_TEXT="${SEEDLAB_BASE_SCRIPT_TEXT%\"}"
+SEEDLAB_BASE_SCRIPT_TEXT="${SEEDLAB_BASE_SCRIPT_TEXT#\"}"
+SEEDLAB_BASE_SCRIPT_TEXT="$(printf '%s' "${SEEDLAB_BASE_SCRIPT_TEXT}" | tr -d '\r')"
 
 if [[ -z "${OPENAI_API_KEY_SEEDLAB_ASR:-}" ]]; then
   OPENAI_API_KEY_SEEDLAB_ASR="${OPENAI_FALLBACK_API_KEY:-${OPENAI_API_KEY:-}}"
@@ -163,6 +187,12 @@ if [[ -n "${OPENAI_API_KEY_SEEDLAB_ASR:-}" && -n "${OPENAI_API_KEY_SEEDLAB_JUDGE
 else
   echo "[seed-lab] OpenAI keys loaded: no (AI 자동평가 비활성)"
   echo "[seed-lab] OpenAI keys exported to serve env: no"
+fi
+if [[ -n "${SEEDLAB_BASE_SCRIPT_TEXT:-}" ]]; then
+  export SEEDLAB_BASE_SCRIPT_TEXT
+  echo "[seed-lab] SEEDLAB_BASE_SCRIPT_TEXT loaded: yes"
+else
+  echo "[seed-lab] SEEDLAB_BASE_SCRIPT_TEXT loaded: no (dataset s1 fallback 사용)"
 fi
 echo "[seed-lab] dataset=${DATASET_LOCAL}"
 echo "[seed-lab] stage=a samples=${SAMPLES} takes_per_seed=${TAKES_PER_SEED} concurrency=${CONCURRENCY}"

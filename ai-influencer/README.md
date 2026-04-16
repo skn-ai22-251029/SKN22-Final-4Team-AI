@@ -11,7 +11,7 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 
 ```
 [Discord 사용자]
-      │  /create   /report   /jobs   /tts   /heygen
+      │  /report   /jobs   /tts   /seedlab
       ▼
 [discord-bot]  ──────────────────────────────────→  [messenger-gateway :8080]
                                                               │  /internal/*
@@ -35,56 +35,40 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 | `messenger-gateway` | 메신저 허브 API | 8080 (외부) |
 | `discord-bot` | Discord WebSocket 연결 | 없음 |
 | `notebooklm-service` | NotebookLM 자동화 & 보고서 생성 | 내부 전용 |
+| `sns-publisher-service` | YouTube/Instagram 업로드, YouTube 자막 생성 | 내부 전용 |
+| `heygen-pipeline-service` | 생성 콘텐츠 메타데이터 등록 전용 | 내부 전용 |
+| `tts-router-service` | TTS 라우팅/서버리스 전환용 라우터 | 내부 전용 |
+| `seed-lab-service` | Seed Lab run 생성, 큐, AI 평가, 웹 API | 내부 전용 |
 
 ---
 
 ## 워크플로 전체 흐름 개요
 
 ```
-자동 수집 (WF-09/10)          수동 요청 (/create)        수동 요청 (/report)
-       │                              │                          │
-       ▼                              ▼                          ▼
-[YouTube RSS 수집]           [WF-01: 스크립트 생성]    [채널 선택 버튼 표시]
-[notebooklm 소스 추가]              │                          │
-       │ (성공 시 auto-report)      │                          │
-       └──────────────→ [gateway /internal/auto-report]       │
-                               │                               │
-                          [WF-06: 보고서 생성]                 │
-                               │                               │
-                       [Discord 자동 보고서 전송]              │
+자동 수집 (WF-09/10)                          수동 요청 (/report)
+       │                                             │
+       ▼                                             ▼
+[YouTube RSS 수집]                            [채널 선택 버튼 표시]
+[notebooklm 소스 추가]                               │
+       │ (성공 시 auto-report)                       │
+       └──────────────→ [gateway /internal/auto-report]
+                               │
+                          [WF-06: 보고서 생성]
+                               │
+                       [Discord 자동 보고서 전송]
                                                                │
-       │                       [컨펌 버튼 전송]            [채널 선택]
-       [WF-10: 매일 노트북 생성]           │                          │
-                                [WF-05: 승인/수정]         [보고서 목록 조회]
-                                     │ 승인                      │
-                               [WF-11: TTS 생성]    [WF-06: 보고서 생성]
-                                     │                          │
-                                 [WF-12: HeyGen 생성]        [영상 제작 요청]
+       │                                                  [채널 선택]
+       [WF-10: 매일 노트북 생성]                            │
+                                                        [보고서 목록 조회]
+                                                               │
+                                                        [WF-06: 보고서 생성]
+                                                               │
+                                                          [영상 제작 요청]
 ```
 
 ---
 
 ## Discord 명령어 사용 흐름 (실운영)
-
-### `/create concept:<콘셉트>`
-
-```
-/create
-  → gateway /internal/message
-  → WF-01 (스크립트 생성 + 승인 버튼 전송)
-  → 승인 버튼 클릭: /internal/confirm-action
-  → WF-05 approved
-  → WF-11 (TTS 생성 + 승인/반려 버튼)
-  → TTS 승인: /internal/tts-action
-  → WF-12 (영상 생성 + 미리보기 승인/반려)
-  → 영상 승인: /internal/video-action
-  → WF-08 (SNS 업로드)
-```
-
-반려/수정:
-- 스크립트 수정요청 → WF-05 `revision_requested` → WF-01 재실행
-- TTS 반려 → 상태 `APPROVED`로 복귀 후 `/tts` 재실행 가능
-- 영상 반려 → 스크립트/TTS/처음부터 단계 선택 재실행
 
 ### `/report [prompt]` (공백 허용)
 
@@ -126,10 +110,9 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 
 ### `/heygen [job_id]`
 
-- `job_id`는 전체 UUID/8자리 prefix/미입력 모두 허용
-- 미입력 시 현재 사용자+채널의 최근 `audio_url` 보유 job 자동 선택
-- 실행 경로: `/internal/heygen-generate` → WF-12
-- avatar 선택 우선순위: 요청 `avatar_id` → job 저장값 → `characters.heygen_avatar_id` → `HEYGEN_AVATAR_ID`
+- 현재 `/heygen` 명령은 비활성화되어 있습니다.
+- WF-12 실행은 TTS 완료 메시지의 `일반 승인` 또는 `고화질 승인` 버튼에서만 시작합니다.
+- 즉 Discord 봇이 `/heygen` slash command를 직접 WF-12로 연결하지 않습니다.
 
 ### `POST /internal/heygen-smoke-test`
 
@@ -197,22 +180,24 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 | `MEDIA_S3_ROLE_SESSION_NAME` | STS 세션명 |
 | `MEDIA_PRESIGN_EXPIRES_SECONDS` | Presigned URL 만료(기본 86400) |
 | `MEDIA_MAX_DISCORD_FILE_BYTES` | 첨부 임계치(기본 10485760, 10MB) |
-| `MEDIA_S3_PREFIX_REPORTS` | 대본 prefix (기본 `reports`) |
+| `MEDIA_S3_PREFIX_REPORTS` | 자막용 대본 prefix (기본 `subtitle`) |
 | `MEDIA_S3_PREFIX_TTS` | TTS prefix (기본 `tts`) |
 | `MEDIA_S3_PREFIX_VIDEOS` | 영상 prefix (기본 `videos`) |
+| `MEDIA_S3_PREFIX_SRT` | SRT prefix (기본 `srt`) |
+| `MEDIA_S3_PREFIX_VIDEOS_WITH_SUBTITLE` | 하드번 영상 prefix (기본 `Video_with_Subtitle`) |
 
 ### AWS IAM 설정 요약 (교차 계정)
 
 1. **타겟 계정(S3 보유)**에 업로드 전용 Role 생성 (예: `AiInfluencerMediaWriterRole`)
 2. Trust policy에서 소스 계정의 실행 Role(EC2/ECS)을 Principal로 허용
-3. 권한은 버킷 전체가 아닌 `reports/*`, `tts/*`, `videos/*` prefix로 최소권한 부여
+3. 권한은 버킷 전체가 아닌 `subtitle/*`, `scripts/*`, `tts/*`, `videos/*`, `srt/*`, `Video_with_Subtitle/*` prefix로 최소권한 부여
 4. 소스 계정 실행 Role에 `sts:AssumeRole` 권한 추가
 
 ---
 
 ## 워크플로 상세 흐름
 
-### WF-01: 콘텐츠 생성 요청 수신
+### WF-01: 콘텐츠 생성 요청 수신 (레거시, 현재 실운영 미사용)
 
 ```
 [Webhook 수신] ← discord-bot /create 요청
@@ -339,11 +324,16 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
       ▼
 [HeyGen 업로드 + 영상 생성 + 폴링]
       │
-      ├─[completed]──→ [DB 업데이트] status=WAITING_VIDEO_APPROVAL, video_url 저장
+      ├─[completed]──→ [gateway /internal/send-video-preview 호출]
       │                      │
       │                      ▼
-      │               [gateway /internal/send-video-preview 호출]
-      │               → Discord에 영상 미리보기 + [✅ 승인] [❌ 반려] 버튼
+      │               [raw mp4 다운로드]
+      │               [caption-artifacts로 SRT 생성]
+      │               [ffmpeg hardburn]
+      │               [raw / srt / hardburn S3 저장]
+      │               [DB 업데이트] status=WAITING_VIDEO_APPROVAL,
+      │                            video_url/final_url=hardburn 영상
+      │               → Discord에 hardburn 미리보기 + [✅ 승인] [❌ 반려] 버튼
       │
       └─[failed]────→ [DB 업데이트] status=FAILED
                              │
@@ -506,7 +496,7 @@ Discord 사용자: /report
 
 | 파일 | 트리거 | 진입점 | 핵심 처리 | 후속 |
 |------|--------|--------|-----------|------|
-| `WF-01_input_receive.json` | Webhook | `POST /webhook/wf-01-input` | job 수신, `SCRIPTING` 전이, 스크립트 생성/저장 | gateway `/internal/send-confirm` |
+| `WF-01_input_receive.json` | Webhook | `POST /webhook/wf-01-input` | 레거시 `/create` 경로용 job 수신, `SCRIPTING` 전이, 스크립트 생성/저장 | gateway `/internal/send-confirm` |
 | `WF-04_confirm_request.json` | Webhook | `POST /webhook/wf-04-confirm-request` | 기존 스크립트/상태 조회 후 컨펌 재전송 | gateway `/internal/send-confirm` |
 | `WF-05_confirm_handler.json` | Webhook | `POST /webhook/wf-05-confirm` | 승인/수정 분기 및 상태 업데이트 | 승인→WF-11, 수정→WF-01 |
 | `WF-06_notebooklm_report.json` | Webhook | `POST /webhook/wf-06-report` | NotebookLM 보고서 생성 호출, 성공/실패 분기 | 성공→`/internal/send-report`, 실패→`/internal/send-text` |
@@ -616,7 +606,7 @@ nano .env   # 또는 vi .env
 | `N8N_WF08_WEBHOOK_URL` | WF-08 업로드 웹훅 URL | `http://n8n:5678/webhook/uLRW8JT5UitrhCC9/webhook/wf-08-sns-upload` |
 | `NOTEBOOKLM_MAX_SOURCES` | 채널당 최대 소스 수 | `20` |
 | `WF09_LOOKBACK_HOURS` | WF-09 새 영상 판정 시간창(시간). 빈 active notebook에도 항상 적용됨 | `24` |
-| `TOPIC_CHANNELS` | YouTube 채널 목록 | `노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg` |
+| `TOPIC_CHANNELS` | YouTube 채널 목록 | `채널A/UCxxxxxxxxxxxxxxxxxxxxxx+채널B/UCyyyyyyyyyyyyyyyyyyyyyy` |
 | `N8N_WF11_WEBHOOK_URL` | WF-11(TTS) 웹훅 URL | `http://n8n:5678/webhook/Wv5SdSdlPLwNzeqF/webhook/wf-11-tts-generate` |
 | `N8N_WF12_WEBHOOK_URL` | WF-12(HeyGen) 웹훅 URL | `http://n8n:5678/webhook/WF12HeygenV2Run/webhook/wf-12-heygen-generate-v2` |
 | `YOUTUBE_CLIENT_ID` | YouTube 업로드 OAuth Client ID | |
@@ -626,7 +616,6 @@ nano .env   # 또는 vi .env
 | `INSTAGRAM_IG_USER_ID` | Instagram 비즈니스 계정 ID | |
 | `INSTAGRAM_PAGE_ID` | (선택) 현재 업로드 경로에서는 미사용(운영 참고용) | |
 | `TTS_API_URL` | TTS API 서버 주소 | `https://...trycloudflare.com` |
-| `TTS_API_URL_INTERNAL` | 도커 내부 서비스에서 사용할 TTS URL | `http://tts-router-service:8300` |
 | `TTS_ROUTER_MODE` | TTS Router 모드 (`legacy_http`/`runpod_serverless`) | `legacy_http` |
 | `TTS_REF_AUDIO_PATH` | (선택) 음색 클론용 참조 오디오 경로 | `/workspace/reference.wav` |
 | `TTS_PROMPT_TEXT` | (선택) 참조 오디오 실제 문장 | `안녕하세요 ...` |
@@ -666,7 +655,7 @@ nano .env   # 또는 vi .env
 **`TOPIC_CHANNELS` 형식:**
 ```
 TOPIC_CHANNELS=채널이름/채널ID+채널이름/채널ID+...
-예: 노마드코더/UCUpJs89fSBXNolQGOYKn0YQ+조코딩/UCQNE2JmbasNYbjGAcuBiRRg
+예: 채널A/UCxxxxxxxxxxxxxxxxxxxxxx+채널B/UCyyyyyyyyyyyyyyyyyyyyyy
 ```
 - 채널이름: 노트북 및 보고서 식별 키로 사용됨
 - 채널ID: YouTube 채널 ID (UC로 시작하는 24자리)
@@ -724,7 +713,7 @@ docker-compose logs -f notebooklm-service
 
    | 파일 | 설명 | 트리거 |
    |------|------|--------|
-   | `WF-01_input_receive.json` | 콘텐츠 생성 요청 수신 | Webhook |
+   | `WF-01_input_receive.json` | 레거시 콘텐츠 생성 요청 수신 | Webhook |
    | `WF-04_confirm_request.json` | 컨펌 재요청 | Webhook |
    | `WF-05_confirm_handler.json` | 승인/수정 처리 | Webhook |
    | `WF-06_notebooklm_report.json` | 보고서 생성 | Webhook |
@@ -939,8 +928,8 @@ python register_command.py \
 
 | Method | Path | 호출자 | 설명 |
 |--------|------|--------|------|
-| `POST` | `/internal/message` | discord-bot | /create 요청 수신 |
-| `POST` | `/internal/send-confirm` | n8n WF-01/04 | 스크립트 컨펌 버튼 전송 |
+| `POST` | `/internal/message` | discord-bot | 레거시 `/create` 요청 수신 (현재 실운영 미사용) |
+| `POST` | `/internal/send-confirm` | n8n WF-01/04 | 레거시 스크립트 컨펌 버튼 전송 |
 | `POST` | `/internal/confirm-action` | discord-bot | 승인/수정 버튼 클릭 처리 |
 | `POST` | `/internal/send-text` | n8n WF-05/08 | 일반 텍스트 전송 |
 | `POST` | `/internal/video-action` | discord-bot | 영상 승인/재작업 버튼 처리 |
@@ -955,7 +944,6 @@ python register_command.py \
 | `POST` | `/internal/report-to-tts` | discord-bot | 보고서 → TTS만 제작 요청 |
 | `POST` | `/internal/report-to-video` | discord-bot | 보고서 → 영상 제작 요청 |
 | `POST` | `/internal/tts-generate` | discord-bot | `/tts [job_id]` 수동 WF-11 실행 (미입력 시 최근 job 자동 선택) |
-| `POST` | `/internal/heygen-generate` | discord-bot | `/heygen [job_id]` 수동 WF-12 실행 (미입력 시 최근 job 자동 선택) |
 | `POST` | `/internal/jobs` | discord-bot | `/jobs [purpose]` 최근 job 목록 조회 (`all/tts/heygen`) |
 | `GET`  | `/health` | 모니터링 | 헬스체크 |
 
@@ -964,21 +952,21 @@ python register_command.py \
 ## 테스트 시나리오
 
 ### 수집 대상 채널
-1. https://www.youtube.com/@nomadcoders
-2. https://www.youtube.com/@jocoding
-3. https://www.youtube.com/@Fireship
-4. https://www.youtube.com/@t3dotgg
-5. https://www.youtube.com/@matthew_berman
-6. https://www.youtube.com/@TwoMinutePapers
+1. https://www.youtube.com/@example-channel-a
+2. https://www.youtube.com/@example-channel-b
+3. https://www.youtube.com/@example-channel-c
+4. https://www.youtube.com/@example-channel-d
+5. https://www.youtube.com/@example-channel-e
+6. https://www.youtube.com/@example-channel-f
 
-### 콘텐츠 생성 (/create)
+### 보고서 생성 및 영상 제작 (/report)
 
-1. Discord에서 `/create concept:20대 여성을 위한 재테크 팁` 실행
-   → "✅ 요청이 접수되었습니다!" 메시지 확인
-2. WF-01 자동 실행 → 스크립트 + `[✅ 승인하기] [✏️ 수정 지시]` 버튼 수신
-3. **✅ 승인하기** → WF-11 실행 → WF-11 TTS 생성
-4. TTS 완료 → `[✅ 승인 (WF-12 진행)] [❌ 반려]` 버튼 수신
-5. TTS 승인 → WF-12 실행 → 영상 미리보기 수신 후 승인 시 WF-08 실행
+1. Discord에서 `/report` 실행
+   → 채널 선택 버튼 확인
+2. 채널 선택 후 기존 보고서 목록 또는 새 보고서 생성 버튼 확인
+3. 보고서 선택 또는 새 보고서 생성 완료 후 Discord에 대본 도착 확인
+4. `TTS만 제작` 또는 `영상으로 제작` 버튼으로 WF-11/WF-12 진입 확인
+5. TTS 승인 또는 자동 진행 후 영상 미리보기 수신, 승인 시 WF-08 실행 확인
 
 ### 보고서 조회 (/report)
 
@@ -1144,9 +1132,331 @@ python3 scripts/seed_lab.py run \
 
 참고:
 - `.yaml` dataset도 가능하지만 로컬 Python에 `PyYAML`이 있어야 합니다.
-- 현재 Seed Lab은 같은 seed당 3개(`t1~t3`)를 항상 새로 생성합니다.
+- 기본 quickstart/run 모드는 `30 x 1`입니다.
+- `-dup` 또는 dup 모드일 때만 `10 x 3`으로 생성합니다.
 - 동일 run 재실행 시에도 기존 오디오를 건너뛰지 않고 다시 생성합니다.
 - 운영 반영은 사람이 최종 seed를 확정한 뒤 `.env`의 `TTS_FIXED_SEEDS`에 수동 반영합니다.
+
+### Seed Lab 서버 운영 구조 (`/seedlab`)
+
+현재 운영 경로는 로컬 `seed_lab.py serve`가 아니라 Discord `/seedlab` 명령을 기준으로 동작합니다.
+
+전체 흐름:
+
+```text
+Discord /seedlab
+  -> discord-bot /seedlab
+  -> messenger-gateway /internal/seedlab-start
+  -> seed_lab_runs 메타 row 생성
+  -> seed-lab-service /internal/runs
+  -> run queue 등록
+  -> gateway signed link 발급
+  -> Discord ephemeral 응답 + 채널 진행 메시지 생성
+  -> seed-lab-service가 샘플 생성 / AI 평가 진행
+  -> gateway /internal/seedlab-progress 로 진행률 push
+  -> Discord 진행 메시지 1개를 계속 edit
+  -> 사용자는 signed link로 웹 UI 접속
+```
+
+Discord 명령:
+
+- `/seedlab`
+  - 기본 모드: `30 x 1`
+  - seed 미입력 시 랜덤으로 30개 생성
+- `/seedlab seeds:"111,222"`
+  - 지정 seed를 우선 사용하고 부족분은 랜덤으로 채움
+- `/seedlab dup:true`
+  - `10 x 3` 모드
+  - 같은 seed당 3개씩 생성하되 총 30개 유지
+
+서버 구성:
+
+- `discord-bot`
+  - slash command `/seedlab`를 받고 gateway의 `/internal/seedlab-start`를 호출
+- `messenger-gateway`
+  - Seed Lab run 메타데이터를 DB(`seed_lab_runs`)에 저장
+  - signed link 생성
+  - `/seedlab/r/{token}/...` 경로를 `seed-lab-service`로 reverse proxy
+  - 진행률 push를 받아 Discord 메시지를 수정
+- `seed-lab-service`
+  - 실제 run 생성/큐잉/샘플 TTS 생성/AI 평가/API 제공 담당
+  - `seed_lab.py`의 core 함수를 import해서 사용
+
+현재 관련 환경변수:
+
+| 변수 | 위치 | 역할 |
+|------|------|------|
+| `SEEDLAB_SERVICE_URL` | gateway | seed-lab-service 내부 호출 주소 |
+| `SEEDLAB_SIGNING_SECRET` | gateway | signed link HMAC 서명 |
+| `SEEDLAB_LINK_TTL_SECONDS` | gateway | 링크 만료 시간 |
+| `SEEDLAB_PUBLIC_BASE_URL` | gateway | Discord에 전달할 외부 접속 베이스 URL |
+| `SEEDLAB_GATEWAY_URL` | seed-lab-service | 진행률 push 대상 gateway 주소 |
+| `SEEDLAB_RUN_ROOT` | seed-lab-service | run 디렉터리 루트 |
+| `SEEDLAB_DEFAULT_DATASET` | seed-lab-service | 서버 기준 기본 dataset |
+| `SEEDLAB_QUEUE_CONCURRENCY` | seed-lab-service | 동시에 처리할 run 수. 현재 기본 `1` |
+| `SEEDLAB_SAMPLE_CONCURRENCY` | seed-lab-service | run 내부 TTS 생성 동시성. 현재 기본 `2` |
+| `SEEDLAB_ASR_MODEL` | seed-lab-service | 자동평가 전사 모델 |
+| `SEEDLAB_JUDGE_MODEL` | seed-lab-service | 자동평가 note 생성 모델 |
+| `SEEDLAB_EVALUATION_PROFILE` | seed-lab-service | 현재 `hybrid` |
+| `SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH` | seed-lab-service | 톤 비교용 기준 음성 로컬 경로 |
+| `SEEDLAB_REFERENCE_AUDIO_S3_URI` | seed-lab-service | 톤 비교용 기준 음성 S3 URI |
+| `SEEDLAB_REFERENCE_AUDIO_CACHE_DIR` | seed-lab-service | 기준 음성 캐시 경로 |
+| `SEEDLAB_DISABLE_LLM_NOTE` | seed-lab-service | LLM note 생성 비활성 |
+
+#### 서버 기준 TTS 생성 구조
+
+run 1개는 아래 순서로 처리됩니다.
+
+1. dataset 로드
+2. seed 목록 확정
+3. `manifest.json` / `index.html` / `human_eval.json` 초기 생성
+4. run 상태 `queued -> generating`
+5. `seed_lab.py._worker_generate_one()`으로 TTS 샘플 생성
+6. 모든 샘플 생성 후 상태 `auto_evaluating`
+7. `seed_lab.py._auto_eval_single_record()`로 AI 평가 수행
+8. 상태 `ready` 또는 `failed`
+
+현재 정책:
+
+- 활성 run은 동시에 1개만 처리
+- run 내부 샘플 생성은 `SEEDLAB_SAMPLE_CONCURRENCY`만큼 병렬 처리
+- run 생성 직후 signed link를 바로 발급하므로, 사용자는 생성 중에도 페이지를 열 수 있음
+- 진행률은 Discord 채널 메시지에서 `생성 n/30`, `AI 평가 m/x` 형태로 갱신
+
+실제 샘플 TTS 생성 경로:
+
+- TTS 서버: `.env`의 `TTS_API_URL`
+- 호출 함수: `scripts/seed_lab.py::_worker_generate_one`
+- 생성 결과는 각 record에 아래가 저장됨
+  - `sample_id`
+  - `seed`
+  - `script_id`
+  - `script_title`
+  - `status`
+  - `audio_rel_path`
+  - `audio_url` (웹 UI용 상대 경로)
+
+#### 서버 기준 저장 구조
+
+run root:
+
+```text
+runtime/seed-lab/runs/<run_id>/
+```
+
+주요 파일:
+
+- `run_state.json`
+  - 현재 run 상태, generated/evaluated/failed 카운트, 마지막 오류
+- `manifest.json`
+  - 샘플 목록과 메타데이터
+- `manifest.jsonl`
+  - manifest record 스트림
+- `index.html`
+  - Seed Lab 웹 UI
+- `human_eval.json`
+  - 사람 평가 canonical 저장본
+- `auto_eval.json`
+  - manifest 샘플에 대한 AI 평가 결과
+- `auto_eval_debug.jsonl`
+  - 샘플별 전사/평가 디버그 로그
+- `live_records.jsonl`
+  - 페이지에서 즉석 생성하여 평가 테이블에 추가한 샘플
+- `auto_eval_live.json`
+  - live sample용 AI 평가 결과
+- `auto_eval_live_debug.jsonl`
+  - live sample 평가 디버그 로그
+- `audio/...`
+  - 생성된 wav 파일
+
+DB에는 run 메타데이터만 저장합니다.
+
+테이블: `seed_lab_runs`
+
+- `run_id`
+- `status`
+- `discord_user_id`
+- `discord_channel_id`
+- `dataset_path`
+- `seed_list_raw`
+- `dup_mode`
+- `samples`
+- `takes_per_seed`
+- `concurrency`
+- `run_dir`
+- `signed_link_expires_at`
+- `last_error`
+- 진행 메시지 추적 필드
+  - `progress_message_id`
+  - `progress_last_stage`
+  - `progress_last_generated_count`
+  - `progress_last_evaluated_count`
+  - `progress_last_failed_count`
+  - `progress_last_total_count`
+
+즉 평가/샘플의 진실 원천은 파일이고, DB는 run 추적과 링크/Discord 상태만 담당합니다.
+
+#### AI 평가 구조
+
+현재 서버 Seed Lab의 AI 평가는 `seed_lab.py::_auto_eval_single_record()`를 그대로 사용합니다.
+
+입력:
+
+- 생성된 wav
+- 기준 대본 text
+- ASR 키: `OPENAI_API_KEY_SEEDLAB_ASR`
+- judge 키: `OPENAI_API_KEY_SEEDLAB_JUDGE`
+- profile: 현재 `hybrid`
+- optional 기준 음성:
+  - `SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH`
+  - `SEEDLAB_REFERENCE_AUDIO_S3_URI`
+
+평가 단계:
+
+1. ASR 전사
+  - 기본 전사 모델은 `SEEDLAB_ASR_MODEL`
+  - 전사용 모델이 아니면 내부에서 transcribe 계열 모델로 보정
+2. 전사 기반 발음 지표 계산
+  - `char_accuracy`
+  - `length_ratio`
+  - `chars_per_sec`
+3. 기준 음성(reference corpus) 해석
+  - `SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH` 또는 `SEEDLAB_REFERENCE_AUDIO_S3_URI`가 있으면 기준 음성 집합을 로드
+  - S3 사용 시 `manifest.json` + `audio/*.wav` 구조를 캐시 디렉터리(`SEEDLAB_REFERENCE_AUDIO_CACHE_DIR`)로 내려받아 사용
+  - 기준 음성에서 화자/피치/리듬 centroid를 계산
+4. wav 직접 분석
+  - `pitch_jump_rate`
+  - `pitch_dropout_rate`
+  - `rms_jump_rate`
+  - `spectral_flux_spike_rate`
+  - `zcr_spike_rate`
+  - `clipping_ratio`
+  - `short_pause_break_rate`
+  - `energy_cv`
+  - `pitch_cv`
+  - `pause_density`
+  - `voiced_segment_rate`
+5. 하이브리드 점수 계산
+  - `naturalness`
+  - `pronunciation`
+  - `stability`
+  - `tone_fit`
+  - `pitch_consistency`
+  - `artifact_cleanliness`
+  - `intonation_similarity`
+  - `weighted_ai_score`
+  - 내부 정렬용 raw 값:
+    - `naturalness_raw`
+    - `pronunciation_raw`
+    - `stability_raw`
+    - `tone_fit_raw`
+    - `pitch_consistency_raw`
+    - `artifact_cleanliness_raw`
+    - `intonation_similarity_raw`
+    - `weighted_ai_score_raw`
+6. 치명적 artifact / 억양 과락 판단
+  - `hard_artifact_fail`
+  - `hard_artifact_reason`
+  - `prosody_fail`
+  - `prosody_fail_reason`
+  - `rank_excluded`
+7. LLM note 생성
+  - judge 모델은 점수 산출이 아니라 설명(`note`) 생성에만 사용
+
+현재 AI 평가 결과는 `auto_eval.json` 또는 `auto_eval_live.json`에 저장됩니다.
+
+핵심 필드:
+
+- `naturalness`
+- `pronunciation`
+- `stability`
+- `tone_fit`
+- `pitch_consistency`
+- `artifact_cleanliness`
+- `intonation_similarity`
+- `weighted_ai_score`
+- `weighted_ai_score_raw`
+- `hard_artifact_fail`
+- `hard_artifact_reason`
+- `prosody_fail`
+- `prosody_fail_reason`
+- `rank_excluded`
+- `capabilities`
+- `reference_set_id`
+- `note`
+- `auto_eval_status`
+
+정책:
+
+- `hard_artifact_fail=true`면 AI 랭킹 후보에서 기본 제외
+- `prosody_fail=true`여도 AI 랭킹 후보에서 기본 제외
+- 테이블 정렬과 AI 랭킹은 `weighted_ai_score_raw`를 우선 사용
+- `AI 억양` 컬럼은 `intonation_similarity`를 표시
+- OpenAI note 생성이 실패해도 기계 점수는 저장 가능
+- reference audio가 없으면 `tone_fit`, `intonation_similarity` 계열은 degraded mode로 동작하고 `capabilities`에 상태가 남음
+
+#### 사람 평가 구조
+
+사람 평가는 브라우저 localStorage가 아니라 서버 파일 `human_eval.json`이 canonical source입니다.
+
+현재 웹 UI API:
+
+- `GET /runs/{run_id}/api/human-evals`
+  - 서버 저장 사람 평가 로드
+- `PUT /runs/{run_id}/api/human-evals`
+  - 현재 테이블 상태를 서버에 저장
+
+사람 평가 항목은 기본적으로 아래를 포함합니다.
+
+- 점수
+- 메모
+- 선택 여부(`selected`)
+
+즉 사용자가 브라우저에서 수정한 값은 서버 공용본으로 저장되고, 다른 브라우저에서 같은 링크를 열어도 동일한 평가 상태를 보게 됩니다.
+
+Import/Export 정책:
+
+- Export는 현재 서버 저장본 기준으로 JSON을 내보냄
+- Import 후에는 브라우저 상태만 바꾸는 것이 아니라 서버 `human_eval.json`에도 즉시 반영
+
+#### 웹 UI에서 가능한 추가 동작
+
+현재 signed link 페이지에서는 단순 조회만 하는 것이 아니라 아래가 가능합니다.
+
+- 샘플 오디오 재생
+- 사람 점수/메모/선택 수정
+- 정렬
+- AI 평가 결과 조회
+- 즉석 TTS 생성
+  - `POST /runs/{run_id}/api/tts/generate`
+  - seed, text, top_k, sample_steps 등 파라미터를 조정해 새 샘플 생성 가능
+- 즉석 생성 샘플을 평가 테이블에 추가
+- 단일 샘플 AI 재평가
+  - `POST /runs/{run_id}/api/ai-eval-one`
+
+즉석 생성 샘플을 `평가 테이블에 추가`로 만들면:
+
+- `live_records.jsonl`에 append
+- OpenAI 키가 설정돼 있으면 즉시 AI 평가 수행
+- 결과는 `auto_eval_live.json`에 저장
+
+#### Discord 피드백 구조
+
+`/seedlab` 실행 시 Discord에는 두 종류의 메시지가 존재합니다.
+
+- ephemeral 응답
+  - run id
+  - 모드(`30 x 1` 또는 `10 x 3`)
+  - signed link
+- 채널 공개 진행 메시지 1개
+  - `상태`
+  - `생성 n/30`
+  - `실패 k`
+  - `AI 평가 m/x`
+  - `링크`
+  - 실패 시 `사유`
+
+진행 메시지는 새 메시지를 계속 쌓지 않고 같은 메시지를 edit합니다.
 
 ### 자동 수집 확인
 
@@ -1215,7 +1525,7 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 ## RunPod & Cloudflare 서버 구축 튜토리얼 (GPT-SoVITS-v4 실습)
 
 ### 1. RunPod 환경 구성
-- RunPod에서 **RTX 5090** 인스턴스를 생성합니다.
+- RunPod에서 **Pytorch 2.8.0** 인스턴스를 생성합니다.
 - 포트 번호를 `8888, 9874, 9880, 9872`로 설정하여 열어줍니다.
 - 8888 포트를 통해 Jupyter Notebook으로 접속한 후, **Terminal 1**을 켭니다.
 
@@ -1259,14 +1569,15 @@ wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 dpkg -i cloudflared-linux-amd64.deb
 ```
 
-## TTS Router 기반 RunPod Serverless 전환 (복구 가능)
+## TTS Router 기반 RunPod Serverless 전환 메모 (현재 운영 경로와 별개)
 
-기존 요청 포맷(`/tts`)은 유지하고, 호출 경로만 `tts-router-service`로 분리합니다.
+이 섹션은 `tts-router-service`를 이용한 serverless 전환 메모입니다.
+현재 실운영 경로는 여전히 `TTS_API_URL` 기반 레거시 HTTP 호출이 남아 있을 수 있으므로,
+아래 내용은 "이미 완전히 적용된 현재 구조"가 아니라 전환/복구용 참고 문서로 봐야 합니다.
 
 ### 핵심 환경변수
 
 - `TTS_API_URL`: 로컬 툴(예: seed lab)에서 직접 호출할 기본 URL
-- `TTS_API_URL_INTERNAL`: 도커 내부(`messenger-gateway`, `n8n`)에서 사용할 URL
 - `TTS_ROUTER_MODE`: `legacy_http` 또는 `runpod_serverless`
 - `TTS_LEGACY_API_URL`: 기존 Cloudflare/RunPod API URL
 - `RUNPOD_API_KEY`, `RUNPOD_SERVERLESS_ENDPOINT_ID`: Serverless 호출 자격
@@ -1274,10 +1585,9 @@ dpkg -i cloudflared-linux-amd64.deb
 ### 무중단 단계별 전환
 
 1. 안전 배포(동작 동일 유지)
-   - `TTS_API_URL_INTERNAL`을 기존 값으로 두고 배포
    - `TTS_ROUTER_MODE=legacy_http`
 2. 라우터 경유 전환
-   - `TTS_API_URL_INTERNAL=http://tts-router-service:8300`
+   - 내부 호출 경로가 실제로 `tts-router-service`를 타도록 서비스 코드를 먼저 정리
    - `TTS_ROUTER_MODE=legacy_http` 유지 (실동작은 기존 API 그대로)
 3. Serverless 활성화
    - `RUNPOD_API_KEY`, `RUNPOD_SERVERLESS_ENDPOINT_ID` 설정
@@ -1286,7 +1596,6 @@ dpkg -i cloudflared-linux-amd64.deb
 ### 즉시 롤백
 
 - `TTS_ROUTER_MODE=legacy_http` 로 변경 후 재기동
-- 필요 시 `TTS_API_URL_INTERNAL`도 기존 Cloudflare URL로 복원
 
 ```bash
 cd ~/SKN22-Final-4Team-AI/ai-influencer

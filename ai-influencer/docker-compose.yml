@@ -125,6 +125,8 @@ services:
         condition: service_started
       tts-router-service:
         condition: service_healthy
+      seed-lab-service:
+        condition: service_started
     environment:
       GATEWAY_PORT: ${GATEWAY_PORT}
       GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
@@ -193,6 +195,10 @@ services:
       HEYGEN_MOCK_ENABLED: ${HEYGEN_MOCK_ENABLED:-false}
       HEYGEN_MOCK_VIDEO_URL: ${HEYGEN_MOCK_VIDEO_URL:-https://samplelib.com/lib/preview/mp4/sample-5s.mp4}
       HEYGEN_PIPELINE_SERVICE_URL: ${HEYGEN_PIPELINE_SERVICE_URL:-http://heygen-pipeline-service:8100}
+      SEEDLAB_SERVICE_URL: ${SEEDLAB_SERVICE_URL:-http://seed-lab-service:8300}
+      SEEDLAB_SIGNING_SECRET: ${SEEDLAB_SIGNING_SECRET:-}
+      SEEDLAB_LINK_TTL_SECONDS: ${SEEDLAB_LINK_TTL_SECONDS:-604800}
+      SEEDLAB_PUBLIC_BASE_URL: ${SEEDLAB_PUBLIC_BASE_URL:-}
       COST_VIEWER_BASIC_USER: ${COST_VIEWER_BASIC_USER:-}
       COST_VIEWER_BASIC_PASSWORD: ${COST_VIEWER_BASIC_PASSWORD:-}
       COST_USD_KRW_RATE: ${COST_USD_KRW_RATE:-1350}
@@ -210,6 +216,53 @@ services:
       - "8080:8080"
     networks:
       - internal
+
+  seed-lab-service:
+    depends_on:
+      seed-lab-init:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: seed-lab-service/Dockerfile
+    restart: always
+    environment:
+      GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
+      SEEDLAB_GATEWAY_URL: ${SEEDLAB_GATEWAY_URL:-http://messenger-gateway:8080}
+      TTS_API_URL: ${TTS_API_URL}
+      OPENAI_FALLBACK_API_KEY: ${OPENAI_FALLBACK_API_KEY:-}
+      OPENAI_API_KEY_SEEDLAB_ASR: ${OPENAI_API_KEY_SEEDLAB_ASR:-}
+      OPENAI_API_KEY_SEEDLAB_JUDGE: ${OPENAI_API_KEY_SEEDLAB_JUDGE:-}
+      SEEDLAB_RUN_ROOT: /app/runtime/seed-lab/runs
+      SEEDLAB_DEFAULT_DATASET: /app/scripts/seed_lab_dataset.local.json
+      SEEDLAB_QUEUE_CONCURRENCY: ${SEEDLAB_QUEUE_CONCURRENCY:-1}
+      SEEDLAB_SAMPLE_CONCURRENCY: ${SEEDLAB_SAMPLE_CONCURRENCY:-2}
+      SEEDLAB_ASR_MODEL: ${SEEDLAB_ASR_MODEL:-gpt-4o-transcribe}
+      SEEDLAB_JUDGE_MODEL: ${SEEDLAB_JUDGE_MODEL:-gpt-5.4}
+      SEEDLAB_AUTO_EVAL_TIMEOUT: ${SEEDLAB_AUTO_EVAL_TIMEOUT:-120}
+      SEEDLAB_EVALUATION_PROFILE: ${SEEDLAB_EVALUATION_PROFILE:-hybrid}
+      SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH: ${SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH:-}
+      SEEDLAB_REFERENCE_AUDIO_S3_URI: ${SEEDLAB_REFERENCE_AUDIO_S3_URI:-}
+      SEEDLAB_REFERENCE_AUDIO_CACHE_DIR: ${SEEDLAB_REFERENCE_AUDIO_CACHE_DIR:-}
+      SEEDLAB_BASE_SCRIPT_TEXT: ${SEEDLAB_BASE_SCRIPT_TEXT:-}
+      SEEDLAB_DISABLE_LLM_NOTE: ${SEEDLAB_DISABLE_LLM_NOTE:-false}
+      SEEDLAB_LANGUAGE: ${SEEDLAB_LANGUAGE:-ko}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    volumes:
+      - ./runtime/seed-lab:/app/runtime/seed-lab
+    networks:
+      - internal
+
+  seed-lab-init:
+    image: alpine:3.20
+    restart: "no"
+    command:
+      - /bin/sh
+      - -lc
+      - mkdir -p /app/runtime/seed-lab/runs && chown -R 10001:10001 /app/runtime/seed-lab
+    volumes:
+      - ./runtime/seed-lab:/app/runtime/seed-lab
 
   sns-publisher-service:
     build: ./sns-publisher-service

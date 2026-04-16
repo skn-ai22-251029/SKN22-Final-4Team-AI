@@ -200,6 +200,32 @@ class Wf13RunBatchRequest(BaseModel):
     targets: list[str] = ["youtube"]
 
 
+class SeedLabStartRequest(BaseModel):
+    messenger_user_id: str
+    messenger_channel_id: str
+    seeds: str = ""
+    dup: bool = False
+
+
+class SeedLabRefreshLinkRequest(BaseModel):
+    run_id: str
+    messenger_user_id: str = ""
+    messenger_channel_id: str = ""
+
+
+class SeedLabProgressRequest(BaseModel):
+    run_id: str
+    status: str = ""
+    stage: str = ""
+    generated_count: int = 0
+    evaluated_count: int = 0
+    ready_count: int = 0
+    failed_count: int = 0
+    total_count: int = 0
+    last_error: str = ""
+    finished_at: str = ""
+
+
 class CostEventIngestRequest(BaseModel):
     job_id: str
     topic_text: str = ""

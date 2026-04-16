@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -13,8 +15,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Awaitable, Callable, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from openai import AsyncOpenAI
 
@@ -55,6 +57,9 @@ from models.job import (
     SendReportRequest,
     SendTextRequest,
     SendVideoPreviewRequest,
+    SeedLabProgressRequest,
+    SeedLabRefreshLinkRequest,
+    SeedLabStartRequest,
     TtsActionRequest,
     VideoActionRequest,
     Wf13RunBatchRequest,
@@ -3791,6 +3796,180 @@ CostViewerAuthDep = Annotated[None, Depends(_verify_cost_viewer_auth)]
 # 어댑터 반환 헬퍼
 # ─────────────────────────────────────────
 
+_SEEDLAB_DEFAULT_SAMPLES = 30
+_SEEDLAB_DUP_SAMPLES = 10
+_SEEDLAB_DEFAULT_TAKES = 1
+_SEEDLAB_DUP_TAKES = 3
+_SEEDLAB_SAMPLE_CONCURRENCY = 2
+
+
+def _seedlab_signing_secret_bytes() -> bytes:
+    raw = (settings.seedlab_signing_secret or "").strip() or (settings.gateway_internal_secret or "").strip()
+    if not raw:
+        raise HTTPException(status_code=503, detail="Seed Lab signing secret is not configured")
+    return raw.encode("utf-8")
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(raw: str) -> bytes:
+    padding = "=" * ((4 - (len(raw) % 4)) % 4)
+    return base64.urlsafe_b64decode((raw + padding).encode("ascii"))
+
+
+def _build_seedlab_signed_token(*, run_id: str, user_id: str, expires_at: datetime) -> str:
+    payload = {
+        "run_id": run_id,
+        "discord_user_id": user_id,
+        "exp": int(expires_at.timestamp()),
+    }
+    payload_raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(_seedlab_signing_secret_bytes(), payload_raw, hashlib.sha256).digest()
+    return f"{_b64url_encode(payload_raw)}.{_b64url_encode(sig)}"
+
+
+def _verify_seedlab_signed_token(token: str) -> dict[str, Any]:
+    try:
+        payload_part, sig_part = token.split(".", 1)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail="Invalid seedlab token") from e
+    payload_raw = _b64url_decode(payload_part)
+    actual_sig = _b64url_decode(sig_part)
+    expected_sig = hmac.new(_seedlab_signing_secret_bytes(), payload_raw, hashlib.sha256).digest()
+    if not secrets.compare_digest(actual_sig, expected_sig):
+        raise HTTPException(status_code=403, detail="Invalid seedlab token")
+    payload = json.loads(payload_raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=403, detail="Invalid seedlab token payload")
+    expires_at = int(payload.get("exp") or 0)
+    if expires_at <= int(datetime.now(timezone.utc).timestamp()):
+        raise HTTPException(status_code=403, detail="Seedlab link expired")
+    run_id = str(payload.get("run_id") or "").strip()
+    user_id = str(payload.get("discord_user_id") or "").strip()
+    if not run_id or not user_id:
+        raise HTTPException(status_code=403, detail="Invalid seedlab token payload")
+    return payload
+
+
+async def _seedlab_service_request(
+    method: str,
+    path: str,
+    *,
+    json_body: Any = None,
+    content: bytes | None = None,
+    headers: Optional[dict[str, str]] = None,
+) -> httpx.Response:
+    service_base_url = (settings.seedlab_service_url or "").strip().rstrip("/")
+    if not service_base_url:
+        raise HTTPException(status_code=503, detail="Seed Lab service URL is not configured")
+    request_headers = {"X-Internal-Secret": settings.gateway_internal_secret}
+    if headers:
+        request_headers.update(headers)
+    try:
+        response = await _http_client.request(
+            method,
+            f"{service_base_url}{path}",
+            json=json_body,
+            content=content,
+            headers=request_headers,
+            timeout=120.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Seed Lab service unavailable: {e}") from e
+    return response
+
+
+def _build_seedlab_link_from_run(run: dict[str, Any]) -> str:
+    user_id = str(run.get("discord_user_id") or "").strip()
+    run_id = str(run.get("run_id") or "").strip()
+    expires_at = run.get("signed_link_expires_at")
+    if not user_id or not run_id or expires_at is None:
+        return ""
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except Exception:
+            return ""
+    if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if not isinstance(expires_at, datetime):
+        return ""
+    token = _build_seedlab_signed_token(run_id=run_id, user_id=user_id, expires_at=expires_at)
+    base_url = (settings.seedlab_public_base_url or "").strip().rstrip("/")
+    return f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
+
+
+def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequest) -> str:
+    run_id = str(run.get("run_id") or body.run_id)
+    stage = (body.stage or body.status or "queued").strip().lower()
+    total_count = max(0, int(body.total_count or 0))
+    generated_count = max(0, int(body.generated_count or 0))
+    evaluated_count = max(0, int(body.evaluated_count or 0))
+    ready_count = max(0, int(body.ready_count or 0))
+    failed_count = max(0, int(body.failed_count or 0))
+    if stage == "queued":
+        stage_label = "대기 중"
+    elif stage == "generating":
+        stage_label = "샘플 생성 중"
+    elif stage == "auto_evaluating":
+        stage_label = "AI 평가 중"
+    elif stage == "ready":
+        stage_label = "완료"
+    elif stage == "failed":
+        stage_label = "실패"
+    else:
+        stage_label = stage or "대기 중"
+
+    if stage == "auto_evaluating":
+        ai_total = ready_count or max(generated_count - failed_count, 0)
+        ai_line = f"AI 평가: {evaluated_count}/{ai_total}"
+    elif stage == "ready":
+        ai_total = ready_count or max(generated_count - failed_count, 0)
+        ai_line = f"AI 평가: {evaluated_count}/{ai_total}" if evaluated_count > 0 else "AI 평가: 비활성"
+    elif stage == "failed":
+        ai_total = ready_count or max(generated_count - failed_count, 0)
+        ai_line = f"AI 평가: {evaluated_count}/{ai_total}" if (evaluated_count > 0 or ai_total > 0) else "AI 평가: 진행 전 중단"
+    else:
+        ai_line = "AI 평가: 대기 중"
+
+    lines = [
+        "🧪 Seed Lab 실행 중",
+        f"Run ID: `{run_id}`",
+        f"상태: {stage_label}",
+        f"생성: {generated_count}/{total_count}",
+        f"실패: {failed_count}",
+        ai_line,
+    ]
+    link = _build_seedlab_link_from_run(run)
+    if link:
+        lines.append(f"링크: {link}")
+    if body.last_error:
+        lines.append(f"사유: {_clip_text(str(body.last_error), 250)}")
+    return "\n".join(lines)
+
+
+async def _ensure_seedlab_progress_message(run: dict[str, Any], text: str) -> str:
+    channel_id = str(run.get("discord_channel_id") or "").strip()
+    if not channel_id:
+        raise RuntimeError("seedlab discord channel id is missing")
+    existing_message_id = str(run.get("progress_message_id") or "").strip()
+    if existing_message_id:
+        try:
+            await _discord_adapter.edit_seedlab_progress_message(channel_id, existing_message_id, text)
+            return existing_message_id
+        except Exception as e:
+            logger.warning(
+                "[discord] seedlab progress edit failed run=%s message_id=%s err=%s",
+                run.get("run_id"),
+                existing_message_id,
+                e,
+            )
+    message_id = await _discord_adapter.send_seedlab_progress_message(channel_id, text)
+    await job_service.update_seed_lab_run(run["run_id"], progress_message_id=message_id)
+    return message_id
+
 def get_adapter(messenger_source: str) -> DiscordAdapter:
     if messenger_source == "discord":
         return _discord_adapter
@@ -5977,6 +6156,160 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
         status_code=410,
         detail="Manual /heygen is disabled. Use the TTS approval buttons to choose standard or high-quality WF-12.",
     )
+
+
+@app.post("/internal/seedlab-start")
+async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
+    run_id = f"seedlab-{uuid.uuid4().hex[:12]}"
+    samples = _SEEDLAB_DUP_SAMPLES if body.dup else _SEEDLAB_DEFAULT_SAMPLES
+    takes_per_seed = _SEEDLAB_DUP_TAKES if body.dup else _SEEDLAB_DEFAULT_TAKES
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, int(settings.seedlab_link_ttl_seconds)))
+    created = await job_service.create_seed_lab_run(
+        run_id=run_id,
+        discord_user_id=body.messenger_user_id,
+        discord_channel_id=body.messenger_channel_id,
+        dataset_path="./scripts/seed_lab_dataset.local.json",
+        seed_list_raw=(body.seeds or "").strip(),
+        dup_mode=bool(body.dup),
+        samples=samples,
+        takes_per_seed=takes_per_seed,
+        concurrency=_SEEDLAB_SAMPLE_CONCURRENCY,
+        run_dir=f"/app/runtime/seed-lab/runs/{run_id}",
+        signed_link_expires_at=expires_at,
+    )
+    response = await _seedlab_service_request(
+        "POST",
+        "/internal/runs",
+        json_body={
+            "run_id": run_id,
+            "seeds": (body.seeds or "").strip(),
+            "dup": bool(body.dup),
+        },
+    )
+    if response.status_code >= 400:
+        response_detail = response.text
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict) and parsed.get("detail"):
+                response_detail = str(parsed["detail"])
+        except Exception:
+            pass
+        await job_service.update_seed_lab_run(run_id, status="failed", last_error=response_detail[:800])
+        raise HTTPException(status_code=502, detail=f"seedlab create failed: {response_detail[:300]}")
+    token = _build_seedlab_signed_token(run_id=run_id, user_id=body.messenger_user_id, expires_at=expires_at)
+    base_url = (settings.seedlab_public_base_url or "").strip().rstrip("/")
+    link = f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
+    created = await job_service.update_seed_lab_run(run_id, status="queued")
+    return {
+        "run_id": run_id,
+        "status": str((created or {}).get("status") or "queued"),
+        "seedlab_url": link,
+        "expires_at": expires_at.isoformat(),
+        "samples": samples,
+        "takes_per_seed": takes_per_seed,
+    }
+
+
+@app.post("/internal/seedlab-refresh-link")
+async def seedlab_refresh_link(_: AuthDep, body: SeedLabRefreshLinkRequest) -> dict:
+    run = await job_service.get_seed_lab_run(body.run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Seed Lab run not found")
+    user_id = (body.messenger_user_id or "").strip() or str(run.get("discord_user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="discord user id is required")
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, int(settings.seedlab_link_ttl_seconds)))
+    await job_service.update_seed_lab_run(body.run_id, signed_link_expires_at=expires_at)
+    token = _build_seedlab_signed_token(run_id=body.run_id, user_id=user_id, expires_at=expires_at)
+    base_url = (settings.seedlab_public_base_url or "").strip().rstrip("/")
+    link = f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
+    return {"run_id": body.run_id, "seedlab_url": link, "expires_at": expires_at.isoformat()}
+
+
+@app.post("/internal/seedlab-progress")
+async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
+    run = await job_service.get_seed_lab_run(body.run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Seed Lab run not found")
+
+    incoming_stage = str(body.stage or body.status or "")
+    incoming_generated = int(body.generated_count or 0)
+    incoming_evaluated = int(body.evaluated_count or 0)
+    incoming_failed = int(body.failed_count or 0)
+    incoming_total = int(body.total_count or 0)
+
+    current_stage = str(run.get("progress_last_stage") or "")
+    current_generated = int(run.get("progress_last_generated_count") or 0)
+    current_evaluated = int(run.get("progress_last_evaluated_count") or 0)
+    current_failed = int(run.get("progress_last_failed_count") or 0)
+    current_total = int(run.get("progress_last_total_count") or 0)
+
+    should_update_message = (
+        incoming_stage != current_stage
+        or incoming_generated != current_generated
+        or incoming_evaluated != current_evaluated
+        or incoming_failed != current_failed
+        or incoming_total != current_total
+        or str(run.get("progress_message_id") or "").strip() == ""
+    )
+
+    updated_run = await job_service.update_seed_lab_run(
+        body.run_id,
+        status=str(body.status or run.get("status") or "queued"),
+        last_error=str(body.last_error or ""),
+        progress_last_stage=incoming_stage,
+        progress_last_generated_count=incoming_generated,
+        progress_last_evaluated_count=incoming_evaluated,
+        progress_last_failed_count=incoming_failed,
+        progress_last_total_count=incoming_total,
+    )
+    run_for_message = updated_run or run
+    if should_update_message and _discord_adapter is not None:
+        progress_text = _format_seedlab_progress_text(run_for_message, body)
+        await _ensure_seedlab_progress_message(run_for_message, progress_text)
+    return {"ok": True, "updated": should_update_message}
+
+
+async def _seedlab_proxy_request(token: str, suffix: str, request: Request) -> Response:
+    payload = _verify_seedlab_signed_token(token)
+    run_id = str(payload["run_id"])
+    run = await job_service.get_seed_lab_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Seed Lab run not found")
+    clean_suffix = suffix.lstrip("/")
+    service_path = f"/runs/{run_id}/{clean_suffix}" if clean_suffix else f"/runs/{run_id}/"
+    body = await request.body()
+    headers: dict[str, str] = {}
+    if request.headers.get("content-type"):
+        headers["Content-Type"] = request.headers["content-type"]
+    upstream = await _seedlab_service_request(request.method, service_path, content=body if body else None, headers=headers)
+    content_type = upstream.headers.get("content-type") or "application/octet-stream"
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=content_type.split(";", 1)[0],
+        headers={"Content-Type": content_type},
+    )
+
+
+@app.get("/seedlab/r/{token}/")
+async def seedlab_proxy_root(token: str, request: Request) -> Response:
+    return await _seedlab_proxy_request(token, "", request)
+
+
+@app.get("/seedlab/r/{token}/{suffix:path}")
+async def seedlab_proxy_get(token: str, suffix: str, request: Request) -> Response:
+    return await _seedlab_proxy_request(token, suffix, request)
+
+
+@app.post("/seedlab/r/{token}/{suffix:path}")
+async def seedlab_proxy_post(token: str, suffix: str, request: Request) -> Response:
+    return await _seedlab_proxy_request(token, suffix, request)
+
+
+@app.put("/seedlab/r/{token}/{suffix:path}")
+async def seedlab_proxy_put(token: str, suffix: str, request: Request) -> Response:
+    return await _seedlab_proxy_request(token, suffix, request)
 
 
 @app.post("/internal/jobs")

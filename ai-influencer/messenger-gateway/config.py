@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     heygen_pipeline_service_url: str = "http://heygen-pipeline-service:8100"
     heygen_pipeline_service_timeout_seconds: float = 120.0
     sns_publisher_service_url: str = "http://sns-publisher-service:8200"
+    seedlab_service_url: str = "http://seed-lab-service:8300"
+    seedlab_signing_secret: str = ""
+    seedlab_link_ttl_seconds: int = 604800
+    seedlab_public_base_url: str = ""
 
     # Cross-account S3 (AssumeRole)
     media_s3_bucket: str = ""

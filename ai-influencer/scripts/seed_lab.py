@@ -12,12 +12,15 @@ Goals:
 from __future__ import annotations
 
 import argparse
+import audioop
 import concurrent.futures
 import csv
 import datetime as dt
+import hashlib
 import html
 import http.server
 import json
+import math
 import mimetypes
 import os
 import random
@@ -32,6 +35,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,8 +53,21 @@ DEFAULT_SERVE_PORT = 8765
 DEFAULT_AUTO_EVAL_ASR_MODEL = "gpt-4o-transcribe"
 DEFAULT_AUTO_EVAL_JUDGE_MODEL = "gpt-5.4"
 DEFAULT_AUTO_EVAL_TIMEOUT = 120
+DEFAULT_AUTO_EVAL_PROFILE = "hybrid"
 LIVE_RECORDS_JSONL = "live_records.jsonl"
 LIVE_AUTO_EVAL_JSON = "auto_eval_live.json"
+HUMAN_EVAL_JSON = "human_eval.json"
+AI_SCORE_KEYS = (
+    "naturalness",
+    "pronunciation",
+    "stability",
+    "tone_fit",
+    "pitch_consistency",
+    "artifact_cleanliness",
+    "intonation_similarity",
+)
+_DISTILLMOS_PREDICTOR: Any | None = None
+_SPEAKER_VERIFIER: Any | None = None
 
 
 @dataclass
@@ -91,6 +108,13 @@ def _load_optional_yaml(text: str, path: Path) -> dict[str, Any]:
     return parsed
 
 
+def _resolve_seedlab_base_script_override() -> str:
+    raw = (os.getenv("SEEDLAB_BASE_SCRIPT_TEXT") or "").strip()
+    if not raw:
+        return ""
+    return raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\r")
+
+
 def load_dataset(path: Path) -> tuple[list[ScriptItem], dict[str, Any]]:
     if not path.exists():
         raise RuntimeError(f"dataset not found: {path}")
@@ -108,6 +132,7 @@ def load_dataset(path: Path) -> tuple[list[ScriptItem], dict[str, Any]]:
         raise RuntimeError("dataset.scripts must be a non-empty list")
 
     scripts: list[ScriptItem] = []
+    base_script_override = _resolve_seedlab_base_script_override()
     for idx, item in enumerate(scripts_raw, start=1):
         if isinstance(item, str):
             script_id = f"s{idx}"
@@ -119,6 +144,8 @@ def load_dataset(path: Path) -> tuple[list[ScriptItem], dict[str, Any]]:
             content = str(item.get("text") or "").strip()
         else:
             raise RuntimeError(f"dataset.scripts[{idx}] invalid type={type(item).__name__}")
+        if base_script_override and script_id == "s1":
+            content = base_script_override
         if not content:
             raise RuntimeError(f"dataset.scripts[{idx}] text is empty")
         scripts.append(ScriptItem(script_id=script_id, title=title, text=content))
@@ -381,7 +408,7 @@ def _upsert_eval_entry(
     payload = _load_eval_payload(path)
     payload["run_id"] = str(payload.get("run_id") or run_id)
     payload["exported_at"] = dt.datetime.now().isoformat()
-    payload["mode"] = str(payload.get("mode") or "auto_eval_asr_llm")
+    payload["mode"] = str(payload.get("mode") or "auto_eval_hybrid_v2")
     payload["asr_model"] = str(payload.get("asr_model") or asr_model)
     payload["judge_model"] = str(payload.get("judge_model") or judge_model)
     evaluations = payload.get("evaluations")
@@ -389,6 +416,28 @@ def _upsert_eval_entry(
         evaluations = {}
         payload["evaluations"] = evaluations
     evaluations[sample_id] = eval_obj
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_human_eval_map(path: Path) -> dict[str, dict[str, Any]]:
+    payload = _load_eval_payload(path)
+    evaluations = payload.get("evaluations")
+    if not isinstance(evaluations, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for sample_id, eval_obj in evaluations.items():
+        if isinstance(eval_obj, dict):
+            out[str(sample_id)] = eval_obj
+    return out
+
+
+def _write_human_eval_map(path: Path, *, run_id: str, evaluations: dict[str, Any]) -> None:
+    payload = {
+        "run_id": run_id,
+        "exported_at": dt.datetime.now().isoformat(),
+        "mode": "human_eval_v1",
+        "evaluations": evaluations if isinstance(evaluations, dict) else {},
+    }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -719,6 +768,10 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
             <th class="sortable" data-human-sort="tone_fit" data-label="톤" style="min-width:44px;">톤</th>
             <th class="sortable" data-human-sort="avg" data-label="평균" style="min-width:50px;">평균</th>
             <th class="sortable" data-human-sort="ai_avg" data-label="AI 평균" style="min-width:56px;">AI 평균</th>
+            <th class="sortable" data-human-sort="ai_pitch" data-label="AI 피치" style="min-width:56px;">AI 피치</th>
+            <th class="sortable" data-human-sort="ai_artifact" data-label="AI 튐" style="min-width:56px;">AI 튐</th>
+            <th class="sortable" data-human-sort="ai_intonation" data-label="AI 억양" style="min-width:56px;">AI 억양</th>
+            <th class="sortable" data-human-sort="ai_fail" data-label="과락" style="min-width:56px;">과락</th>
             <th style="min-width:160px;">AI note</th>
             <th class="sortable" data-human-sort="selected" data-label="선택" style="min-width:56px;">선택</th>
             <th>메모</th>
@@ -742,8 +795,10 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
     const RUN_ID = {json.dumps(run_id, ensure_ascii=False)};
     const STORAGE_KEY = "seed-lab-eval:" + RUN_ID;
     const AI_STORAGE_KEY = "seed-lab-ai-eval:" + RUN_ID;
+    const API_BASE = new URL("./api/", window.location.href);
     const MANIFEST = {manifest_json};
     const SCORE_KEYS = ["naturalness", "pronunciation", "stability", "tone_fit"];
+    const AI_SCORE_KEYS = ["naturalness", "pronunciation", "stability", "tone_fit", "pitch_consistency", "artifact_cleanliness", "intonation_similarity"];
     let records = [...MANIFEST];
     let serverConfig = {{
       openai_configured: false,
@@ -758,6 +813,16 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
         pronunciation: "",
         stability: "",
         tone_fit: "",
+        pitch_consistency: "",
+        artifact_cleanliness: "",
+        intonation_similarity: "",
+        weighted_ai_score: "",
+        weighted_ai_score_raw: "",
+        hard_artifact_fail: false,
+        hard_artifact_reason: "",
+        prosody_fail: false,
+        prosody_fail_reason: "",
+        rank_excluded: false,
         note: "",
         selected: false,
         updated_at: "",
@@ -768,7 +833,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       return new Date().toISOString();
     }}
 
-    function loadState() {{
+    function loadLocalState() {{
       try {{
         const raw = localStorage.getItem(STORAGE_KEY);
         if (!raw) return {{}};
@@ -779,7 +844,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       }}
     }}
 
-    function saveState(state) {{
+    function saveLocalState(state) {{
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     }}
 
@@ -798,6 +863,23 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       localStorage.setItem(AI_STORAGE_KEY, JSON.stringify(state));
     }}
 
+    let humanStateSaveTimer = null;
+
+    function saveState(state) {{
+      saveLocalState(state);
+      if (humanStateSaveTimer) {{
+        clearTimeout(humanStateSaveTimer);
+      }}
+      humanStateSaveTimer = setTimeout(() => {{
+        apiPost("human-evals", {{
+          run_id: RUN_ID,
+          evaluations: state,
+        }}, "PUT").catch((_e) => {{
+          // 네트워크 실패 시 localStorage fallback 유지
+        }});
+      }}, 250);
+    }}
+
     function mergeRecords(base, extras) {{
       const orderedIds = [];
       const map = new Map();
@@ -812,8 +894,13 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       return orderedIds.map((id) => map.get(id));
     }}
 
+    function apiUrl(path) {{
+      const normalized = String(path || "").replace(/^\\/+/, "");
+      return new URL(normalized, API_BASE).toString();
+    }}
+
     async function apiGet(path) {{
-      const resp = await fetch(path, {{ method: "GET" }});
+      const resp = await fetch(apiUrl(path), {{ method: "GET" }});
       if (!resp.ok) {{
         const text = await resp.text();
         throw new Error(`HTTP ${{resp.status}}: ${{text.slice(0, 200)}}`);
@@ -821,9 +908,9 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       return resp.json();
     }}
 
-    async function apiPost(path, body) {{
-      const resp = await fetch(path, {{
-        method: "POST",
+    async function apiPost(path, body, method = "POST") {{
+      const resp = await fetch(apiUrl(path), {{
+        method,
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify(body),
       }});
@@ -841,8 +928,15 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       return parsed;
     }}
 
-    function scoreAvg(evalObj) {{
-      const vals = SCORE_KEYS.map(k => Number(evalObj[k])).filter(v => Number.isFinite(v) && v > 0);
+    function scoreAvg(evalObj, aiMode = false) {{
+      if (aiMode) {{
+        const weighted = Number(evalObj && evalObj.weighted_ai_score);
+        if (Number.isFinite(weighted) && weighted > 0) return weighted.toFixed(2);
+        const weightedRaw = Number(evalObj && evalObj.weighted_ai_score_raw);
+        if (Number.isFinite(weightedRaw) && weightedRaw >= 0) return (1 + weightedRaw * 4).toFixed(2);
+      }}
+      const keys = aiMode ? AI_SCORE_KEYS : SCORE_KEYS;
+      const vals = keys.map(k => Number(evalObj[k])).filter(v => Number.isFinite(v) && v > 0);
       if (!vals.length) return "";
       return (vals.reduce((a,b) => a+b, 0) / vals.length).toFixed(2);
     }}
@@ -883,9 +977,24 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
           return Number.isFinite(v) ? v : -1;
         }}
         if (key === "ai_avg") {{
-          const v = Number(scoreAvg(ai));
+          const raw = Number(ai.weighted_ai_score_raw);
+          if (Number.isFinite(raw) && raw >= 0) return raw;
+          const v = Number(scoreAvg(ai, true));
           return Number.isFinite(v) ? v : -1;
         }}
+        if (key === "ai_pitch") {{
+          const v = Number(ai.pitch_consistency);
+          return Number.isFinite(v) ? v : -1;
+        }}
+        if (key === "ai_artifact") {{
+          const v = Number(ai.artifact_cleanliness);
+          return Number.isFinite(v) ? v : -1;
+        }}
+        if (key === "ai_intonation") {{
+          const v = Number(ai.intonation_similarity);
+          return Number.isFinite(v) ? v : -1;
+        }}
+        if (key === "ai_fail") return ai && (ai.hard_artifact_fail || ai.prosody_fail) ? 1 : 0;
         if (key === "selected") return ev.selected ? 1 : 0;
         if (key === "status") return String(rec.status || "");
         if (SCORE_KEYS.includes(key)) {{
@@ -1059,11 +1168,36 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
         tr.appendChild(tdAvg);
 
         const tdAiAvg = document.createElement("td");
-        tdAiAvg.textContent = scoreAvg(ai) || "-";
+        tdAiAvg.textContent = scoreAvg(ai, true) || "-";
         tr.appendChild(tdAiAvg);
 
+        const tdAiPitch = document.createElement("td");
+        tdAiPitch.textContent = String(ai.pitch_consistency || "-");
+        tr.appendChild(tdAiPitch);
+
+        const tdAiArtifact = document.createElement("td");
+        tdAiArtifact.textContent = String(ai.artifact_cleanliness || "-");
+        tr.appendChild(tdAiArtifact);
+
+        const tdAiIntonation = document.createElement("td");
+        tdAiIntonation.textContent = String(ai.intonation_similarity || "-");
+        tr.appendChild(tdAiIntonation);
+
+        const tdAiFail = document.createElement("td");
+        const aiFailed = !!(ai && (ai.hard_artifact_fail || ai.prosody_fail));
+        tdAiFail.textContent = aiFailed ? "Y" : "-";
+        tdAiFail.className = aiFailed ? "bad" : "";
+        tr.appendChild(tdAiFail);
+
         const tdAiNote = document.createElement("td");
-        tdAiNote.textContent = String(ai.note || "-");
+        let failPrefix = "";
+        if (ai && ai.hard_artifact_fail) {{
+          failPrefix += `[과락:${{String(ai.hard_artifact_reason || "artifact")}}] `;
+        }}
+        if (ai && ai.prosody_fail) {{
+          failPrefix += `[억양과락:${{String(ai.prosody_fail_reason || "prosody")}}] `;
+        }}
+        tdAiNote.textContent = failPrefix + String(ai.note || "-");
         tr.appendChild(tdAiNote);
 
         const tdSel = document.createElement("td");
@@ -1196,7 +1330,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       const payload = {{
         run_id: RUN_ID,
         exported_at: nowIso(),
-        mode: "auto_eval_asr_llm",
+        mode: "auto_eval_hybrid_v3",
         evaluations: aiMap,
       }};
       const blob = new Blob([JSON.stringify(payload, null, 2)], {{ type: "application/json" }});
@@ -1212,7 +1346,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
 
     async function refreshLiveRecords(renderAfter = true) {{
       try {{
-        const payload = await apiGet("/api/live-records");
+        const payload = await apiGet("live-records");
         const incoming = Array.isArray(payload.records) ? payload.records : [];
         records = mergeRecords(MANIFEST, incoming);
         if (renderAfter) render(state);
@@ -1224,7 +1358,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
 
     async function refreshAiState(renderAfter = true) {{
       try {{
-        const payload = await apiGet("/api/ai-evals");
+        const payload = await apiGet("ai-evals");
         const incoming = payload && typeof payload === "object" ? payload.evaluations : {{}};
         aiState = incoming && typeof incoming === "object" ? incoming : {{}};
         saveAiState(aiState);
@@ -1234,9 +1368,38 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       if (renderAfter) render(state);
     }}
 
+    async function refreshHumanState(renderAfter = true) {{
+      try {{
+        const payload = await apiGet("human-evals");
+        const incoming = payload && typeof payload === "object" ? payload.evaluations : {{}};
+        if (incoming && typeof incoming === "object") {{
+          for (const [sampleId, value] of Object.entries(incoming)) {{
+            if (!value || typeof value !== "object") continue;
+            state[sampleId] = {{
+              ...emptyEval(),
+              ...state[sampleId],
+              ...value,
+            }};
+          }}
+          saveLocalState(state);
+        }}
+      }} catch (_e) {{
+        // localStorage fallback 유지
+      }}
+      if (renderAfter) render(state);
+    }}
+
+    async function refreshRunStatus() {{
+      try {{
+        return await apiGet("run-status");
+      }} catch (_e) {{
+        return null;
+      }}
+    }}
+
     async function loadServerConfig() {{
       try {{
-        const payload = await apiGet("/api/config");
+        const payload = await apiGet("config");
         serverConfigLoaded = true;
         serverConfig = {{
           openai_configured: !!(payload && payload.openai_configured),
@@ -1265,7 +1428,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       }}
     }}
 
-    const state = loadState();
+    const state = loadLocalState();
     let aiState = loadAiState();
     const scriptModal = document.getElementById("scriptModal");
     const scriptModalTitle = document.getElementById("scriptModalTitle");
@@ -1354,7 +1517,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       pgGenerateBtn.disabled = true;
       pgStatus.textContent = "생성 중...";
       try {{
-        const out = await apiPost("/api/tts/generate", payload);
+        const out = await apiPost("tts/generate", payload);
         const audioUrl = String(out.audio_url || "");
         if (audioUrl) {{
           pgAudio.src = audioUrl + `?t=${{Date.now()}}`;
@@ -1384,7 +1547,19 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       pgScriptText.value = String(MANIFEST[0].script_text || "");
     }}
     render(state);
-    loadServerConfig().then(() => refreshLiveRecords(false).then(() => refreshAiState(true)));
+    loadServerConfig()
+      .then(() => refreshHumanState(false))
+      .then(() => refreshLiveRecords(false))
+      .then(() => refreshAiState(true));
+    const pollHandle = setInterval(() => {{
+      refreshRunStatus().then((statusPayload) => {{
+        const runStatus = String((statusPayload && statusPayload.status) || "");
+        refreshLiveRecords(false).then(() => refreshAiState(true));
+        if (runStatus === "ready" || runStatus === "failed") {{
+          clearInterval(pollHandle);
+        }}
+      }});
+    }}, 5000);
   </script>
 </body>
 </html>
@@ -1447,6 +1622,10 @@ def _worker_generate_one(
                 "error_type": "",
                 "error": "",
                 "bytes": len(audio_bytes),
+                "tts_params": {
+                    "ref_audio_path": str(tts_params.get("ref_audio_path") or ""),
+                    "reference_audio_local_path": str(tts_params.get("reference_audio_local_path") or ""),
+                },
             }
         except Exception as e:
             last_error = str(e)
@@ -1469,6 +1648,10 @@ def _worker_generate_one(
         "error_type": error_type,
         "error": last_error[:800],
         "bytes": 0,
+        "tts_params": {
+            "ref_audio_path": str(tts_params.get("ref_audio_path") or ""),
+            "reference_audio_local_path": str(tts_params.get("reference_audio_local_path") or ""),
+        },
     }
 
 
@@ -1787,6 +1970,679 @@ def _wav_duration_seconds(path: Path) -> float:
         return 0.0
 
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _mean(values: list[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return float(ordered[mid])
+    return float((ordered[mid - 1] + ordered[mid]) / 2.0)
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    pos = _clamp(q, 0.0, 1.0) * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(ordered[lo])
+    frac = pos - lo
+    return float(ordered[lo] * (1.0 - frac) + ordered[hi] * frac)
+
+
+def _safe_div(num: float, den: float) -> float:
+    return float(num / den) if den else 0.0
+
+
+def _sigmoid01(value: float, *, center: float, width: float) -> float:
+    width = max(1e-6, float(width))
+    return 1.0 / (1.0 + math.exp(-((float(value) - center) / width)))
+
+
+def _linear_similarity(value: float, *, ideal: float, tolerance: float) -> float:
+    tolerance = max(1e-6, float(tolerance))
+    return _clamp(1.0 - (abs(float(value) - ideal) / tolerance), 0.0, 1.0)
+
+
+def _pairwise_mean(values: list[float]) -> float | None:
+    cleaned = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    if not cleaned:
+        return None
+    return _mean(cleaned)
+
+
+def _map_similarity_to_score(value: float | None, *, floor: float = 1.0, ceil: float = 5.0) -> float | None:
+    if value is None:
+        return None
+    return round(_clamp(floor + (ceil - floor) * float(value), floor, ceil), 2)
+
+
+def _read_wav_mono_samples(path: Path) -> tuple[list[float], int]:
+    with wave.open(str(path), "rb") as wf:
+        frames = wf.readframes(wf.getnframes())
+        sample_rate = int(wf.getframerate() or 0)
+        sample_width = int(wf.getsampwidth() or 0)
+        channels = int(wf.getnchannels() or 1)
+    if sample_rate <= 0 or sample_width <= 0:
+        return [], 0
+    mono = frames
+    if channels > 1:
+        mono = audioop.tomono(frames, sample_width, 0.5, 0.5)
+    if sample_width == 1:
+        raw = array("B", mono)
+        samples = [(float(v) - 128.0) / 128.0 for v in raw]
+    elif sample_width == 2:
+        raw = array("h")
+        raw.frombytes(mono)
+        if sys.byteorder != "little":
+            raw.byteswap()
+        samples = [float(v) / 32768.0 for v in raw]
+    elif sample_width == 3:
+        widened = audioop.lin2lin(mono, 3, 4)
+        raw = array("i")
+        raw.frombytes(widened)
+        if sys.byteorder != "little":
+            raw.byteswap()
+        samples = [float(v) / 2147483648.0 for v in raw]
+    else:
+        raw = array("i")
+        raw.frombytes(audioop.lin2lin(mono, sample_width, 4))
+        if sys.byteorder != "little":
+            raw.byteswap()
+        samples = [float(v) / 2147483648.0 for v in raw]
+    return samples, sample_rate
+
+
+def _estimate_pitch_hz(frame: list[float], sample_rate: int) -> float:
+    if not frame or sample_rate <= 0:
+        return 0.0
+    energy = math.sqrt(sum(v * v for v in frame) / len(frame))
+    if energy < 0.015:
+        return 0.0
+    min_f0 = 70.0
+    max_f0 = 400.0
+    min_lag = max(1, int(sample_rate / max_f0))
+    max_lag = min(len(frame) - 2, int(sample_rate / min_f0))
+    if max_lag <= min_lag:
+        return 0.0
+    denom = sum(v * v for v in frame)
+    if denom <= 1e-9:
+        return 0.0
+    best_lag = 0
+    best_corr = 0.0
+    for lag in range(min_lag, max_lag + 1):
+        corr = 0.0
+        upto = len(frame) - lag
+        for i in range(upto):
+            corr += frame[i] * frame[i + lag]
+        normalized = corr / denom
+        if normalized > best_corr:
+            best_corr = normalized
+            best_lag = lag
+    if best_lag <= 0 or best_corr < 0.30:
+        return 0.0
+    return float(sample_rate) / float(best_lag)
+
+
+def _prosody_features_from_samples(samples: list[float], sample_rate: int) -> dict[str, Any]:
+    if not samples or sample_rate <= 0:
+        return {
+            "duration_sec": 0.0,
+            "f0_median_hz": 0.0,
+            "f0_iqr_hz": 0.0,
+            "voiced_ratio": 0.0,
+            "pitch_jump_rate": 1.0,
+            "pitch_dropout_rate": 1.0,
+            "rms_jump_rate": 1.0,
+            "spectral_flux_spike_rate": 1.0,
+            "zcr_spike_rate": 1.0,
+            "clipping_ratio": 1.0,
+            "short_pause_break_rate": 1.0,
+            "energy_cv": 1.0,
+            "pitch_cv": 1.0,
+            "pause_density": 1.0,
+            "voiced_segment_rate": 1.0,
+            "worst_artifact_window_sec": 0.0,
+        }
+
+    frame_size = max(256, int(sample_rate * 0.02))
+    hop_size = max(128, int(sample_rate * 0.01))
+    rms_values: list[float] = []
+    zcr_values: list[float] = []
+    flux_values: list[float] = []
+    pitch_values: list[float] = []
+    pause_count = 0
+    silent_run = 0
+    prev_energy_band: list[float] | None = None
+    voiced_segments = 0
+    in_voiced = False
+
+    for start in range(0, max(1, len(samples) - frame_size + 1), hop_size):
+        frame = samples[start : start + frame_size]
+        if len(frame) < frame_size:
+            break
+        rms = math.sqrt(sum(v * v for v in frame) / len(frame))
+        rms_values.append(rms)
+        zero_crossings = 0
+        for left, right in zip(frame[:-1], frame[1:]):
+            if (left <= 0 < right) or (left >= 0 > right):
+                zero_crossings += 1
+        zcr_values.append(float(zero_crossings) / max(1, len(frame) - 1))
+
+        band_size = max(1, len(frame) // 8)
+        current_energy_band: list[float] = []
+        for band_idx in range(8):
+            band = frame[band_idx * band_size : (band_idx + 1) * band_size]
+            if not band:
+                continue
+            current_energy_band.append(sum(abs(v) for v in band) / len(band))
+        if prev_energy_band and current_energy_band and len(prev_energy_band) == len(current_energy_band):
+            flux = 0.0
+            for prev_val, curr_val in zip(prev_energy_band, current_energy_band):
+                flux += abs(curr_val - prev_val)
+            flux_values.append(flux / len(current_energy_band))
+        prev_energy_band = current_energy_band
+
+        if rms < 0.008:
+            silent_run += 1
+        else:
+            if silent_run >= 3:
+                pause_count += 1
+            silent_run = 0
+
+        pitch_hz = _estimate_pitch_hz(frame, sample_rate)
+        if pitch_hz > 0:
+            pitch_values.append(pitch_hz)
+            if not in_voiced:
+                voiced_segments += 1
+                in_voiced = True
+        else:
+            in_voiced = False
+
+    duration_sec = len(samples) / float(sample_rate)
+    voiced_ratio = _safe_div(len(pitch_values), len(rms_values))
+    f0_median_hz = _median(pitch_values)
+    f0_iqr_hz = max(0.0, _quantile(pitch_values, 0.75) - _quantile(pitch_values, 0.25))
+    clipping_ratio = _safe_div(sum(1 for s in samples if abs(s) >= 0.985), len(samples))
+
+    pitch_jumps = 0
+    for left, right in zip(pitch_values[:-1], pitch_values[1:]):
+        ratio = max(left, right) / max(1e-6, min(left, right))
+        if ratio > 1.22:
+            pitch_jumps += 1
+    pitch_jump_rate = _safe_div(pitch_jumps, max(1, len(pitch_values) - 1))
+    pitch_dropout_rate = 1.0 - voiced_ratio
+
+    rms_jump_count = 0
+    worst_rms_jump = 0.0
+    worst_rms_idx = 0
+    for idx, (left, right) in enumerate(zip(rms_values[:-1], rms_values[1:])):
+        if left < 1e-6:
+            continue
+        jump = abs(math.log((right + 1e-6) / (left + 1e-6)))
+        if jump > 0.70:
+            rms_jump_count += 1
+        if jump > worst_rms_jump:
+            worst_rms_jump = jump
+            worst_rms_idx = idx
+    rms_jump_rate = _safe_div(rms_jump_count, max(1, len(rms_values) - 1))
+
+    flux_baseline = _quantile(flux_values, 0.8) if flux_values else 0.0
+    flux_spike_count = sum(1 for val in flux_values if flux_baseline > 0 and val > flux_baseline * 2.3)
+    spectral_flux_spike_rate = _safe_div(flux_spike_count, len(flux_values))
+
+    zcr_baseline = _quantile(zcr_values, 0.8) if zcr_values else 0.0
+    zcr_spike_count = sum(1 for val in zcr_values if zcr_baseline > 0 and val > zcr_baseline * 1.9)
+    zcr_spike_rate = _safe_div(zcr_spike_count, len(zcr_values))
+
+    short_pause_break_rate = _safe_div(pause_count, max(1.0, duration_sec / 2.0))
+    energy_cv = _safe_div(math.sqrt(_mean([(v - _mean(rms_values)) ** 2 for v in rms_values])), max(1e-6, _mean(rms_values))) if rms_values else 0.0
+    pitch_cv = _safe_div(math.sqrt(_mean([(v - _mean(pitch_values)) ** 2 for v in pitch_values])), max(1e-6, _mean(pitch_values))) if pitch_values else 1.0
+    pause_density = _safe_div(pause_count, max(duration_sec, 1e-6))
+    voiced_segment_rate = _safe_div(voiced_segments, max(duration_sec, 1e-6))
+    worst_artifact_window_sec = round((worst_rms_idx * hop_size) / float(sample_rate), 3) if rms_values else 0.0
+
+    return {
+        "duration_sec": round(duration_sec, 6),
+        "f0_median_hz": round(f0_median_hz, 6),
+        "f0_iqr_hz": round(f0_iqr_hz, 6),
+        "voiced_ratio": round(voiced_ratio, 6),
+        "pitch_jump_rate": round(pitch_jump_rate, 6),
+        "pitch_dropout_rate": round(pitch_dropout_rate, 6),
+        "rms_jump_rate": round(rms_jump_rate, 6),
+        "spectral_flux_spike_rate": round(spectral_flux_spike_rate, 6),
+        "zcr_spike_rate": round(zcr_spike_rate, 6),
+        "clipping_ratio": round(clipping_ratio, 6),
+        "short_pause_break_rate": round(short_pause_break_rate, 6),
+        "energy_cv": round(energy_cv, 6),
+        "pitch_cv": round(pitch_cv, 6),
+        "pause_density": round(pause_density, 6),
+        "voiced_segment_rate": round(voiced_segment_rate, 6),
+        "worst_artifact_window_sec": worst_artifact_window_sec,
+    }
+
+
+def _build_reference_corpus_summary(reference_audio_paths: list[Path]) -> dict[str, Any]:
+    pitch_profile_values: list[float] = []
+    speaker_scores: list[float] = []
+    durations: list[float] = []
+    f0_medians: list[float] = []
+    f0_iqrs: list[float] = []
+    voiced_ratios: list[float] = []
+    energy_cvs: list[float] = []
+    pause_densities: list[float] = []
+    voiced_segment_rates: list[float] = []
+
+    per_file_features: list[dict[str, Any]] = []
+    for path in reference_audio_paths:
+        samples, sample_rate = _read_wav_mono_samples(path)
+        features = _prosody_features_from_samples(samples, sample_rate)
+        per_file_features.append(features)
+        durations.append(float(features.get("duration_sec") or 0.0))
+        f0_medians.append(float(features.get("f0_median_hz") or 0.0))
+        f0_iqrs.append(float(features.get("f0_iqr_hz") or 0.0))
+        voiced_ratios.append(float(features.get("voiced_ratio") or 0.0))
+        energy_cvs.append(float(features.get("energy_cv") or 0.0))
+        pause_densities.append(float(features.get("pause_density") or 0.0))
+        voiced_segment_rates.append(float(features.get("voiced_segment_rate") or 0.0))
+
+    return {
+        "reference_count": len(reference_audio_paths),
+        "duration_sec_mean": _pairwise_mean(durations) or 0.0,
+        "f0_median_hz_mean": _pairwise_mean(f0_medians) or 0.0,
+        "f0_iqr_hz_mean": _pairwise_mean(f0_iqrs) or 0.0,
+        "voiced_ratio_mean": _pairwise_mean(voiced_ratios) or 0.0,
+        "energy_cv_mean": _pairwise_mean(energy_cvs) or 0.0,
+        "pause_density_mean": _pairwise_mean(pause_densities) or 0.0,
+        "voiced_segment_rate_mean": _pairwise_mean(voiced_segment_rates) or 0.0,
+        "per_file_features": per_file_features,
+    }
+
+
+def _resolve_reference_audio_paths(
+    *,
+    run_dir: Path,
+    rec: dict[str, Any],
+    explicit_local_path: str,
+    explicit_s3_uri: str,
+    reference_audio_cache_dir: str,
+) -> tuple[list[Path], str, str]:
+    paths: list[Path] = []
+    source = ""
+    reference_set_id = ""
+
+    local_candidates = []
+    if explicit_local_path:
+        local_candidates.append(Path(explicit_local_path).expanduser())
+    for key in ("reference_audio_local_path", "reference_audio_eval_path", "ref_audio_path"):
+        raw = str(rec.get(key) or "").strip()
+        if raw:
+            local_candidates.append(Path(raw).expanduser())
+    for candidate in local_candidates:
+        if candidate.is_dir():
+            found = sorted([p for p in candidate.iterdir() if p.suffix.lower() == ".wav"])
+            if found:
+                return found, "local_dir", candidate.name
+        if candidate.exists() and candidate.is_file():
+            return [candidate], "local_file", candidate.stem
+
+    if explicit_s3_uri:
+        try:
+            import boto3  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"reference_audio_s3_uri requires boto3: {e}") from e
+        if not explicit_s3_uri.startswith("s3://"):
+            raise RuntimeError("reference_audio_s3_uri must start with s3://")
+        parsed = urllib.parse.urlparse(explicit_s3_uri)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        cache_root = Path(reference_audio_cache_dir).expanduser() if reference_audio_cache_dir else (run_dir / ".ref-audio-cache")
+        cache_root.mkdir(parents=True, exist_ok=True)
+        s3 = boto3.client("s3")
+        manifest_key = key
+        if not manifest_key.endswith(".json"):
+            manifest_key = manifest_key.rstrip("/") + "/manifest.json"
+        manifest_local = cache_root / hashlib.sha256(f"{bucket}/{manifest_key}".encode("utf-8")).hexdigest() / "manifest.json"
+        manifest_local.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, manifest_key, str(manifest_local))
+        manifest = json.loads(manifest_local.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise RuntimeError("reference manifest must be an object")
+        reference_set_id = str(manifest.get("reference_set_id") or manifest.get("voice_id") or manifest_key.replace("/", "-")).strip()
+        files = manifest.get("files")
+        if not isinstance(files, list) or not files:
+            raise RuntimeError("reference manifest files must be a non-empty list")
+        local_files: list[Path] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            if item.get("enabled", True) is False:
+                continue
+            rel_key = str(item.get("key") or "").strip()
+            if not rel_key:
+                continue
+            local_path = manifest_local.parent / rel_key.replace("/", "_")
+            s3.download_file(bucket, rel_key, str(local_path))
+            if local_path.exists():
+                local_files.append(local_path)
+        if local_files:
+            return local_files, "s3_manifest", reference_set_id or manifest_local.parent.name
+
+    return paths, source, reference_set_id
+
+
+def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path] | None = None) -> dict[str, Any]:
+    samples, sample_rate = _read_wav_mono_samples(audio_path)
+    if not samples or sample_rate <= 0:
+        return {
+            "duration_sec": 0.0,
+            "mos_pred": None,
+            "speaker_similarity": None,
+            "pitch_profile_similarity": None,
+            "f0_median_hz": 0.0,
+            "f0_iqr_hz": 0.0,
+            "voiced_ratio": 0.0,
+            "pitch_jump_rate": 1.0,
+            "pitch_dropout_rate": 1.0,
+            "rms_jump_rate": 1.0,
+            "spectral_flux_spike_rate": 1.0,
+            "zcr_spike_rate": 1.0,
+            "clipping_ratio": 1.0,
+            "short_pause_break_rate": 1.0,
+            "energy_cv": 1.0,
+            "pitch_cv": 1.0,
+            "pause_density": 1.0,
+            "voiced_segment_rate": 1.0,
+            "hard_artifact_fail": True,
+            "hard_artifact_reason": "audio decode failed",
+            "worst_artifact_window_sec": 0.0,
+            "speaker_similarity_mean": None,
+            "pitch_profile_similarity": None,
+            "intonation_similarity": None,
+            "reference_count": 0,
+            "capabilities": {
+                "advanced_dsp_enabled": False,
+                "mos_enabled": False,
+                "speaker_similarity_enabled": False,
+                "reference_corpus_loaded": False,
+                "intonation_enabled": False,
+            },
+        }
+    features = _prosody_features_from_samples(samples, sample_rate)
+    duration_sec = float(features.get("duration_sec") or 0.0)
+    voiced_ratio = float(features.get("voiced_ratio") or 0.0)
+    f0_median_hz = float(features.get("f0_median_hz") or 0.0)
+    f0_iqr_hz = float(features.get("f0_iqr_hz") or 0.0)
+    clipping_ratio = float(features.get("clipping_ratio") or 0.0)
+    pitch_jump_rate = float(features.get("pitch_jump_rate") or 0.0)
+    pitch_dropout_rate = float(features.get("pitch_dropout_rate") or 0.0)
+    rms_jump_rate = float(features.get("rms_jump_rate") or 0.0)
+    spectral_flux_spike_rate = float(features.get("spectral_flux_spike_rate") or 0.0)
+    zcr_spike_rate = float(features.get("zcr_spike_rate") or 0.0)
+    short_pause_break_rate = float(features.get("short_pause_break_rate") or 0.0)
+    energy_cv = float(features.get("energy_cv") or 0.0)
+    pitch_cv = float(features.get("pitch_cv") or 0.0)
+    pause_density = float(features.get("pause_density") or 0.0)
+    voiced_segment_rate = float(features.get("voiced_segment_rate") or 0.0)
+    worst_artifact_window_sec = float(features.get("worst_artifact_window_sec") or 0.0)
+
+    hard_artifact_reasons: list[str] = []
+    if clipping_ratio >= 0.003:
+        hard_artifact_reasons.append(f"clipping_ratio={clipping_ratio:.4f}")
+    if rms_jump_rate >= 0.055 and spectral_flux_spike_rate >= 0.040:
+        hard_artifact_reasons.append("energy/spectral spike")
+    if pitch_jump_rate >= 0.22 and pitch_dropout_rate >= 0.45:
+        hard_artifact_reasons.append("pitch discontinuity")
+    if zcr_spike_rate >= 0.08 and spectral_flux_spike_rate >= 0.05:
+        hard_artifact_reasons.append("transient burst")
+    hard_artifact_fail = bool(hard_artifact_reasons)
+    hard_artifact_reason = ", ".join(hard_artifact_reasons[:3])
+
+    pitch_profile_similarity = None
+    speaker_similarity = None
+    speaker_similarity_mean = None
+    intonation_similarity = None
+    reference_count = 0
+    capabilities = {
+        "advanced_dsp_enabled": True,
+        "mos_enabled": False,
+        "speaker_similarity_enabled": False,
+        "reference_corpus_loaded": False,
+        "intonation_enabled": False,
+    }
+    reference_audio_paths = [p for p in (reference_audio_paths or []) if p.exists()]
+    if reference_audio_paths:
+        reference_count = len(reference_audio_paths)
+        capabilities["reference_corpus_loaded"] = True
+        corpus = _build_reference_corpus_summary(reference_audio_paths)
+        ref_median = float(corpus.get("f0_median_hz_mean") or 0.0)
+        ref_iqr = float(corpus.get("f0_iqr_hz_mean") or 0.0)
+        if ref_median > 0 and f0_median_hz > 0:
+            pitch_delta = abs(math.log(max(f0_median_hz, 1.0) / max(ref_median, 1.0)))
+            iqr_delta = abs(f0_iqr_hz - ref_iqr) / max(30.0, ref_iqr + 1e-6)
+            pitch_profile_similarity = _clamp(1.0 - (pitch_delta / 0.7) - (iqr_delta * 0.3), 0.0, 1.0)
+        intonation_parts = [
+            _linear_similarity(voiced_ratio, ideal=float(corpus.get("voiced_ratio_mean") or voiced_ratio), tolerance=0.35),
+            _linear_similarity(energy_cv, ideal=float(corpus.get("energy_cv_mean") or energy_cv), tolerance=0.80),
+            _linear_similarity(pause_density, ideal=float(corpus.get("pause_density_mean") or pause_density), tolerance=0.9),
+            _linear_similarity(voiced_segment_rate, ideal=float(corpus.get("voiced_segment_rate_mean") or voiced_segment_rate), tolerance=1.5),
+            _linear_similarity(pitch_cv, ideal=_pairwise_mean([float(f.get("pitch_cv") or 0.0) for f in corpus.get("per_file_features", [])]) or pitch_cv, tolerance=0.75),
+        ]
+        intonation_similarity = _mean(intonation_parts)
+        capabilities["intonation_enabled"] = True
+        try:
+            global _SPEAKER_VERIFIER
+            if _SPEAKER_VERIFIER is None:
+                from speechbrain.inference.speaker import SpeakerRecognition  # type: ignore
+
+                _SPEAKER_VERIFIER = SpeakerRecognition.from_hparams(
+                    source="speechbrain/spkrec-ecapa-voxceleb",
+                    savedir=str(audio_path.parent / ".seed_lab_spkrec_cache"),
+                )
+            speaker_scores: list[float] = []
+            for ref_path in reference_audio_paths:
+                score, _prediction = _SPEAKER_VERIFIER.verify_files(str(ref_path), str(audio_path))
+                speaker_scores.append(float(score))
+            speaker_similarity_mean = _pairwise_mean(speaker_scores)
+            speaker_similarity = speaker_similarity_mean
+            capabilities["speaker_similarity_enabled"] = speaker_similarity_mean is not None
+        except Exception:
+            speaker_similarity = None
+
+    mos_pred = None
+    try:
+        global _DISTILLMOS_PREDICTOR
+        if _DISTILLMOS_PREDICTOR is None:
+            import distillmos  # type: ignore
+
+            _DISTILLMOS_PREDICTOR = distillmos.DistillMOS()
+        mos_pred = float(_DISTILLMOS_PREDICTOR.predict(str(audio_path)))
+        capabilities["mos_enabled"] = True
+    except Exception:
+        mos_pred = None
+
+    return {
+        "duration_sec": round(duration_sec, 6),
+        "mos_pred": mos_pred,
+        "speaker_similarity": speaker_similarity,
+        "speaker_similarity_mean": speaker_similarity_mean,
+        "pitch_profile_similarity": pitch_profile_similarity,
+        "intonation_similarity": round(float(intonation_similarity), 6) if isinstance(intonation_similarity, (int, float)) else None,
+        "f0_median_hz": round(f0_median_hz, 6),
+        "f0_iqr_hz": round(f0_iqr_hz, 6),
+        "voiced_ratio": round(voiced_ratio, 6),
+        "pitch_jump_rate": round(pitch_jump_rate, 6),
+        "pitch_dropout_rate": round(pitch_dropout_rate, 6),
+        "rms_jump_rate": round(rms_jump_rate, 6),
+        "spectral_flux_spike_rate": round(spectral_flux_spike_rate, 6),
+        "zcr_spike_rate": round(zcr_spike_rate, 6),
+        "clipping_ratio": round(clipping_ratio, 6),
+        "short_pause_break_rate": round(short_pause_break_rate, 6),
+        "energy_cv": round(energy_cv, 6),
+        "pitch_cv": round(pitch_cv, 6),
+        "pause_density": round(pause_density, 6),
+        "voiced_segment_rate": round(voiced_segment_rate, 6),
+        "hard_artifact_fail": hard_artifact_fail,
+        "hard_artifact_reason": hard_artifact_reason,
+        "worst_artifact_window_sec": worst_artifact_window_sec,
+        "reference_count": reference_count,
+        "capabilities": capabilities,
+    }
+
+
+def _score_from_ratio(value: float, *, good_min: float, good_max: float, soft_min: float, soft_max: float) -> str:
+    if soft_min <= value <= soft_max:
+        if good_min <= value <= good_max:
+            return "5"
+        return "4"
+    if value < soft_min or value > soft_max:
+        return "2"
+    return "3"
+
+
+def _compute_hybrid_scores(
+    *,
+    char_accuracy: float,
+    length_ratio: float,
+    chars_per_sec: float,
+    signal: dict[str, Any],
+) -> dict[str, Any]:
+    capabilities = signal.get("capabilities") if isinstance(signal.get("capabilities"), dict) else {}
+    mos_pred = signal.get("mos_pred")
+    speaker_similarity = signal.get("speaker_similarity")
+    pitch_profile_similarity = signal.get("pitch_profile_similarity")
+    intonation_similarity_value = signal.get("intonation_similarity")
+
+    pronunciation_raw = _clamp(_sigmoid01(char_accuracy, center=0.90, width=0.06), 0.0, 1.0)
+
+    cps_lower = _sigmoid01(chars_per_sec, center=3.1, width=0.8)
+    cps_upper = 1.0 - _sigmoid01(chars_per_sec, center=8.8, width=1.1)
+    cps_score = _clamp(min(cps_lower, cps_upper) * 1.15, 0.0, 1.0)
+    length_stability = _linear_similarity(length_ratio, ideal=1.0, tolerance=0.32)
+    if isinstance(mos_pred, (int, float)):
+        mos_score = _clamp((float(mos_pred) - 1.5) / 3.5, 0.0, 1.0)
+        naturalness_raw = _clamp(mos_score * 0.7 + cps_score * 0.15 + length_stability * 0.15, 0.0, 1.0)
+    else:
+        naturalness_raw = _clamp(cps_score * 0.55 + length_stability * 0.45, 0.0, 1.0)
+
+    dropout_penalty = _clamp(float(signal.get("pitch_dropout_rate") or 0.0) * 1.45, 0.0, 1.0)
+    rms_penalty = _clamp(float(signal.get("rms_jump_rate") or 0.0) * 10.0, 0.0, 1.0)
+    pause_penalty = _clamp(float(signal.get("short_pause_break_rate") or 0.0) / 0.65, 0.0, 1.0)
+    length_penalty = 1.0 - length_stability
+    stability_raw = _clamp(1.0 - (dropout_penalty * 0.40 + rms_penalty * 0.25 + pause_penalty * 0.15 + length_penalty * 0.20), 0.0, 1.0)
+
+    tone_parts: list[float] = []
+    if isinstance(speaker_similarity, (int, float)):
+        tone_parts.append(_clamp((float(speaker_similarity) + 1.0) / 2.0, 0.0, 1.0))
+    if isinstance(pitch_profile_similarity, (int, float)):
+        tone_parts.append(_clamp(float(pitch_profile_similarity), 0.0, 1.0))
+    tone_fit_raw = _pairwise_mean(tone_parts)
+
+    pitch_jump_penalty = _clamp(float(signal.get("pitch_jump_rate") or 0.0) / 0.30, 0.0, 1.0)
+    pitch_dropout_penalty = _clamp(float(signal.get("pitch_dropout_rate") or 0.0) / 0.55, 0.0, 1.0)
+    pitch_cv_penalty = _clamp(float(signal.get("pitch_cv") or 0.0) / 1.20, 0.0, 1.0)
+    pitch_consistency_raw = _clamp(1.0 - (pitch_jump_penalty * 0.45 + pitch_dropout_penalty * 0.40 + pitch_cv_penalty * 0.15), 0.0, 1.0)
+
+    clipping_penalty = _clamp(float(signal.get("clipping_ratio") or 0.0) / 0.003, 0.0, 1.0)
+    flux_penalty = _clamp(float(signal.get("spectral_flux_spike_rate") or 0.0) / 0.08, 0.0, 1.0)
+    zcr_penalty = _clamp(float(signal.get("zcr_spike_rate") or 0.0) / 0.10, 0.0, 1.0)
+    artifact_rms_penalty = _clamp(float(signal.get("rms_jump_rate") or 0.0) / 0.08, 0.0, 1.0)
+    artifact_cleanliness_raw = _clamp(1.0 - (clipping_penalty * 0.35 + flux_penalty * 0.25 + zcr_penalty * 0.15 + artifact_rms_penalty * 0.25), 0.0, 1.0)
+
+    intonation_similarity_raw = _clamp(float(intonation_similarity_value), 0.0, 1.0) if isinstance(intonation_similarity_value, (int, float)) else None
+
+    hard_artifact_fail = bool(signal.get("hard_artifact_fail"))
+    hard_artifact_reason = str(signal.get("hard_artifact_reason") or "").strip()
+
+    prosody_fail = False
+    prosody_fail_reason = ""
+    if intonation_similarity_raw is not None and tone_fit_raw is not None:
+        if intonation_similarity_raw < 0.28 and tone_fit_raw < 0.34:
+            prosody_fail = True
+            prosody_fail_reason = (
+                f"intonation_similarity={intonation_similarity_raw:.2f}, "
+                f"tone_fit={tone_fit_raw:.2f}"
+            )
+
+    if hard_artifact_fail:
+        artifact_cleanliness_raw = min(artifact_cleanliness_raw, 0.02)
+        stability_raw = min(stability_raw, 0.25)
+
+    raw_scores: dict[str, float | None] = {
+        "naturalness_raw": naturalness_raw,
+        "pronunciation_raw": pronunciation_raw,
+        "stability_raw": stability_raw,
+        "tone_fit_raw": tone_fit_raw,
+        "pitch_consistency_raw": pitch_consistency_raw,
+        "artifact_cleanliness_raw": artifact_cleanliness_raw,
+        "intonation_similarity_raw": intonation_similarity_raw,
+    }
+    raw_weights: dict[str, float] = {
+        "naturalness_raw": 0.20,
+        "pronunciation_raw": 0.18,
+        "stability_raw": 0.17,
+        "tone_fit_raw": 0.15,
+        "pitch_consistency_raw": 0.10,
+        "artifact_cleanliness_raw": 0.10,
+        "intonation_similarity_raw": 0.10,
+    }
+    available_weight = sum(weight for key, weight in raw_weights.items() if isinstance(raw_scores.get(key), (int, float)))
+    if available_weight > 0:
+        weighted_ai_score_raw = sum(float(raw_scores[key]) * weight for key, weight in raw_weights.items() if isinstance(raw_scores.get(key), (int, float))) / available_weight
+    else:
+        weighted_ai_score_raw = 0.0
+
+    naturalness = _map_similarity_to_score(naturalness_raw)
+    pronunciation = _map_similarity_to_score(pronunciation_raw)
+    stability = _map_similarity_to_score(stability_raw)
+    tone_fit = _map_similarity_to_score(tone_fit_raw)
+    pitch_consistency = _map_similarity_to_score(pitch_consistency_raw)
+    artifact_cleanliness = _map_similarity_to_score(artifact_cleanliness_raw)
+    intonation_similarity = _map_similarity_to_score(intonation_similarity_raw)
+    weighted_ai_score = _map_similarity_to_score(weighted_ai_score_raw)
+
+    rank_excluded = hard_artifact_fail or prosody_fail
+
+    return {
+        "naturalness": naturalness,
+        "pronunciation": pronunciation,
+        "stability": stability,
+        "tone_fit": tone_fit,
+        "pitch_consistency": pitch_consistency,
+        "artifact_cleanliness": artifact_cleanliness,
+        "intonation_similarity": intonation_similarity,
+        "naturalness_raw": round(float(naturalness_raw), 6),
+        "pronunciation_raw": round(float(pronunciation_raw), 6),
+        "stability_raw": round(float(stability_raw), 6),
+        "tone_fit_raw": round(float(tone_fit_raw), 6) if isinstance(tone_fit_raw, (int, float)) else None,
+        "pitch_consistency_raw": round(float(pitch_consistency_raw), 6),
+        "artifact_cleanliness_raw": round(float(artifact_cleanliness_raw), 6),
+        "intonation_similarity_raw": round(float(intonation_similarity_raw), 6) if isinstance(intonation_similarity_raw, (int, float)) else None,
+        "weighted_ai_score_raw": round(float(weighted_ai_score_raw), 6),
+        "weighted_ai_score": weighted_ai_score,
+        "hard_artifact_fail": hard_artifact_fail,
+        "hard_artifact_reason": hard_artifact_reason,
+        "prosody_fail": prosody_fail,
+        "prosody_fail_reason": prosody_fail_reason,
+        "rank_excluded": rank_excluded,
+        "capabilities": capabilities,
+    }
+
+
 def _coerce_score(value: Any) -> str:
     try:
         num = int(str(value).strip())
@@ -1815,6 +2671,18 @@ def _empty_eval(note: str, *, status: str) -> dict[str, Any]:
         "pronunciation": "",
         "stability": "",
         "tone_fit": "",
+        "pitch_consistency": "",
+        "artifact_cleanliness": "",
+        "intonation_similarity": "",
+        "weighted_ai_score": "",
+        "weighted_ai_score_raw": "",
+        "hard_artifact_fail": False,
+        "hard_artifact_reason": "",
+        "prosody_fail": False,
+        "prosody_fail_reason": "",
+        "rank_excluded": False,
+        "capabilities": {},
+        "reference_set_id": "",
         "note": note[:600],
         "selected": False,
         "updated_at": dt.datetime.now().isoformat(),
@@ -1848,38 +2716,29 @@ def _openai_transcribe_audio(
     raise RuntimeError("empty transcript")
 
 
-def _openai_judge_scores(
+def _openai_generate_eval_note(
     *,
     api_key: str,
     judge_model: str,
     timeout_seconds: int,
     script_text: str,
     transcript_text: str,
-    char_accuracy: float,
-    length_ratio: float,
-    chars_per_sec: float,
-) -> dict[str, Any]:
+    metrics: dict[str, Any],
+) -> str:
     system_prompt = (
         "당신은 한국어 TTS 품질 평가자다. "
-        "반드시 JSON 객체만 반환한다. "
-        "점수는 1~5 정수로만 준다. "
-        "키는 naturalness, pronunciation, stability, tone_fit, note 이다."
+        "반드시 note 하나만 JSON 객체로 반환한다. "
+        "키는 note 이다."
     )
     user_prompt = (
-        "아래 정보를 보고 TTS 품질을 평가하라.\n"
+        "아래 정보를 보고 TTS 품질 평가 코멘트를 작성하라.\n"
         f"- 기준 대본:\n{script_text}\n\n"
         f"- ASR 전사:\n{transcript_text}\n\n"
-        f"- 자동 지표: char_accuracy={char_accuracy:.4f}, length_ratio={length_ratio:.4f}, chars_per_sec={chars_per_sec:.4f}\n\n"
-        "평가 기준:\n"
-        "1) naturalness: 듣기 자연스러움\n"
-        "2) pronunciation: 발음/전사 일치도\n"
-        "3) stability: 흔들림/깨짐/일관성\n"
-        "4) tone_fit: 의도한 화자 톤 적합성\n"
-        "5) note: 핵심 판단 근거를 한국어 1~2문장으로 작성\n"
+        f"- 자동 지표(JSON):\n{json.dumps(metrics, ensure_ascii=False, indent=2)}\n\n"
         "주의:\n"
-        "- 3~4점 남발 금지. 불확실하면 보수적으로 낮게 준다.\n"
-        "- 근거 없이 5점을 주지 않는다.\n"
-        "- 지표가 나쁘면(낮은 정확도/길이 비정상/말하기 속도 비정상) 반드시 낮은 점수를 준다.\n"
+        "- 점수는 이미 계산되었다. 새 점수를 만들지 말고 note만 작성한다.\n"
+        "- 1~2문장으로, 자연스러움/톤/피치/튐 관점의 핵심 문제를 요약한다.\n"
+        "- hard_artifact_fail=true면 그 원인을 먼저 말한다.\n"
     )
     payload = {
         "model": judge_model,
@@ -1906,7 +2765,56 @@ def _openai_judge_scores(
     parsed = _extract_json_object(content)
     if not parsed:
         raise RuntimeError("judge returned non-json content")
-    return parsed
+    return str(parsed.get("note") or "").strip()
+
+
+def _resolve_reference_audio_path(
+    *,
+    run_dir: Path,
+    rec: dict[str, Any],
+    explicit_local_path: str,
+    explicit_s3_uri: str,
+    reference_audio_cache_dir: str,
+) -> tuple[Path | None, str]:
+    local_candidate = str(explicit_local_path or "").strip()
+    if local_candidate:
+        path = Path(local_candidate).expanduser()
+        if not path.is_absolute():
+            path = (run_dir / path).resolve()
+        if path.exists():
+            return path, "local"
+        raise RuntimeError(f"reference audio not found: {path}")
+
+    if explicit_s3_uri.strip():
+        try:
+            import boto3  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"reference_audio_s3_uri requires boto3: {e}") from e
+        uri = explicit_s3_uri.strip()
+        if not uri.startswith("s3://"):
+            raise RuntimeError("reference_audio_s3_uri must start with s3://")
+        bucket_and_key = uri[5:]
+        if "/" not in bucket_and_key:
+            raise RuntimeError("reference_audio_s3_uri missing key")
+        bucket, key = bucket_and_key.split("/", 1)
+        cache_root = Path(reference_audio_cache_dir).expanduser() if reference_audio_cache_dir else (run_dir / ".ref-audio-cache")
+        cache_root.mkdir(parents=True, exist_ok=True)
+        target = cache_root / Path(key).name
+        if not target.exists():
+            boto3.client("s3").download_file(bucket, key, str(target))
+        return target, "s3"
+
+    tts_params = rec.get("tts_params") if isinstance(rec.get("tts_params"), dict) else {}
+    for key in ("reference_audio_local_path", "reference_audio_eval_path", "ref_audio_path"):
+        candidate = str(tts_params.get(key) or "").strip()
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = (run_dir / path).resolve()
+        if path.exists():
+            return path, f"tts_params:{key}"
+    return None, ""
 
 
 def _auto_eval_single_record(
@@ -1919,6 +2827,11 @@ def _auto_eval_single_record(
     judge_model: str,
     language: str,
     timeout_seconds: int,
+    evaluation_profile: str,
+    reference_audio_local_path: str,
+    reference_audio_s3_uri: str,
+    reference_audio_cache_dir: str,
+    disable_llm_note: bool,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     sample_id = str(rec.get("sample_id") or "").strip()
     seed = int(rec.get("seed") or 0)
@@ -1942,6 +2855,13 @@ def _auto_eval_single_record(
         return sample_id, eval_obj, debug
 
     try:
+        reference_audio_paths, reference_audio_source, reference_set_id = _resolve_reference_audio_paths(
+            run_dir=run_dir,
+            rec=rec,
+            explicit_local_path=reference_audio_local_path,
+            explicit_s3_uri=reference_audio_s3_uri,
+            reference_audio_cache_dir=reference_audio_cache_dir,
+        )
         transcript_text = _openai_transcribe_audio(
             api_key=asr_api_key,
             audio_path=audio_path,
@@ -1955,47 +2875,56 @@ def _auto_eval_single_record(
         length_ratio = (len(hyp_norm) / len(ref_norm)) if ref_norm else 0.0
         duration = _wav_duration_seconds(audio_path)
         chars_per_sec = (len(hyp_norm) / duration) if duration > 0 else 0.0
-
-        judged = _openai_judge_scores(
-            api_key=judge_api_key,
-            judge_model=judge_model,
-            timeout_seconds=timeout_seconds,
-            script_text=script_text,
-            transcript_text=transcript_text,
+        signal = _analyze_audio_signal(audio_path, reference_audio_paths=reference_audio_paths)
+        scored = _compute_hybrid_scores(
             char_accuracy=char_acc,
             length_ratio=length_ratio,
             chars_per_sec=chars_per_sec,
+            signal=signal,
         )
-
-        naturalness = _coerce_score(judged.get("naturalness"))
-        pronunciation = _coerce_score(judged.get("pronunciation"))
-        stability = _coerce_score(judged.get("stability"))
-        tone_fit = _coerce_score(judged.get("tone_fit"))
-
-        if char_acc < 0.70:
-            pronunciation = _cap_score(pronunciation, 1)
-        elif char_acc < 0.82:
-            pronunciation = _cap_score(pronunciation, 2)
-        elif char_acc < 0.92:
-            pronunciation = _cap_score(pronunciation, 3)
-        if length_ratio < 0.75 or length_ratio > 1.30:
-            stability = _cap_score(stability, 2)
-        elif length_ratio < 0.85 or length_ratio > 1.15:
-            stability = _cap_score(stability, 3)
-        if chars_per_sec < 2.3 or chars_per_sec > 11.5:
-            naturalness = _cap_score(naturalness, 2)
-        elif chars_per_sec < 3.0 or chars_per_sec > 10.0:
-            naturalness = _cap_score(naturalness, 3)
-
-        raw_note = str(judged.get("note") or "").strip()
+        note_metrics = {
+            "char_accuracy": round(char_acc, 6),
+            "length_ratio": round(length_ratio, 6),
+            "chars_per_sec": round(chars_per_sec, 6),
+            **{key: scored.get(key) for key in AI_SCORE_KEYS},
+            "weighted_ai_score": scored.get("weighted_ai_score"),
+            "hard_artifact_fail": scored.get("hard_artifact_fail"),
+            "hard_artifact_reason": scored.get("hard_artifact_reason"),
+            "signal": signal,
+        }
+        raw_note = ""
+        if not disable_llm_note:
+            try:
+                raw_note = _openai_generate_eval_note(
+                    api_key=judge_api_key,
+                    judge_model=judge_model,
+                    timeout_seconds=timeout_seconds,
+                    script_text=script_text,
+                    transcript_text=transcript_text,
+                    metrics=note_metrics,
+                )
+            except Exception as note_err:
+                raw_note = f"LLM note unavailable: {note_err}"
         metrics_note = f"acc={char_acc:.3f}, len={length_ratio:.2f}, cps={chars_per_sec:.2f}"
         note = f"[AI] {metrics_note} | {raw_note}".strip()
 
         eval_obj = {
-            "naturalness": naturalness,
-            "pronunciation": pronunciation,
-            "stability": stability,
-            "tone_fit": tone_fit,
+            "naturalness": scored["naturalness"],
+            "pronunciation": scored["pronunciation"],
+            "stability": scored["stability"],
+            "tone_fit": scored["tone_fit"],
+            "pitch_consistency": scored["pitch_consistency"],
+            "artifact_cleanliness": scored["artifact_cleanliness"],
+            "intonation_similarity": scored["intonation_similarity"],
+            "weighted_ai_score": scored["weighted_ai_score"],
+            "weighted_ai_score_raw": scored["weighted_ai_score_raw"],
+            "hard_artifact_fail": scored["hard_artifact_fail"],
+            "hard_artifact_reason": scored["hard_artifact_reason"],
+            "prosody_fail": scored["prosody_fail"],
+            "prosody_fail_reason": scored["prosody_fail_reason"],
+            "rank_excluded": scored["rank_excluded"],
+            "capabilities": scored.get("capabilities") or signal.get("capabilities") or {},
+            "reference_set_id": reference_set_id,
             "note": note[:600],
             "selected": False,
             "updated_at": dt.datetime.now().isoformat(),
@@ -2006,6 +2935,7 @@ def _auto_eval_single_record(
             "seed": seed,
             "script_id": script_id,
             "status": "ready",
+            "evaluation_profile": evaluation_profile,
             "asr_model": asr_model,
             "judge_model": judge_model,
             "transcript_text": transcript_text,
@@ -2013,7 +2943,11 @@ def _auto_eval_single_record(
             "length_ratio": round(length_ratio, 6),
             "chars_per_sec": round(chars_per_sec, 6),
             "duration_sec": round(duration, 6),
-            "judge_raw": judged,
+            "reference_audio_source": reference_audio_source,
+            "reference_audio_paths": [str(path) for path in reference_audio_paths],
+            "reference_set_id": reference_set_id,
+            "signal_metrics": signal,
+            "scored_metrics": scored,
             "elapsed_ms": int((time.time() - started) * 1000),
         }
         return sample_id, eval_obj, debug
@@ -2082,6 +3016,11 @@ def cmd_auto_eval(args: argparse.Namespace) -> int:
                     judge_model=judge_model,
                     language=str(args.language),
                     timeout_seconds=int(args.timeout),
+                    evaluation_profile=str(args.evaluation_profile),
+                    reference_audio_local_path=str(args.reference_audio_local_path),
+                    reference_audio_s3_uri=str(args.reference_audio_s3_uri),
+                    reference_audio_cache_dir=str(args.reference_audio_cache_dir),
+                    disable_llm_note=bool(args.disable_llm_note),
                 )
             )
         for fut in concurrent.futures.as_completed(futures):
@@ -2095,7 +3034,8 @@ def cmd_auto_eval(args: argparse.Namespace) -> int:
     payload = {
         "run_id": str((manifest.get("meta") or {}).get("run_id") or run_dir.name),
         "exported_at": dt.datetime.now().isoformat(),
-        "mode": "auto_eval_asr_llm",
+        "mode": "auto_eval_hybrid_v3",
+        "evaluation_profile": str(args.evaluation_profile),
         "asr_model": asr_model_resolved,
         "asr_model_requested": asr_model_requested,
         "judge_model": judge_model,
@@ -2114,6 +3054,7 @@ def cmd_auto_eval(args: argparse.Namespace) -> int:
     print(f"[seed-lab] auto_eval_debug={debug_jsonl}")
     print(f"[seed-lab] asr_model={asr_model_resolved} (requested={asr_model_requested})")
     print(f"[seed-lab] judge_model={judge_model}")
+    print(f"[seed-lab] evaluation_profile={args.evaluation_profile}")
     print(f"[seed-lab] auto_eval_ready={success_count} failed={fail_count} total={len(eval_map)}")
     print("")
     print("[next]")
@@ -2200,6 +3141,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     live_eval_path = run_dir / LIVE_AUTO_EVAL_JSON
     live_eval_debug_path = run_dir / "auto_eval_live_debug.jsonl"
     base_eval_path = run_dir / "auto_eval.json"
+    human_eval_path = run_dir / HUMAN_EVAL_JSON
     write_lock = threading.Lock()
 
     class SeedLabHttpServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -2259,6 +3201,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 merged = _merge_eval_maps([base_eval_path, live_eval_path])
                 return self._send_json(200, {"run_id": run_id, "evaluations": merged})
 
+            if route == "/api/human-evals":
+                merged = _load_human_eval_map(human_eval_path)
+                return self._send_json(200, {"run_id": run_id, "evaluations": merged})
+
             if route == "/api/health":
                 return self._send_json(
                     200,
@@ -2283,6 +3229,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         "asr_model": asr_model_resolved,
                         "asr_model_requested": asr_model_requested,
                         "judge_model": judge_model,
+                        "evaluation_profile": str(args.evaluation_profile),
+                    },
+                )
+
+            if route == "/api/run-status":
+                rows = _read_jsonl_objects(live_records_path)
+                return self._send_json(
+                    200,
+                    {
+                        "run_id": run_id,
+                        "status": "ready",
+                        "stage": "ready",
+                        "generated_count": len(rows) or len(manifest_records),
+                        "failed_count": sum(1 for row in rows if str(row.get("status") or "") == "failed"),
+                        "evaluated_count": len(_merge_eval_maps([base_eval_path, live_eval_path])),
+                        "total_count": len(manifest_records) or len(rows),
+                        "last_error": "",
                     },
                 )
 
@@ -2361,6 +3324,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         "error": "",
                         "bytes": len(audio_bytes),
                         "created_at": created.isoformat(),
+                        "tts_params": {
+                            "ref_audio_path": str(tts_params.get("ref_audio_path") or ""),
+                            "reference_audio_local_path": str(tts_params.get("reference_audio_local_path") or ""),
+                        },
                     }
 
                     add_to_review = _to_bool(body.get("add_to_review"), default=False)
@@ -2381,6 +3348,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                                 judge_model=judge_model,
                                 language=str(args.language),
                                 timeout_seconds=int(args.auto_eval_timeout),
+                                evaluation_profile=str(args.evaluation_profile),
+                                reference_audio_local_path=str(args.reference_audio_local_path),
+                                reference_audio_s3_uri=str(args.reference_audio_s3_uri),
+                                reference_audio_cache_dir=str(args.reference_audio_cache_dir),
+                                disable_llm_note=bool(args.disable_llm_note),
                             )
                             ai_eval_obj = eval_obj
                             ai_debug_obj = debug_obj
@@ -2433,6 +3405,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         judge_model=judge_model,
                         language=str(args.language),
                         timeout_seconds=int(args.auto_eval_timeout),
+                        evaluation_profile=str(args.evaluation_profile),
+                        reference_audio_local_path=str(args.reference_audio_local_path),
+                        reference_audio_s3_uri=str(args.reference_audio_s3_uri),
+                        reference_audio_cache_dir=str(args.reference_audio_cache_dir),
+                        disable_llm_note=bool(args.disable_llm_note),
                     )
                     with write_lock:
                         target_path = live_eval_path if sample_id.startswith("live:") else base_eval_path
@@ -2449,6 +3426,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 except Exception as e:
                     return self._send_json(500, {"ok": False, "error": str(e)})
 
+            if route == "/api/human-evals":
+                try:
+                    body = self._read_json()
+                    evaluations = body.get("evaluations")
+                    if not isinstance(evaluations, dict):
+                        raise RuntimeError("evaluations must be an object")
+                    normalized: dict[str, Any] = {}
+                    for sample_id, eval_obj in evaluations.items():
+                        if isinstance(eval_obj, dict):
+                            normalized[str(sample_id)] = eval_obj
+                    with write_lock:
+                        _write_human_eval_map(human_eval_path, run_id=run_id, evaluations=normalized)
+                    return self._send_json(200, {"ok": True, "run_id": run_id, "saved_count": len(normalized)})
+                except Exception as e:
+                    return self._send_json(500, {"ok": False, "error": str(e)})
+
             return self._send_json(404, {"ok": False, "error": f"unknown route: {route}"})
 
     server = SeedLabHttpServer((str(args.host), int(args.port)), SeedLabHandler)
@@ -2460,6 +3453,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f"[seed-lab] WARN: {asr_warning}")
     print(f"[seed-lab] asr_model={asr_model_resolved} (requested={asr_model_requested})")
     print(f"[seed-lab] judge_model={judge_model}")
+    print(f"[seed-lab] evaluation_profile={args.evaluation_profile}")
     print(f"[seed-lab] auto_eval_on_add={auto_eval_on_add} openai_configured={openai_configured}")
     print("")
     try:
@@ -2483,8 +3477,22 @@ def _read_eval(path: Path) -> dict[str, Any]:
 
 
 def _score_total(eval_obj: dict[str, Any]) -> float | None:
+    if bool(eval_obj.get("rank_excluded")) or bool(eval_obj.get("prosody_fail")):
+        return None
+    try:
+        weighted = float(eval_obj.get("weighted_ai_score_raw"))
+        if 0 <= weighted <= 1:
+            return 1.0 + weighted * 4.0
+    except Exception:
+        pass
+    try:
+        weighted_display = float(eval_obj.get("weighted_ai_score"))
+        if 1 <= weighted_display <= 5:
+            return weighted_display
+    except Exception:
+        pass
     vals = []
-    for key in ("naturalness", "pronunciation", "stability", "tone_fit"):
+    for key in ("naturalness", "pronunciation", "stability", "tone_fit", "pitch_consistency", "artifact_cleanliness", "intonation_similarity"):
         try:
             num = float(eval_obj.get(key))
         except Exception:
@@ -2518,12 +3526,19 @@ def _build_seed_ranking(records: list[dict[str, Any]], eval_map: dict[str, Any])
                 "selected_count": 0,
                 "notes": [],
                 "script_ids": set(),
+                "excluded": False,
+                "exclude_reasons": [],
             }
         item = seed_agg[seed]
         item["samples_total"] += 1
         item["script_ids"].add(str(rec.get("script_id") or ""))
         ev = eval_map.get(sample_id)
         if isinstance(ev, dict):
+            if bool(ev.get("rank_excluded")) or bool(ev.get("hard_artifact_fail")) or bool(ev.get("prosody_fail")):
+                item["excluded"] = True
+                reason = str(ev.get("hard_artifact_reason") or ev.get("prosody_fail_reason") or "excluded").strip()
+                if reason and reason not in item["exclude_reasons"]:
+                    item["exclude_reasons"].append(reason)
             total = _score_total(ev)
             if total is not None:
                 item["samples_scored"] += 1
@@ -2536,6 +3551,8 @@ def _build_seed_ranking(records: list[dict[str, Any]], eval_map: dict[str, Any])
 
     ranking: list[dict[str, Any]] = []
     for seed, item in seed_agg.items():
+        if item["excluded"]:
+            continue
         samples_scored = int(item["samples_scored"])
         avg_score = (float(item["score_sum"]) / samples_scored) if samples_scored > 0 else 0.0
         ranking.append(
@@ -2607,6 +3624,18 @@ def cmd_report(args: argparse.Namespace) -> int:
         ai_eval_map = _read_eval(ai_eval_path)
         ai_ranking = _build_seed_ranking(records, ai_eval_map)
         ai_csv, ai_json = _write_ranking_outputs(run_dir, "seed_ranking_ai", ai_ranking, top_n=top_n)
+        excluded_ai_seeds = sorted(
+            {
+                int(rec.get("seed") or 0)
+                for rec in records
+                if isinstance(rec, dict)
+                and int(rec.get("seed") or 0) > 0
+                and isinstance(ai_eval_map.get(str(rec.get("sample_id") or "").strip()), dict)
+                and bool(ai_eval_map.get(str(rec.get("sample_id") or "").strip(), {}).get("rank_excluded"))
+            }
+        )
+    else:
+        excluded_ai_seeds = []
 
     stage_b_path = run_dir / "top_seeds_stage_b.txt"
     if args.prepare_stage_b:
@@ -2645,6 +3674,10 @@ def cmd_report(args: argparse.Namespace) -> int:
                 f"{idx:02d}. seed={row['seed']} avg={row['avg_score']:.2f} "
                 f"scored={row['samples_scored']}/{row['samples_total']} selected={row['selected_count']}"
             )
+        if excluded_ai_seeds:
+            print("")
+            print("[excluded ai seeds]")
+            print(", ".join(str(v) for v in excluded_ai_seeds[:50]))
     return 0
 
 
@@ -2692,12 +3725,17 @@ def build_parser() -> argparse.ArgumentParser:
     auto_p.add_argument("--out-json", default="", help="output eval JSON path (default: <run-dir>/auto_eval.json)")
     auto_p.add_argument("--asr-model", default=DEFAULT_AUTO_EVAL_ASR_MODEL, help="OpenAI ASR model")
     auto_p.add_argument("--judge-model", default=DEFAULT_AUTO_EVAL_JUDGE_MODEL, help="OpenAI judge model")
+    auto_p.add_argument("--evaluation-profile", default=DEFAULT_AUTO_EVAL_PROFILE, help="evaluation profile")
     auto_p.add_argument("--language", default="ko", help="ASR language hint")
     auto_p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     auto_p.add_argument("--timeout", type=int, default=DEFAULT_AUTO_EVAL_TIMEOUT)
     auto_p.add_argument("--openai-api-key", default="", help="optional shared key; fallback to OPENAI_FALLBACK_API_KEY/OPENAI_API_KEY")
     auto_p.add_argument("--openai-api-key-asr", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_ASR")
     auto_p.add_argument("--openai-api-key-judge", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_JUDGE")
+    auto_p.add_argument("--reference-audio-local-path", default="", help="optional local/reference WAV path for tone similarity")
+    auto_p.add_argument("--reference-audio-s3-uri", default="", help="optional S3 URI for reference WAV")
+    auto_p.add_argument("--reference-audio-cache-dir", default="", help="optional cache dir for downloaded reference audio")
+    auto_p.add_argument("--disable-llm-note", action="store_true")
     auto_p.add_argument("--top", type=int, default=DEFAULT_STAGE_B_TOP, help="only used in printed next-step command")
     auto_p.set_defaults(func=cmd_auto_eval)
 
@@ -2713,6 +3751,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--openai-api-key-judge", default="", help="optional; fallback to OPENAI_API_KEY_SEEDLAB_JUDGE")
     serve_p.add_argument("--asr-model", default=DEFAULT_AUTO_EVAL_ASR_MODEL)
     serve_p.add_argument("--judge-model", default=DEFAULT_AUTO_EVAL_JUDGE_MODEL)
+    serve_p.add_argument("--evaluation-profile", default=DEFAULT_AUTO_EVAL_PROFILE)
+    serve_p.add_argument("--reference-audio-local-path", default="", help="optional local/reference WAV path for tone similarity")
+    serve_p.add_argument("--reference-audio-s3-uri", default="", help="optional S3 URI for reference WAV")
+    serve_p.add_argument("--reference-audio-cache-dir", default="", help="optional cache dir for downloaded reference audio")
+    serve_p.add_argument("--disable-llm-note", action="store_true")
     serve_p.add_argument("--language", default="ko")
     serve_p.add_argument("--auto-eval-timeout", type=int, default=DEFAULT_AUTO_EVAL_TIMEOUT)
     serve_p.add_argument("--return-ai-debug", action="store_true")
