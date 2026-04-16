@@ -1652,51 +1652,55 @@ cat notebooklm-service/data/library.json | python3 -m json.tool | grep '"channel
 
 ---
 
-## RunPod & Cloudflare 서버 구축 튜토리얼 (GPT-SoVITS-v4 실습)
+## RunPod & AWS 고정 프록시 운영 튜토리얼
+
+현재 운영 상태:
+
+- 이 프로젝트는 **Cloudflare/직접 포트 노출 방식에서 AWS 고정 프록시 + reverse SSH tunnel 방식으로 전환됨**
+- TTS와 Seed Lab 평가는 이제 고정 주소 방식으로 운영됨
+- Seed Lab 평가는 하이브리드 구조를 유지하되, `speechbrain`/`distillmos`는 CUDA 가능 시 RunPod GPU를 우선 사용하도록 전환됨
+- 새 RunPod Pod를 열어도 같은 `/workspace` volume만 연결하면, 아래 한 줄로 TTS와 Seed Lab 평가를 다시 올릴 수 있음
+  - `bash /workspace/runpod-stack/bin/start-all.sh`
+
+### 새 Pod 체크리스트
+- **Pytorch 2.8.0** 인스턴스 필수(패키지 버전 충돌 방지)
+- `Expose HTTP ports`는 기본적으로 `8888`만 연다
+- 반드시 기존과 같은 `/workspace` network volume를 연결한다
+- RunPod 터미널/Jupyter Terminal에 접속한다
+- GPU 강제가 필요하면 `runpod-services.env`에 `SEEDLAB_EVAL_REQUIRE_GPU=true`를 넣는다
+- 아래 한 줄을 실행한다
+```bash
+bash /workspace/runpod-stack/bin/start-all.sh
+```
+
+고정 운영 기본값:
+
+- TTS와 Seed Lab 평가는 AWS 고정 프록시를 통해 동일한 주소로 유지됩니다.
+- 실제 운영 도메인 값은 리포 기본값이 아니라 배포 환경의 `.env`에서만 주입합니다.
+- Pod 내부 one-shot 부팅: `bash /workspace/runpod-stack/bin/start-all.sh`
+
+새 Pod를 열 때 URL을 다시 바꾸지 않으려면 RunPod에서 AWS EC2로 reverse SSH tunnel을 붙이고,
+외부 공개는 EC2의 `edge-proxy`가 담당하게 합니다.
+실제 Pod에서는 network volume 아래 `runpod-stack/`와 SSH 키를 유지하면 됩니다.
 
 ### 1. RunPod 환경 구성
 - RunPod에서 **Pytorch 2.8.0** 인스턴스를 생성합니다.
-- 포트 번호를 `8888, 9874, 9880, 9872`로 설정하여 열어줍니다.
+- 현재 운영 기준 권장값은 `8888`만 오픈입니다.
+- `9880`, `9872`, `9874`를 직접 여는 방식은 **구버전 직접 노출/디버깅 경로**이며, 현재 고정 운영 경로에서는 필수가 아닙니다.
 - 8888 포트를 통해 Jupyter Notebook으로 접속한 후, **Terminal 1**을 켭니다.
 
-### 2. 로컬 서버 실행
+### 2. 고정 부팅 스크립트 실행
+network volume에 `runpod-stack/`가 준비되어 있으면 아래 한 줄만 실행합니다.
 ```bash
-# 디렉터리 이동
-cd /workspace/GPT-SoVITS-v4-real
-
-# Python 가상환경(venv) 활성화
-source /workspace/GPT-SoVITS-v4/venv/bin/activate
-
-# 로컬호스트 서버 실행 (API v2)
-python api_v2.py
+bash /workspace/runpod-stack/bin/start-all.sh
 ```
 
-### 3. Cloudflare 터널링으로 퍼블릭 URL 생성
-- 새 터미널(**Terminal 2**)을 켭니다.
-- Cloudflare 터널링 도구를 실행하기 위해 가상환경을 활성화합니다.
-- 포트 9880을 연결하여 퍼블릭 URL을 만들어줍니다.
+### 3. 신규 Pod 교체 운영
+- 기존 Pod를 terminate 합니다.
+- 같은 `/workspace` network volume를 연결한 새 Pod를 띄웁니다.
+- RunPod 터미널에서 아래 한 줄만 다시 실행합니다.
 ```bash
-# Python 가상환경(venv) 활성화
-source /workspace/GPT-SoVITS-v4/venv/bin/activate
-
-cloudflared tunnel --url http://127.0.0.1:9880/
-```
-
-### 트러블슈팅: Cloudflare 관련 오류 발생 시
-만약 `cloudflared` 실행 중 오류가 나거나 명령어가 없으면 아래로 수동 설치를 진행합니다.
-
-```bash
-# 1. 최신 패키지 리스트 업데이트
-apt-get update
-
-# 2. cloudflared 다운로드용 도구 설치 (이미 있을 수도 있음)
-apt-get install -y wget
-
-# 3. cloudflared 최신 버전 다운로드 (Linux 64-bit 기준)
-wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-
-# 4. 다운로드한 패키지 설치
-dpkg -i cloudflared-linux-amd64.deb
+bash /workspace/runpod-stack/bin/start-all.sh
 ```
 
 ## TTS Router 기반 RunPod Serverless 전환 메모 (현재 운영 경로와 별개)
@@ -1731,3 +1735,7 @@ dpkg -i cloudflared-linux-amd64.deb
 cd ~/SKN22-Final-4Team-AI/ai-influencer
 docker-compose up -d --build --force-recreate tts-router-service messenger-gateway n8n
 ```
+
+### 메모
+
+- ASR -> SRT 자막 생성 로직

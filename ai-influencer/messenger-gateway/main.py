@@ -3166,10 +3166,10 @@ async def _store_and_send_tts_variant(
 
 
 async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Optional[int] = None) -> bytes:
-    # gateway가 직접 TTS API를 호출해 WAV 바이트를 받아온다.
-    tts_api_url = settings.tts_api_url.strip()
+    # gateway는 내부 router를 우선 사용하고, 비어 있으면 기존 TTS API URL로 fallback 한다.
+    tts_api_url = (settings.tts_router_url or "").strip() or settings.tts_api_url.strip()
     if not tts_api_url:
-        raise RuntimeError("TTS_API_URL is not configured")
+        raise RuntimeError("TTS router URL is not configured")
 
     tts_body = _build_tts_request_body(script_text, seed=seed)
 
@@ -3904,6 +3904,7 @@ def _build_seedlab_link_from_run(run: dict[str, Any]) -> str:
 def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequest) -> str:
     run_id = str(run.get("run_id") or body.run_id)
     stage = (body.stage or body.status or "queued").strip().lower()
+    eval_location = str(body.eval_location or "").strip().lower()
     total_count = max(0, int(body.total_count or 0))
     generated_count = max(0, int(body.generated_count or 0))
     evaluated_count = max(0, int(body.evaluated_count or 0))
@@ -3933,6 +3934,8 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
         ai_line = f"AI 평가: {evaluated_count}/{ai_total}" if (evaluated_count > 0 or ai_total > 0) else "AI 평가: 진행 전 중단"
     else:
         ai_line = "AI 평가: 대기 중"
+    if eval_location:
+        ai_line = f"{ai_line} ({eval_location})"
 
     lines = [
         "🧪 Seed Lab 실행 중",

@@ -19,6 +19,7 @@ import datetime as dt
 import hashlib
 import html
 import http.server
+import importlib.util
 import json
 import math
 import mimetypes
@@ -54,6 +55,8 @@ DEFAULT_AUTO_EVAL_ASR_MODEL = "gpt-4o-transcribe"
 DEFAULT_AUTO_EVAL_JUDGE_MODEL = "gpt-5.4"
 DEFAULT_AUTO_EVAL_TIMEOUT = 120
 DEFAULT_AUTO_EVAL_PROFILE = "hybrid"
+DEFAULT_SEEDLAB_EVAL_DEVICE = "auto"
+DEFAULT_SEEDLAB_EVAL_MODEL_CACHE_DIR = "/workspace/runpod-stack/cache/seedlab-models"
 LIVE_RECORDS_JSONL = "live_records.jsonl"
 LIVE_AUTO_EVAL_JSON = "auto_eval_live.json"
 HUMAN_EVAL_JSON = "human_eval.json"
@@ -66,8 +69,9 @@ AI_SCORE_KEYS = (
     "artifact_cleanliness",
     "intonation_similarity",
 )
-_DISTILLMOS_PREDICTOR: Any | None = None
-_SPEAKER_VERIFIER: Any | None = None
+_DISTILLMOS_PREDICTORS: dict[str, Any] = {}
+_SPEAKER_VERIFIERS: dict[str, Any] = {}
+_TORCH_RUNTIME: dict[str, Any] | None = None
 
 
 @dataclass
@@ -93,6 +97,193 @@ def _safe_slug(value: str) -> str:
             keep.append("-")
     slug = "".join(keep).strip("-")
     return slug or "item"
+
+
+def _seedlab_eval_model_cache_dir() -> Path:
+    raw = (os.getenv("SEEDLAB_EVAL_MODEL_CACHE_DIR") or DEFAULT_SEEDLAB_EVAL_MODEL_CACHE_DIR).strip()
+    path = Path(raw or DEFAULT_SEEDLAB_EVAL_MODEL_CACHE_DIR).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        fallback = Path("/tmp/seedlab-model-cache").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    return path.resolve()
+
+
+def _get_torch_runtime() -> dict[str, Any]:
+    global _TORCH_RUNTIME
+    if _TORCH_RUNTIME is not None:
+        return dict(_TORCH_RUNTIME)
+    info: dict[str, Any] = {
+        "torch_available": False,
+        "torch_version": "",
+        "cuda_available": False,
+        "cuda_device_count": 0,
+        "cuda_version": "",
+        "cuda_device_name": "",
+        "runtime_error": "",
+    }
+    try:
+        import torch  # type: ignore
+
+        info["torch_available"] = True
+        info["torch_version"] = str(getattr(torch, "__version__", "") or "")
+        info["cuda_version"] = str(getattr(torch.version, "cuda", "") or "")
+        cuda_available = bool(torch.cuda.is_available())
+        info["cuda_available"] = cuda_available
+        if cuda_available:
+            try:
+                info["cuda_device_count"] = int(torch.cuda.device_count())
+            except Exception:
+                info["cuda_device_count"] = 0
+            try:
+                info["cuda_device_name"] = str(torch.cuda.get_device_name(0) or "")
+            except Exception:
+                info["cuda_device_name"] = ""
+    except Exception as e:
+        info["runtime_error"] = str(e)
+    _TORCH_RUNTIME = dict(info)
+    return dict(info)
+
+
+def _resolve_seedlab_eval_runtime() -> dict[str, Any]:
+    requested_raw = (os.getenv("SEEDLAB_EVAL_DEVICE") or DEFAULT_SEEDLAB_EVAL_DEVICE).strip().lower()
+    requested = requested_raw or DEFAULT_SEEDLAB_EVAL_DEVICE
+    if requested != "cpu" and requested != "auto" and not requested.startswith("cuda"):
+        requested = DEFAULT_SEEDLAB_EVAL_DEVICE
+    require_gpu = _to_bool(os.getenv("SEEDLAB_EVAL_REQUIRE_GPU"), False)
+    torch_runtime = _get_torch_runtime()
+    cuda_available = bool(torch_runtime.get("cuda_available"))
+    resolved = "cpu"
+    fallback_reason = ""
+    if requested == "cpu":
+        resolved = "cpu"
+    elif requested == "auto":
+        if cuda_available:
+            resolved = "cuda:0"
+        else:
+            resolved = "cpu"
+            fallback_reason = "cuda unavailable"
+    else:
+        if cuda_available:
+            resolved = requested if ":" in requested else "cuda:0"
+        else:
+            resolved = "cpu"
+            fallback_reason = f"requested {requested} but cuda unavailable"
+    if require_gpu and not resolved.startswith("cuda"):
+        raise RuntimeError(f"SEEDLAB_EVAL_REQUIRE_GPU=true but GPU runtime is unavailable ({fallback_reason or 'resolved to cpu'})")
+    return {
+        **torch_runtime,
+        "requested_device": requested_raw or DEFAULT_SEEDLAB_EVAL_DEVICE,
+        "resolved_device": resolved,
+        "require_gpu": require_gpu,
+        "gpu_acceleration_active": False,
+        "fallback_reason": fallback_reason,
+        "model_cache_dir": str(_seedlab_eval_model_cache_dir()),
+    }
+
+
+def _torch_device_is_cuda(device: str) -> bool:
+    return str(device or "").strip().lower().startswith("cuda")
+
+
+def _infer_module_device(obj: Any) -> str:
+    seen: set[int] = set()
+    queue: list[Any] = [obj]
+    attr_names = (
+        "device",
+        "module",
+        "model",
+        "_model",
+        "net",
+        "mods",
+        "modules",
+        "embedding_model",
+        "classifier",
+        "encoder",
+        "pipeline",
+    )
+    while queue:
+        current = queue.pop(0)
+        if current is None:
+            continue
+        obj_id = id(current)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        try:
+            device_attr = getattr(current, "device", None)
+            if device_attr is not None:
+                text = str(device_attr).strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+        try:
+            parameters = getattr(current, "parameters", None)
+            if callable(parameters):
+                first_param = next(parameters(), None)
+                if first_param is not None:
+                    return str(first_param.device)
+        except Exception:
+            pass
+        for name in attr_names:
+            try:
+                child = getattr(current, name, None)
+            except Exception:
+                continue
+            if child is None:
+                continue
+            if isinstance(child, dict):
+                queue.extend(child.values())
+            elif isinstance(child, (list, tuple, set)):
+                queue.extend(list(child))
+            else:
+                queue.append(child)
+    return ""
+
+
+def _seedlab_runtime_capabilities(
+    *,
+    reference_audio_local_path: str = "",
+    reference_audio_s3_uri: str = "",
+    reference_audio_paths: list[Path] | None = None,
+) -> dict[str, Any]:
+    runtime = _resolve_seedlab_eval_runtime()
+    reference_audio_paths = [p for p in (reference_audio_paths or []) if p.exists()]
+    reference_corpus_loaded = bool(reference_audio_paths) or bool(reference_audio_local_path.strip() or reference_audio_s3_uri.strip())
+    advanced_dsp_enabled = all(
+        importlib.util.find_spec(name) is not None for name in ("numpy", "scipy", "librosa", "soundfile")
+    )
+    return {
+        "advanced_dsp_enabled": advanced_dsp_enabled,
+        "mos_dependency_installed": importlib.util.find_spec("distillmos") is not None,
+        "speaker_dependency_installed": (
+            importlib.util.find_spec("speechbrain") is not None
+            and importlib.util.find_spec("torch") is not None
+            and importlib.util.find_spec("torchaudio") is not None
+        ),
+        "mos_enabled": False,
+        "speaker_similarity_enabled": False,
+        "reference_corpus_loaded": reference_corpus_loaded,
+        "reference_count": len(reference_audio_paths),
+        "intonation_enabled": advanced_dsp_enabled and reference_corpus_loaded,
+        "requested_device": runtime.get("requested_device"),
+        "resolved_device": runtime.get("resolved_device"),
+        "require_gpu": runtime.get("require_gpu"),
+        "cuda_available": runtime.get("cuda_available"),
+        "cuda_device_count": runtime.get("cuda_device_count"),
+        "cuda_device_name": runtime.get("cuda_device_name"),
+        "cuda_version": runtime.get("cuda_version"),
+        "torch_available": runtime.get("torch_available"),
+        "torch_version": runtime.get("torch_version"),
+        "gpu_acceleration_active": False,
+        "fallback_reason": runtime.get("fallback_reason"),
+        "model_cache_dir": runtime.get("model_cache_dir"),
+        "mos_device": "",
+        "speaker_device": "",
+    }
 
 
 def _load_optional_yaml(text: str, path: Path) -> dict[str, Any]:
@@ -2417,17 +2608,13 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
     speaker_similarity_mean = None
     intonation_similarity = None
     reference_count = 0
-    capabilities = {
-        "advanced_dsp_enabled": True,
-        "mos_enabled": False,
-        "speaker_similarity_enabled": False,
-        "reference_corpus_loaded": False,
-        "intonation_enabled": False,
-    }
+    capabilities = _seedlab_runtime_capabilities(reference_audio_paths=reference_audio_paths)
+    capabilities["advanced_dsp_enabled"] = True
     reference_audio_paths = [p for p in (reference_audio_paths or []) if p.exists()]
     if reference_audio_paths:
         reference_count = len(reference_audio_paths)
         capabilities["reference_corpus_loaded"] = True
+        capabilities["reference_count"] = reference_count
         corpus = _build_reference_corpus_summary(reference_audio_paths)
         ref_median = float(corpus.get("f0_median_hz_mean") or 0.0)
         ref_iqr = float(corpus.get("f0_iqr_hz_mean") or 0.0)
@@ -2445,33 +2632,64 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
         intonation_similarity = _mean(intonation_parts)
         capabilities["intonation_enabled"] = True
         try:
-            global _SPEAKER_VERIFIER
-            if _SPEAKER_VERIFIER is None:
+            runtime = _resolve_seedlab_eval_runtime()
+            resolved_device = str(runtime.get("resolved_device") or "cpu")
+            global _SPEAKER_VERIFIERS
+            verifier = _SPEAKER_VERIFIERS.get(resolved_device)
+            if verifier is None:
                 from speechbrain.inference.speaker import SpeakerRecognition  # type: ignore
 
-                _SPEAKER_VERIFIER = SpeakerRecognition.from_hparams(
+                verifier = SpeakerRecognition.from_hparams(
                     source="speechbrain/spkrec-ecapa-voxceleb",
-                    savedir=str(audio_path.parent / ".seed_lab_spkrec_cache"),
+                    savedir=str(_seedlab_eval_model_cache_dir() / "speechbrain"),
+                    run_opts={"device": resolved_device},
                 )
+                _SPEAKER_VERIFIERS[resolved_device] = verifier
             speaker_scores: list[float] = []
             for ref_path in reference_audio_paths:
-                score, _prediction = _SPEAKER_VERIFIER.verify_files(str(ref_path), str(audio_path))
+                score, _prediction = verifier.verify_files(str(ref_path), str(audio_path))
                 speaker_scores.append(float(score))
             speaker_similarity_mean = _pairwise_mean(speaker_scores)
             speaker_similarity = speaker_similarity_mean
             capabilities["speaker_similarity_enabled"] = speaker_similarity_mean is not None
+            speaker_device = _infer_module_device(verifier) or str(getattr(verifier, "device", "") or resolved_device)
+            capabilities["speaker_device"] = speaker_device
+            if _torch_device_is_cuda(speaker_device):
+                capabilities["gpu_acceleration_active"] = True
         except Exception:
             speaker_similarity = None
 
     mos_pred = None
     try:
-        global _DISTILLMOS_PREDICTOR
-        if _DISTILLMOS_PREDICTOR is None:
+        runtime = _resolve_seedlab_eval_runtime()
+        resolved_device = str(runtime.get("resolved_device") or "cpu")
+        global _DISTILLMOS_PREDICTORS
+        predictor = _DISTILLMOS_PREDICTORS.get(resolved_device)
+        if predictor is None:
             import distillmos  # type: ignore
 
-            _DISTILLMOS_PREDICTOR = distillmos.DistillMOS()
-        mos_pred = float(_DISTILLMOS_PREDICTOR.predict(str(audio_path)))
+            predictor = distillmos.DistillMOS()
+            if hasattr(predictor, "to"):
+                predictor.to(resolved_device)
+            for attr_name in ("model", "_model", "net", "module"):
+                module = getattr(predictor, attr_name, None)
+                if hasattr(module, "to"):
+                    module.to(resolved_device)
+                    if hasattr(module, "eval"):
+                        module.eval()
+            for attr_name in ("device", "_device"):
+                if hasattr(predictor, attr_name):
+                    try:
+                        setattr(predictor, attr_name, resolved_device)
+                    except Exception:
+                        pass
+            _DISTILLMOS_PREDICTORS[resolved_device] = predictor
+        mos_pred = float(predictor.predict(str(audio_path)))
         capabilities["mos_enabled"] = True
+        mos_device = _infer_module_device(predictor) or str(getattr(predictor, "device", "") or "")
+        capabilities["mos_device"] = mos_device
+        if _torch_device_is_cuda(mos_device):
+            capabilities["gpu_acceleration_active"] = True
     except Exception:
         mos_pred = None
 
@@ -2839,7 +3057,6 @@ def _auto_eval_single_record(
     script_text = str(rec.get("script_text") or "")
     audio_rel_path = str(rec.get("audio_rel_path") or "").strip()
     audio_path = (run_dir / audio_rel_path).resolve()
-    started = time.time()
 
     if not sample_id:
         raise RuntimeError("record missing sample_id")
@@ -2854,6 +3071,50 @@ def _auto_eval_single_record(
         }
         return sample_id, eval_obj, debug
 
+    return _auto_eval_audio_file(
+        run_dir=run_dir,
+        sample_id=sample_id,
+        seed=seed,
+        script_id=script_id,
+        script_text=script_text,
+        audio_path=audio_path,
+        rec=rec,
+        asr_api_key=asr_api_key,
+        judge_api_key=judge_api_key,
+        asr_model=asr_model,
+        judge_model=judge_model,
+        language=language,
+        timeout_seconds=timeout_seconds,
+        evaluation_profile=evaluation_profile,
+        reference_audio_local_path=reference_audio_local_path,
+        reference_audio_s3_uri=reference_audio_s3_uri,
+        reference_audio_cache_dir=reference_audio_cache_dir,
+        disable_llm_note=disable_llm_note,
+    )
+
+
+def _auto_eval_audio_file(
+    *,
+    run_dir: Path,
+    sample_id: str,
+    seed: int,
+    script_id: str,
+    script_text: str,
+    audio_path: Path,
+    rec: dict[str, Any],
+    asr_api_key: str,
+    judge_api_key: str,
+    asr_model: str,
+    judge_model: str,
+    language: str,
+    timeout_seconds: int,
+    evaluation_profile: str,
+    reference_audio_local_path: str,
+    reference_audio_s3_uri: str,
+    reference_audio_cache_dir: str,
+    disable_llm_note: bool,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    started = time.time()
     try:
         reference_audio_paths, reference_audio_source, reference_set_id = _resolve_reference_audio_paths(
             run_dir=run_dir,
@@ -2946,6 +3207,8 @@ def _auto_eval_single_record(
             "reference_audio_source": reference_audio_source,
             "reference_audio_paths": [str(path) for path in reference_audio_paths],
             "reference_set_id": reference_set_id,
+            "resolved_device": (signal.get("capabilities") or {}).get("resolved_device"),
+            "gpu_acceleration_active": bool((signal.get("capabilities") or {}).get("gpu_acceleration_active")),
             "signal_metrics": signal,
             "scored_metrics": scored,
             "elapsed_ms": int((time.time() - started) * 1000),

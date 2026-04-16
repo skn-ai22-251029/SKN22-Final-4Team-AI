@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     notebooklm_service_url: str = "http://notebooklm-service:8090"
     topic_channels: str = ""
+    tts_router_url: str = "http://tts-router-service:8300"
     tts_api_url: str = ""
     tts_ref_audio_path: str = ""
     tts_prompt_text: str = ""

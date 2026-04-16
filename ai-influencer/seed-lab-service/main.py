@@ -8,12 +8,15 @@ import json
 import logging
 import secrets
 import sys
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import boto3
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -46,6 +49,7 @@ from seed_lab import (  # type: ignore
     _resolve_asr_model_for_transcription,
     _resolve_openai_keys,
     _resolve_serve_default_tts_params,
+    _seedlab_runtime_capabilities,
     _to_bool,
     _to_float,
     _to_int,
@@ -68,6 +72,7 @@ class Settings(BaseSettings):
     seedlab_default_dataset: str = "/app/scripts/seed_lab_dataset.local.json"
     seedlab_queue_concurrency: int = 1
     seedlab_sample_concurrency: int = 2
+    tts_router_url: str = "http://tts-router-service:8300"
     tts_api_url: str = ""
     openai_fallback_api_key: str = ""
     openai_api_key_seedlab_asr: str = ""
@@ -81,6 +86,14 @@ class Settings(BaseSettings):
     seedlab_reference_audio_cache_dir: str = ""
     seedlab_disable_llm_note: bool = False
     seedlab_language: str = "ko"
+    seedlab_eval_mode: str = "runpod_pod"
+    seedlab_eval_runpod_url: str = ""
+    seedlab_eval_runpod_shared_secret: str = ""
+    seedlab_eval_runpod_timeout: int = 180
+    seedlab_eval_runpod_poll_interval: float = 2.0
+    seedlab_sample_s3_bucket: str = ""
+    seedlab_sample_s3_prefix: str = "seed-lab-samples"
+    seedlab_sample_s3_region: str = "ap-northeast-2"
 
     class Config:
         env_file = ".env"
@@ -95,6 +108,9 @@ class RunCreateRequest(BaseModel):
     seeds: str = ""
     dup: bool = False
     dataset_path: str = ""
+
+
+_s3_client: Any | None = None
 
 
 def _utcnow() -> dt.datetime:
@@ -186,6 +202,7 @@ async def _notify_gateway_progress(state: dict[str, Any]) -> None:
         "run_id": str(state.get("run_id") or ""),
         "status": str(state.get("status") or ""),
         "stage": str(state.get("stage") or ""),
+        "eval_location": _eval_location_label(),
         "generated_count": int(state.get("generated_count") or 0),
         "evaluated_count": int(state.get("evaluated_count") or 0),
         "ready_count": int(state.get("ready_count") or 0),
@@ -226,6 +243,210 @@ def _normalize_record_for_service(rec: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _normalize_eval_mode(raw: str) -> str:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in {"local", "runpod_pod"} else "runpod_pod"
+
+
+def _eval_location_label() -> str:
+    return "runpod" if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod" else "local"
+
+
+def _s3_prefix() -> str:
+    return str(settings.seedlab_sample_s3_prefix or "seed-lab-samples").strip().strip("/")
+
+
+def _sample_s3_enabled() -> bool:
+    return bool(str(settings.seedlab_sample_s3_bucket or "").strip())
+
+
+def _runpod_eval_enabled() -> bool:
+    return bool(
+        _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod"
+        and str(settings.seedlab_eval_runpod_url or "").strip()
+        and str(settings.seedlab_eval_runpod_shared_secret or "").strip()
+    )
+
+
+def _get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        region = str(settings.seedlab_sample_s3_region or "").strip() or None
+        _s3_client = boto3.client("s3", region_name=region)
+    return _s3_client
+
+
+def _record_audio_s3_key(run_id: str, rec: dict[str, Any]) -> str:
+    audio_rel = str(rec.get("audio_rel_path") or "").strip().replace("\\", "/").lstrip("/")
+    if not audio_rel:
+        raise RuntimeError("audio_rel_path missing")
+    return "/".join([part for part in (_s3_prefix(), run_id.strip(), audio_rel) if part])
+
+
+def _upload_record_audio_to_s3(run_id: str, run_dir: Path, rec: dict[str, Any]) -> tuple[str, str]:
+    if not _sample_s3_enabled():
+        raise RuntimeError("sample S3 upload is not configured")
+    audio_rel = str(rec.get("audio_rel_path") or "").strip().replace("\\", "/").lstrip("/")
+    if not audio_rel:
+        raise RuntimeError("audio_rel_path missing")
+    audio_path = (run_dir / audio_rel).resolve()
+    if not audio_path.exists():
+        raise RuntimeError(f"audio file missing: {audio_path}")
+    key = _record_audio_s3_key(run_id, rec)
+    bucket = str(settings.seedlab_sample_s3_bucket or "").strip()
+    extra_args = {"ContentType": "audio/wav"}
+    _get_s3_client().upload_file(str(audio_path), bucket, key, ExtraArgs=extra_args)
+    uri = f"s3://{bucket}/{key}"
+    rec["audio_s3_key"] = key
+    rec["audio_s3_uri"] = uri
+    return key, uri
+
+
+def _ensure_record_audio_uploaded(run_id: str, run_dir: Path, rec: dict[str, Any]) -> tuple[str, str]:
+    existing_uri = str(rec.get("audio_s3_uri") or "").strip()
+    existing_key = str(rec.get("audio_s3_key") or "").strip()
+    if existing_uri and existing_key:
+        return existing_key, existing_uri
+    return _upload_record_audio_to_s3(run_id, run_dir, rec)
+
+
+def _populate_records_s3_audio(run_id: str, run_dir: Path, records: list[dict[str, Any]], concurrency: int) -> None:
+    if not _sample_s3_enabled():
+        return
+    upload_targets = [rec for rec in records if rec.get("status") in ("ready", "skipped_existing") and str(rec.get("audio_rel_path") or "").strip()]
+    if not upload_targets:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = {pool.submit(_ensure_record_audio_uploaded, run_id, run_dir, rec): rec for rec in upload_targets}
+        for fut, rec in futures.items():
+            try:
+                fut.result()
+            except Exception as e:
+                logger.warning("seedlab audio S3 upload failed run_id=%s sample_id=%s err=%s", run_id, rec.get("sample_id"), e)
+
+
+def _local_eval_kwargs() -> dict[str, Any]:
+    asr_api_key, judge_api_key = _resolve_openai_keys(
+        explicit_shared_key="",
+        explicit_asr_key="",
+        explicit_judge_key="",
+    )
+    asr_model_resolved, _warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
+    return {
+        "asr_api_key": asr_api_key,
+        "judge_api_key": judge_api_key,
+        "asr_model": asr_model_resolved,
+        "judge_model": settings.seedlab_judge_model,
+        "language": settings.seedlab_language,
+        "timeout_seconds": int(settings.seedlab_auto_eval_timeout),
+        "evaluation_profile": settings.seedlab_evaluation_profile,
+        "reference_audio_local_path": settings.seedlab_reference_audio_local_path,
+        "reference_audio_s3_uri": settings.seedlab_reference_audio_s3_uri,
+        "reference_audio_cache_dir": settings.seedlab_reference_audio_cache_dir,
+        "disable_llm_note": bool(settings.seedlab_disable_llm_note),
+    }
+
+
+def _remote_eval_request(rec: dict[str, Any]) -> dict[str, Any]:
+    audio_s3_uri = str(rec.get("audio_s3_uri") or "").strip()
+    if not audio_s3_uri:
+        raise RuntimeError("audio_s3_uri missing")
+    asr_model_resolved, _warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
+    return {
+        "sample_id": str(rec.get("sample_id") or "").strip(),
+        "seed": int(rec.get("seed") or 0),
+        "script_id": str(rec.get("script_id") or "").strip(),
+        "script_text": str(rec.get("script_text") or ""),
+        "audio_s3_uri": audio_s3_uri,
+        "asr_model": asr_model_resolved,
+        "judge_model": settings.seedlab_judge_model,
+        "language": settings.seedlab_language,
+        "timeout_seconds": int(settings.seedlab_auto_eval_timeout),
+        "evaluation_profile": settings.seedlab_evaluation_profile,
+        "disable_llm_note": bool(settings.seedlab_disable_llm_note),
+    }
+
+
+def _runpod_eval_headers() -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "X-Seedlab-Secret": str(settings.seedlab_eval_runpod_shared_secret or "").strip(),
+    }
+
+
+def _request_json(req: urllib.request.Request, timeout_seconds: float) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(req, timeout=max(5.0, float(timeout_seconds))) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"runpod eval HTTP {e.code}: {detail[:800]}") from e
+    except Exception as e:
+        raise RuntimeError(f"runpod eval request failed: {e}") from e
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("runpod eval returned non-object response")
+    return parsed
+
+
+def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    if not _runpod_eval_enabled():
+        raise RuntimeError("Runpod evaluation is not configured")
+    url = str(settings.seedlab_eval_runpod_url or "").strip().rstrip("/")
+    timeout_seconds = max(10, int(settings.seedlab_eval_runpod_timeout))
+    poll_interval = max(0.5, float(settings.seedlab_eval_runpod_poll_interval))
+    payload = _remote_eval_request(rec)
+    submit_req = urllib.request.Request(
+        f"{url}/evaluate/jobs",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=_runpod_eval_headers(),
+        method="POST",
+    )
+    submitted = _request_json(submit_req, min(timeout_seconds, 30))
+    job_id = str(submitted.get("job_id") or "").strip()
+    if not job_id:
+        raise RuntimeError("runpod eval submit did not return job_id")
+    deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
+    parsed = submitted
+    while True:
+        status_value = str(parsed.get("status") or "").strip().lower()
+        if status_value in {"completed", "succeeded"}:
+            break
+        if status_value in {"failed", "error"}:
+            raise RuntimeError(f"runpod eval job failed: {parsed.get('error') or 'unknown error'}")
+        if dt.datetime.now(dt.timezone.utc).timestamp() >= deadline:
+            raise RuntimeError(f"runpod eval polling timeout job_id={job_id}")
+        time.sleep(poll_interval)
+        poll_req = urllib.request.Request(
+            f"{url}/evaluate/jobs/{urllib.parse.quote(job_id, safe='')}",
+            headers=_runpod_eval_headers(),
+            method="GET",
+        )
+        parsed = _request_json(poll_req, min(timeout_seconds, 30))
+    sample_id = str(parsed.get("sample_id") or payload["sample_id"]).strip()
+    evaluation = parsed.get("evaluation")
+    debug = parsed.get("debug")
+    if not sample_id or not isinstance(evaluation, dict) or not isinstance(debug, dict):
+        raise RuntimeError("runpod eval returned invalid payload")
+    return sample_id, evaluation, debug
+
+
+def _evaluate_record_with_fallback(run_id: str, run_dir: Path, rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
+        try:
+            if _sample_s3_enabled():
+                _ensure_record_audio_uploaded(run_id, run_dir, rec)
+            return _call_runpod_eval(rec)
+        except Exception as e:
+            logger.warning(
+                "seedlab remote eval failed, falling back to local run_id=%s sample_id=%s err=%s",
+                run_id,
+                rec.get("sample_id"),
+                e,
+            )
+    return _auto_eval_single_record(run_dir=run_dir, rec=rec, **_local_eval_kwargs())
+
+
 def _run_status_payload(run_id: str) -> dict[str, Any]:
     state = _load_state(run_id)
     return {
@@ -257,6 +478,8 @@ _queue_lock = asyncio.Lock()
 
 
 def _openai_enabled() -> bool:
+    if _runpod_eval_enabled():
+        return True
     try:
         _resolve_openai_keys(explicit_shared_key="", explicit_asr_key="", explicit_judge_key="")
         return True
@@ -265,21 +488,14 @@ def _openai_enabled() -> bool:
 
 
 def _seedlab_capabilities() -> dict[str, Any]:
-    advanced_dsp_enabled = all(importlib.util.find_spec(name) is not None for name in ("numpy", "scipy", "librosa", "soundfile"))
-    mos_enabled = importlib.util.find_spec("distillmos") is not None
-    speaker_similarity_enabled = (
-        importlib.util.find_spec("speechbrain") is not None
-        and importlib.util.find_spec("torch") is not None
-        and importlib.util.find_spec("torchaudio") is not None
-    )
-    reference_corpus_loaded = bool((settings.seedlab_reference_audio_local_path or "").strip() or (settings.seedlab_reference_audio_s3_uri or "").strip())
-    intonation_enabled = advanced_dsp_enabled and reference_corpus_loaded
     return {
-        "advanced_dsp_enabled": advanced_dsp_enabled,
-        "mos_enabled": mos_enabled,
-        "speaker_similarity_enabled": speaker_similarity_enabled,
-        "reference_corpus_loaded": reference_corpus_loaded,
-        "intonation_enabled": intonation_enabled,
+        **_seedlab_runtime_capabilities(
+            reference_audio_local_path=settings.seedlab_reference_audio_local_path,
+            reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
+        ),
+        "eval_mode": _normalize_eval_mode(settings.seedlab_eval_mode),
+        "runpod_eval_enabled": _runpod_eval_enabled(),
+        "sample_s3_enabled": _sample_s3_enabled(),
         "reference_audio_local_path_configured": bool((settings.seedlab_reference_audio_local_path or "").strip()),
         "reference_audio_s3_uri_configured": bool((settings.seedlab_reference_audio_s3_uri or "").strip()),
     }
@@ -290,7 +506,7 @@ async def _run_generation_pipeline(run_id: str) -> None:
     run_dir = _run_dir(run_id)
     dataset_path = Path(str(state["dataset_path"])).resolve()
     scripts, tts_params = load_dataset(dataset_path)
-    endpoint = _resolve_api_endpoint(state.get("api_endpoint") or settings.tts_api_url)
+    endpoint = _resolve_api_endpoint(state.get("api_endpoint") or settings.tts_router_url or settings.tts_api_url)
     selected_scripts = _pick_scripts_for_stage(scripts, stage="a", script_ids=[])
     seed_list = list(state.get("seed_list") or [])
     takes_per_seed = int(state.get("takes_per_seed") or 1)
@@ -362,17 +578,13 @@ async def _run_generation_pipeline(run_id: str) -> None:
     )
     state["network_fail_count"] = network_fail_count
     state["http_502_count"] = http_502_count
+    _populate_records_s3_audio(run_id, run_dir, records, concurrency)
     _write_manifest(run_dir, _meta_from_state(state), records)
     _generate_review_html(run_id, records, run_dir / "index.html")
 
     if _openai_enabled() and records:
         state = _update_state(run_id, status="auto_evaluating", stage="auto_evaluating", evaluated_count=0)
         await _notify_gateway_progress(state)
-        asr_api_key, judge_api_key = _resolve_openai_keys(
-            explicit_shared_key="",
-            explicit_asr_key="",
-            explicit_judge_key="",
-        )
         asr_model_resolved, _asr_warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
         eval_out = run_dir / "auto_eval.json"
         eval_out.unlink(missing_ok=True)
@@ -380,20 +592,10 @@ async def _run_generation_pipeline(run_id: str) -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
             futures = [
                 pool.submit(
-                    _auto_eval_single_record,
-                    run_dir=run_dir,
-                    rec=rec,
-                    asr_api_key=asr_api_key,
-                    judge_api_key=judge_api_key,
-                    asr_model=asr_model_resolved,
-                    judge_model=settings.seedlab_judge_model,
-                    language=settings.seedlab_language,
-                    timeout_seconds=int(settings.seedlab_auto_eval_timeout),
-                    evaluation_profile=settings.seedlab_evaluation_profile,
-                    reference_audio_local_path=settings.seedlab_reference_audio_local_path,
-                    reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
-                    reference_audio_cache_dir=settings.seedlab_reference_audio_cache_dir,
-                    disable_llm_note=bool(settings.seedlab_disable_llm_note),
+                    _evaluate_record_with_fallback,
+                    run_id,
+                    run_dir,
+                    rec,
                 )
                 for rec in records
                 if rec.get("status") in ("ready", "skipped_existing")
@@ -518,7 +720,7 @@ async def create_run(_: Any = AuthDep, body: RunCreateRequest | None = None) -> 
         "status": "queued",
         "stage": "queued",
         "dataset_path": str(dataset_path),
-        "api_endpoint": _resolve_api_endpoint(settings.tts_api_url),
+        "api_endpoint": _resolve_api_endpoint(settings.tts_router_url or settings.tts_api_url),
         "seed_list": seed_list,
         "seed_count": len(seed_list),
         "seed_mode": seed_mode,
@@ -572,7 +774,7 @@ async def run_config(run_id: str) -> dict[str, Any]:
     capabilities = _seedlab_capabilities()
     return {
         "run_id": run_id,
-        "tts_endpoint": _resolve_api_endpoint(settings.tts_api_url),
+        "tts_endpoint": _resolve_api_endpoint(settings.tts_router_url or settings.tts_api_url),
         "default_tts_params": default_tts_params,
         "auto_eval_on_add": _openai_enabled(),
         "openai_configured": _openai_enabled(),
@@ -581,6 +783,9 @@ async def run_config(run_id: str) -> dict[str, Any]:
         "judge_model": settings.seedlab_judge_model,
         "evaluation_profile": settings.seedlab_evaluation_profile,
         "asr_warning": asr_warning,
+        "eval_mode": _normalize_eval_mode(settings.seedlab_eval_mode),
+        "runpod_eval_enabled": _runpod_eval_enabled(),
+        "sample_s3_enabled": _sample_s3_enabled(),
         "capabilities": capabilities,
     }
 
@@ -663,7 +868,7 @@ async def run_tts_generate(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         prompt_text = str(body.get("prompt_text") or "").strip()
         if prompt_text:
             tts_params["prompt_text"] = prompt_text
-    endpoint = _resolve_api_endpoint(settings.tts_api_url)
+    endpoint = _resolve_api_endpoint(settings.tts_router_url or settings.tts_api_url)
     rec = await asyncio.to_thread(
         _worker_generate_one,
         endpoint,
@@ -680,30 +885,19 @@ async def run_tts_generate(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
     created = _utcnow()
     rec["created_at"] = created.isoformat()
     rec["audio_url"] = urllib.parse.quote(str(rec.get("audio_rel_path") or "").strip().replace("\\", "/"), safe="/-_.~")
+    if _sample_s3_enabled():
+        try:
+            await asyncio.to_thread(_ensure_record_audio_uploaded, run_id, run_dir, rec)
+        except Exception as e:
+            logger.warning("seedlab live audio S3 upload failed run_id=%s sample_id=%s err=%s", run_id, rec.get("sample_id"), e)
     if _to_bool(body.get("add_to_review"), default=False):
         from seed_lab import _append_jsonl_object  # type: ignore
 
         _append_jsonl_object(run_dir / LIVE_RECORDS_JSONL, rec)
     ai_eval_obj = None
     if _to_bool(body.get("add_to_review"), default=False) and _openai_enabled():
-        asr_api_key, judge_api_key = _resolve_openai_keys(explicit_shared_key="", explicit_asr_key="", explicit_judge_key="")
         asr_model_resolved, _warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
-        sample_id_eval, eval_obj, debug_obj = await asyncio.to_thread(
-            _auto_eval_single_record,
-            run_dir=run_dir,
-            rec=rec,
-            asr_api_key=asr_api_key,
-            judge_api_key=judge_api_key,
-            asr_model=asr_model_resolved,
-            judge_model=settings.seedlab_judge_model,
-            language=settings.seedlab_language,
-            timeout_seconds=int(settings.seedlab_auto_eval_timeout),
-            evaluation_profile=settings.seedlab_evaluation_profile,
-            reference_audio_local_path=settings.seedlab_reference_audio_local_path,
-            reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
-            reference_audio_cache_dir=settings.seedlab_reference_audio_cache_dir,
-            disable_llm_note=bool(settings.seedlab_disable_llm_note),
-        )
+        sample_id_eval, eval_obj, debug_obj = await asyncio.to_thread(_evaluate_record_with_fallback, run_id, run_dir, rec)
         _upsert_eval_entry(
             run_dir / LIVE_AUTO_EVAL_JSON,
             run_id=run_id,
@@ -737,24 +931,8 @@ async def run_ai_eval_one(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
             break
     if not rec:
         raise HTTPException(status_code=404, detail="record not found")
-    asr_api_key, judge_api_key = _resolve_openai_keys(explicit_shared_key="", explicit_asr_key="", explicit_judge_key="")
     asr_model_resolved, _warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
-    sample_id_eval, eval_obj, debug_obj = await asyncio.to_thread(
-        _auto_eval_single_record,
-        run_dir=run_dir,
-        rec=rec,
-        asr_api_key=asr_api_key,
-        judge_api_key=judge_api_key,
-        asr_model=asr_model_resolved,
-        judge_model=settings.seedlab_judge_model,
-        language=settings.seedlab_language,
-        timeout_seconds=int(settings.seedlab_auto_eval_timeout),
-        evaluation_profile=settings.seedlab_evaluation_profile,
-        reference_audio_local_path=settings.seedlab_reference_audio_local_path,
-        reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
-        reference_audio_cache_dir=settings.seedlab_reference_audio_cache_dir,
-        disable_llm_note=bool(settings.seedlab_disable_llm_note),
-    )
+    sample_id_eval, eval_obj, debug_obj = await asyncio.to_thread(_evaluate_record_with_fallback, run_id, run_dir, rec)
     target_path = run_dir / LIVE_AUTO_EVAL_JSON if sample_id.startswith("live:") else run_dir / "auto_eval.json"
     _upsert_eval_entry(
         target_path,

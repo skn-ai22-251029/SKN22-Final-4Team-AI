@@ -2,12 +2,14 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib import request as urllib_request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Header, HTTPException, status
@@ -241,6 +243,25 @@ class NotebookStateResponse(BaseModel):
     error: Optional[str] = None
 
 
+class ResolveLatestVideoRequest(BaseModel):
+    channel_id: str
+    channel_name: str = ""
+    lookback_hours: int = 24
+    exclude_shorts: bool = True
+
+
+class ResolveLatestVideoResponse(BaseModel):
+    status: str
+    found: bool = False
+    video_url: str = ""
+    title: str = ""
+    published_at: str = ""
+    resolver: str = ""
+    attempts: int = 0
+    errors: list[str] = []
+    error: Optional[str] = None
+
+
 class CreateNotebookRequest(BaseModel):
     name: str                          # 노트북 표시 이름
     channel_id: str                    # YouTube 채널 ID (예: "UCUpJs89fSBXNolQGOYKn0YQ")
@@ -452,6 +473,308 @@ def _get_notebook_state(channel_id: str) -> NotebookStateResponse:
         has_reports=active_report_count > 0,
         latest_source_url=latest_source_url,
         latest_source_title=latest_source_title,
+    )
+
+
+def _fetch_rss_entries(channel_id: str) -> list[dict]:
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    req = urllib_request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        xml = resp.read().decode("utf-8", errors="replace")
+
+    entries: list[dict] = []
+    for block in re.findall(r"<entry>([\s\S]*?)</entry>", xml):
+        video_id = (re.search(r"<yt:videoId>([^<]+)</yt:videoId>", block) or [None, ""])[1]
+        if not video_id:
+            continue
+        title = (re.search(r"<title>([^<]+)</title>", block) or [None, ""])[1]
+        published_at = (re.search(r"<published>([^<]+)</published>", block) or [None, ""])[1]
+        link_match = re.search(r'<link rel="alternate" href="([^"]+)"', block)
+        video_url = link_match.group(1) if link_match else f"https://www.youtube.com/watch?v={video_id}"
+        entries.append(
+            {
+                "video_url": video_url,
+                "title": title,
+                "published_at": published_at,
+            }
+        )
+    return entries
+
+
+def _fetch_ytdlp_entries(channel_id: str) -> list[dict]:
+    channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    cmd = [
+        "yt-dlp",
+        "--ignore-errors",
+        "--skip-download",
+        "--playlist-end",
+        "15",
+        "--print-json",
+        channel_url,
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_cua_subprocess_env(),
+    )
+    if result.returncode != 0 and not (result.stdout or "").strip():
+        err = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(err[:500] or f"yt-dlp failed(code={result.returncode})")
+
+    entries: list[dict] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        video_id = str(item.get("id") or "").strip()
+        if not video_id:
+            continue
+        webpage_url = str(item.get("webpage_url") or "").strip()
+        url = webpage_url or f"https://www.youtube.com/watch?v={video_id}"
+        timestamp = item.get("timestamp")
+        upload_date = str(item.get("upload_date") or "").strip()
+        published_at = ""
+        if isinstance(timestamp, (int, float)):
+            published_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        elif len(upload_date) == 8 and upload_date.isdigit():
+            published_at = (
+                datetime.strptime(upload_date, "%Y%m%d")
+                .replace(tzinfo=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        entries.append(
+            {
+                "video_url": url,
+                "title": str(item.get("title") or "").strip(),
+                "published_at": published_at,
+            }
+        )
+    return entries
+
+
+def _parse_relative_published_text(raw: str) -> str:
+    text = (raw or "").strip().lower()
+    if not text:
+        return ""
+
+    now = datetime.now(timezone.utc)
+
+    def _to_iso(delta: timedelta) -> str:
+        return (now - delta).isoformat().replace("+00:00", "Z")
+
+    patterns: list[tuple[str, int]] = [
+        (r"(\d+)\s*seconds?\s+ago", 1),
+        (r"(\d+)\s*minutes?\s+ago", 60),
+        (r"(\d+)\s*hours?\s+ago", 3600),
+        (r"(\d+)\s*days?\s+ago", 86400),
+        (r"(\d+)\s*weeks?\s+ago", 7 * 86400),
+        (r"(\d+)\s*months?\s+ago", 30 * 86400),
+        (r"(\d+)\s*years?\s+ago", 365 * 86400),
+        (r"(\d+)\s*초\s*전", 1),
+        (r"(\d+)\s*분\s*전", 60),
+        (r"(\d+)\s*시간\s*전", 3600),
+        (r"(\d+)\s*일\s*전", 86400),
+        (r"(\d+)\s*주\s*전", 7 * 86400),
+        (r"(\d+)\s*개월\s*전", 30 * 86400),
+        (r"(\d+)\s*년\s*전", 365 * 86400),
+    ]
+    for pattern, unit_seconds in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _to_iso(timedelta(seconds=int(match.group(1)) * unit_seconds))
+
+    return ""
+
+
+def _flatten_runs_text(value: object) -> str:
+    if isinstance(value, dict):
+        simple = str(value.get("simpleText") or "").strip()
+        if simple:
+            return simple
+        runs = value.get("runs")
+        if isinstance(runs, list):
+            return "".join(str(run.get("text") or "") for run in runs if isinstance(run, dict)).strip()
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _iter_video_renderers(value: object):
+    if isinstance(value, dict):
+        if "videoRenderer" in value and isinstance(value["videoRenderer"], dict):
+            yield value["videoRenderer"]
+        for child in value.values():
+            yield from _iter_video_renderers(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_video_renderers(child)
+
+
+def _fetch_channel_page_entries(channel_id: str) -> list[dict]:
+    url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    req = urllib_request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+        },
+    )
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    match = re.search(r"var ytInitialData = (\{.*?\});", html)
+    if not match:
+        match = re.search(r"ytInitialData\s*=\s*(\{.*?\});", html)
+    if not match:
+        raise RuntimeError("ytInitialData not found")
+
+    data = json.loads(match.group(1))
+    entries: list[dict] = []
+    for renderer in _iter_video_renderers(data):
+        video_id = str(renderer.get("videoId") or "").strip()
+        if not video_id:
+            continue
+        entries.append(
+            {
+                "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": _flatten_runs_text(renderer.get("title")),
+                "published_at": _parse_relative_published_text(
+                    _flatten_runs_text(renderer.get("publishedTimeText"))
+                ),
+            }
+        )
+    return entries
+
+
+def _filter_latest_recent_video(
+    entries: list[dict],
+    *,
+    lookback_hours: int,
+    exclude_shorts: bool,
+) -> Optional[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, lookback_hours))
+    candidates: list[tuple[datetime, dict]] = []
+    for entry in entries:
+        video_url = str(entry.get("video_url") or "").strip()
+        if not video_url:
+            continue
+        if exclude_shorts and "/shorts/" in video_url:
+            continue
+        published_at = str(entry.get("published_at") or "").strip()
+        if not published_at:
+            continue
+        try:
+            published_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if published_dt < cutoff:
+            continue
+        candidates.append((published_dt, entry))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _resolve_latest_video(
+    channel_id: str,
+    channel_name: str,
+    lookback_hours: int,
+    exclude_shorts: bool,
+) -> ResolveLatestVideoResponse:
+    errors: list[str] = []
+    attempts = 0
+
+    try:
+        attempts += 1
+        rss_entries = _fetch_rss_entries(channel_id)
+        selected = _filter_latest_recent_video(
+            rss_entries,
+            lookback_hours=lookback_hours,
+            exclude_shorts=exclude_shorts,
+        )
+        if selected:
+            return ResolveLatestVideoResponse(
+                status="success",
+                found=True,
+                video_url=str(selected.get("video_url") or ""),
+                title=str(selected.get("title") or ""),
+                published_at=str(selected.get("published_at") or ""),
+                resolver="rss",
+                attempts=attempts,
+                errors=errors,
+            )
+        errors.append("rss:no-recent-video-within-lookback")
+    except Exception as e:
+        errors.append(f"rss:{str(e)[:300]}")
+
+    try:
+        attempts += 1
+        ytdlp_entries = _fetch_ytdlp_entries(channel_id)
+        selected = _filter_latest_recent_video(
+            ytdlp_entries,
+            lookback_hours=lookback_hours,
+            exclude_shorts=exclude_shorts,
+        )
+        if selected:
+            return ResolveLatestVideoResponse(
+                status="success",
+                found=True,
+                video_url=str(selected.get("video_url") or ""),
+                title=str(selected.get("title") or ""),
+                published_at=str(selected.get("published_at") or ""),
+                resolver="yt_dlp",
+                attempts=attempts,
+                errors=errors,
+            )
+        errors.append("yt_dlp:no-recent-video-within-lookback")
+    except Exception as e:
+        errors.append(f"yt_dlp:{str(e)[:300]}")
+
+    try:
+        attempts += 1
+        html_entries = _fetch_channel_page_entries(channel_id)
+        selected = _filter_latest_recent_video(
+            html_entries,
+            lookback_hours=lookback_hours,
+            exclude_shorts=exclude_shorts,
+        )
+        if selected:
+            return ResolveLatestVideoResponse(
+                status="success",
+                found=True,
+                video_url=str(selected.get("video_url") or ""),
+                title=str(selected.get("title") or ""),
+                published_at=str(selected.get("published_at") or ""),
+                resolver="channel_html",
+                attempts=attempts,
+                errors=errors,
+            )
+        errors.append("channel_html:no-recent-video-within-lookback")
+    except Exception as e:
+        errors.append(f"channel_html:{str(e)[:300]}")
+
+    logger.warning(
+        "[resolve-latest-video] no candidate channel_id=%s channel_name=%s errors=%s",
+        channel_id,
+        channel_name,
+        errors,
+    )
+    return ResolveLatestVideoResponse(
+        status="success",
+        found=False,
+        resolver="",
+        attempts=attempts,
+        errors=errors,
+        error="no recent video found",
     )
 
 
@@ -988,6 +1311,25 @@ async def notebook_state_endpoint(
     """채널의 현재 active notebook과 source 개수를 반환한다."""
     verify_secret(x_internal_secret)
     return _get_notebook_state(body.channel_id)
+
+
+@app.post("/resolve-latest-video", response_model=ResolveLatestVideoResponse)
+async def resolve_latest_video_endpoint(
+    body: ResolveLatestVideoRequest,
+    x_internal_secret: Optional[str] = Header(default=None),
+) -> ResolveLatestVideoResponse:
+    verify_secret(x_internal_secret)
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor,
+        _resolve_latest_video,
+        body.channel_id,
+        body.channel_name,
+        body.lookback_hours,
+        body.exclude_shorts,
+    )
 
 
 @app.get("/all-channels", response_model=AllChannelsResponse)

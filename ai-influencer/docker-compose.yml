@@ -7,8 +7,24 @@ networks:
 volumes:
   postgres_data:
   n8n_data:
+  caddy_data:
+  caddy_config:
 
 services:
+  edge-proxy:
+    image: caddy:2.8-alpine
+    restart: always
+    network_mode: host
+    environment:
+      EDGE_TTS_HOST: ${EDGE_TTS_HOST:?EDGE_TTS_HOST is required}
+      EDGE_SEEDLAB_EVAL_HOST: ${EDGE_SEEDLAB_EVAL_HOST:?EDGE_SEEDLAB_EVAL_HOST is required}
+      EDGE_TTS_UPSTREAM: ${EDGE_TTS_UPSTREAM:-127.0.0.1:19880}
+      EDGE_SEEDLAB_EVAL_UPSTREAM: ${EDGE_SEEDLAB_EVAL_UPSTREAM:-127.0.0.1:18400}
+    volumes:
+      - ./edge-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
   postgres:
     image: postgres:15-alpine
     restart: always
@@ -54,7 +70,8 @@ services:
       NOTEBOOKLM_MAX_SOURCES: ${NOTEBOOKLM_MAX_SOURCES:-20}
       WF09_LOOKBACK_HOURS: ${WF09_LOOKBACK_HOURS:-24}
       N8N_WF12_WEBHOOK_URL: ${N8N_WF12_WEBHOOK_URL}
-      TTS_API_URL: ${TTS_API_URL}
+      TTS_ROUTER_URL: ${TTS_ROUTER_URL:-http://tts-router-service:8300}
+      TTS_API_URL: ${TTS_ROUTER_URL:-http://tts-router-service:8300}
       TTS_REF_AUDIO_PATH: ${TTS_REF_AUDIO_PATH:-}
       TTS_PROMPT_TEXT: ${TTS_PROMPT_TEXT:-}
       TTS_TEXT_LANG: ${TTS_TEXT_LANG:-ko}
@@ -171,7 +188,8 @@ services:
       MEDIA_S3_PREFIX_VIDEOS: ${MEDIA_S3_PREFIX_VIDEOS:-videos}
       MEDIA_S3_PREFIX_SRT: ${MEDIA_S3_PREFIX_SRT:-srt}
       MEDIA_S3_PREFIX_VIDEOS_WITH_SUBTITLE: ${MEDIA_S3_PREFIX_VIDEOS_WITH_SUBTITLE:-Video_with_Subtitle}
-      TTS_API_URL: ${TTS_API_URL}
+      TTS_ROUTER_URL: ${TTS_ROUTER_URL:-http://tts-router-service:8300}
+      TTS_API_URL: ${TTS_ROUTER_URL:-http://tts-router-service:8300}
       TTS_REF_AUDIO_PATH: ${TTS_REF_AUDIO_PATH:-}
       TTS_PROMPT_TEXT: ${TTS_PROMPT_TEXT:-}
       TTS_TEXT_LANG: ${TTS_TEXT_LANG:-ko}
@@ -228,7 +246,8 @@ services:
     environment:
       GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
       SEEDLAB_GATEWAY_URL: ${SEEDLAB_GATEWAY_URL:-http://messenger-gateway:8080}
-      TTS_API_URL: ${TTS_API_URL}
+      TTS_ROUTER_URL: ${TTS_ROUTER_URL:-http://tts-router-service:8300}
+      TTS_API_URL: ${TTS_ROUTER_URL:-http://tts-router-service:8300}
       OPENAI_FALLBACK_API_KEY: ${OPENAI_FALLBACK_API_KEY:-}
       OPENAI_API_KEY_SEEDLAB_ASR: ${OPENAI_API_KEY_SEEDLAB_ASR:-}
       OPENAI_API_KEY_SEEDLAB_JUDGE: ${OPENAI_API_KEY_SEEDLAB_JUDGE:-}
@@ -246,6 +265,14 @@ services:
       SEEDLAB_BASE_SCRIPT_TEXT: ${SEEDLAB_BASE_SCRIPT_TEXT:-}
       SEEDLAB_DISABLE_LLM_NOTE: ${SEEDLAB_DISABLE_LLM_NOTE:-false}
       SEEDLAB_LANGUAGE: ${SEEDLAB_LANGUAGE:-ko}
+      SEEDLAB_EVAL_MODE: ${SEEDLAB_EVAL_MODE:-runpod_pod}
+      SEEDLAB_EVAL_RUNPOD_URL: ${SEEDLAB_EVAL_RUNPOD_URL:-}
+      SEEDLAB_EVAL_RUNPOD_SHARED_SECRET: ${SEEDLAB_EVAL_RUNPOD_SHARED_SECRET:-}
+      SEEDLAB_EVAL_RUNPOD_TIMEOUT: ${SEEDLAB_EVAL_RUNPOD_TIMEOUT:-180}
+      SEEDLAB_EVAL_RUNPOD_POLL_INTERVAL: ${SEEDLAB_EVAL_RUNPOD_POLL_INTERVAL:-2}
+      SEEDLAB_SAMPLE_S3_BUCKET: ${SEEDLAB_SAMPLE_S3_BUCKET:-}
+      SEEDLAB_SAMPLE_S3_PREFIX: ${SEEDLAB_SAMPLE_S3_PREFIX:-seed-lab-samples}
+      SEEDLAB_SAMPLE_S3_REGION: ${SEEDLAB_SAMPLE_S3_REGION:-ap-northeast-2}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
@@ -338,6 +365,7 @@ services:
     environment:
       TTS_ROUTER_MODE: ${TTS_ROUTER_MODE:-legacy_http}
       TTS_ROUTER_FAILOPEN_TO_LEGACY: ${TTS_ROUTER_FAILOPEN_TO_LEGACY:-true}
+      TTS_PUBLIC_BASE_URL: ${TTS_PUBLIC_BASE_URL:-}
       TTS_LEGACY_API_URL: ${TTS_API_URL:-}
       TTS_REQUEST_TIMEOUT_SECONDS: ${TTS_REQUEST_TIMEOUT_SECONDS:-300}
       RUNPOD_API_KEY: ${RUNPOD_API_KEY:-}

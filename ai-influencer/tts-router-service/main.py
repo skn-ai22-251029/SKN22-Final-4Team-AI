@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     tts_router_failopen_to_legacy: bool = True
 
     # Legacy path (current Cloudflare/Pod endpoint)
+    tts_public_base_url: str = ""
     tts_legacy_api_url: str = ""
     tts_request_timeout_seconds: float = 300.0
 
@@ -48,7 +49,7 @@ def _normalize_mode(raw: str) -> str:
 
 
 def _legacy_tts_endpoint() -> str:
-    base = settings.tts_legacy_api_url.strip()
+    base = settings.tts_public_base_url.strip() or settings.tts_legacy_api_url.strip()
     if not base:
         return ""
     return base if base.rstrip("/").endswith("/tts") else f"{base.rstrip('/')}/tts"

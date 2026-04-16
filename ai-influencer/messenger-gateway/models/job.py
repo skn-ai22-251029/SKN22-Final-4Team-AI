@@ -217,6 +217,7 @@ class SeedLabProgressRequest(BaseModel):
     run_id: str
     status: str = ""
     stage: str = ""
+    eval_location: str = ""
     generated_count: int = 0
     evaluated_count: int = 0
     ready_count: int = 0
