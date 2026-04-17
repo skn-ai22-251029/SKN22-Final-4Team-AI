@@ -34,9 +34,6 @@ class Settings(BaseSettings):
 
 
 config = Settings()
-ALLOWED_USER_IDS: set[str] = {
-    uid.strip() for uid in config.discord_allowed_user_ids.split(",") if uid.strip()
-}
 ALLOWED_CHANNEL_IDS: set[str] = {
     cid.strip() for cid in config.discord_allowed_channel_ids.split(",") if cid.strip()
 }
@@ -142,6 +139,19 @@ def _build_button_view(*buttons: tuple[str, str, discord.ButtonStyle]) -> discor
     return view
 
 
+def _is_channel_allowed(channel_id: Optional[int]) -> bool:
+    if not ALLOWED_CHANNEL_IDS:
+        return True
+    return str(channel_id or "") in ALLOWED_CHANNEL_IDS
+
+
+async def _reject_if_channel_disallowed(interaction: discord.Interaction) -> bool:
+    if _is_channel_allowed(interaction.channel_id):
+        return False
+    await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+    return True
+
+
 # ─────────────────────────────────────────
 # 인메모리 수정 대기 상태 (pending_store)
 # ─────────────────────────────────────────
@@ -236,14 +246,10 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # 허용 채널 확인
-    if ALLOWED_CHANNEL_IDS and str(message.channel.id) not in ALLOWED_CHANNEL_IDS:
+    if not _is_channel_allowed(message.channel.id):
         return
 
     user_id = str(message.author.id)
-
-    # 허용 사용자 확인
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        return
 
     # 수정 지시 텍스트 대기 중인 경우에만 처리
     if user_id in revision_pending:
@@ -267,12 +273,7 @@ async def on_message(message: discord.Message) -> None:
 async def create_command(interaction: discord.Interaction, concept: str) -> None:
     user_id = str(interaction.user.id)
 
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
 
     await interaction.response.defer()
@@ -325,12 +326,7 @@ async def report_command(
 ) -> None:
     user_id = str(interaction.user.id)
 
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
 
     await interaction.response.defer()
@@ -388,12 +384,7 @@ async def tts_command(
     )
 
     try:
-        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-            return
-
-        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+        if await _reject_if_channel_disallowed(interaction):
             return
 
         if normalized_job_id and normalized_prompt:
@@ -456,12 +447,7 @@ async def seedlab_command(
     logger.info("[/seedlab] invoked user=%s channel=%s dup=%s seeds=%s", user_id, interaction.channel_id, dup, (seeds or "").strip())
 
     try:
-        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-            return
-
-        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+        if await _reject_if_channel_disallowed(interaction):
             return
 
         await _safe_defer(interaction, ephemeral=True)
@@ -496,12 +482,7 @@ async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> 
     logger.info("[/heygen] invoked user=%s channel=%s job_input=%s", user_id, interaction.channel_id, (job_id or "").strip())
 
     try:
-        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-            return
-
-        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+        if await _reject_if_channel_disallowed(interaction):
             return
 
         await _safe_reply(
@@ -524,12 +505,7 @@ async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> 
 async def jobs_command(interaction: discord.Interaction, purpose: str = "all") -> None:
     user_id = str(interaction.user.id)
 
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
 
     normalized_purpose = (purpose or "all").strip().lower()
@@ -676,13 +652,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         job_id = ":".join(parts[1:])
     user_id = str(interaction.user.id)
 
-    # 허용 채널 확인
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
         return
 
     if action in {"video_publish_youtube", "video_publish_both"}:

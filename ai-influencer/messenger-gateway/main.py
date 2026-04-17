@@ -3568,8 +3568,7 @@ async def _resolve_manual_job(
         return exact
 
     if not normalized_job_id:
-        latest = await job_service.get_latest_job(
-            user_id,
+        latest = await job_service.get_latest_job_in_channel(
             channel_id,
             require_script=require_script,
             require_audio=require_audio,
@@ -3587,13 +3586,12 @@ async def _resolve_manual_job(
 
     exact = await job_service.get_job(normalized_job_id)
     if exact is not None:
-        if exact.get("messenger_user_id") != user_id or exact.get("messenger_channel_id") != channel_id:
-            raise HTTPException(status_code=403, detail="Job belongs to a different user/channel")
+        if exact.get("messenger_channel_id") != channel_id:
+            raise HTTPException(status_code=403, detail="Job belongs to a different channel")
         return exact
 
-    matches = await job_service.find_jobs_by_prefix(
+    matches = await job_service.find_jobs_by_prefix_in_channel(
         normalized_job_id,
-        user_id,
         channel_id,
         require_script=require_script,
         require_audio=require_audio,
@@ -6324,8 +6322,7 @@ async def list_jobs(_: AuthDep, body: ListJobsRequest) -> dict:
 
     require_script = purpose == "tts"
     require_audio = purpose == "heygen"
-    rows = await job_service.list_recent_jobs(
-        body.messenger_user_id,
+    rows = await job_service.list_recent_jobs_in_channel(
         body.messenger_channel_id,
         limit=body.limit,
         require_script=require_script,

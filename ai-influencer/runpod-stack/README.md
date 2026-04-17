@@ -27,7 +27,10 @@ GPU evaluation knobs:
 - `SEEDLAB_EVAL_DEVICE=auto|cuda|cpu` (default `auto`)
 - `SEEDLAB_EVAL_REQUIRE_GPU=true|false` (default `false`)
 - `SEEDLAB_EVAL_MODEL_CACHE_DIR=/workspace/runpod-stack/cache/seedlab-models`
+- `SEEDLAB_REFERENCE_AUDIO_S3_URI=s3://hari-contents-skn22/seed-lab-reference/hari-global-v1/manifest.json`
+- `SEEDLAB_REFERENCE_AUDIO_CACHE_DIR=/workspace/runpod-stack/cache/seedlab-ref-cache`
 - These variables can live in `runpod-services.env`; `start-all.sh` exports them before starting `runpod-seedlab-eval-service`.
+- The default reference corpus is `hari-global-v1`; when configured, speaker similarity and intonation checks can use the RunPod GPU.
 
 Troubleshooting:
 

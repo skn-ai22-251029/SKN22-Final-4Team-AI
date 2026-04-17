@@ -327,6 +327,41 @@ async def list_recent_jobs(
     return [dict(row) for row in rows]
 
 
+async def list_recent_jobs_in_channel(
+    messenger_channel_id: str,
+    *,
+    limit: int = 5,
+    require_script: bool = False,
+    require_audio: bool = False,
+) -> list[dict[str, Any]]:
+    pool = await get_db_pool()
+    safe_limit = max(1, min(limit, 10))
+
+    where_clauses = ["messenger_channel_id = $1"]
+    if require_script:
+        where_clauses.append("COALESCE(script_json->>'script_text', script_json->>'script', '') <> ''")
+    if require_audio:
+        where_clauses.append("COALESCE(audio_url, '') <> ''")
+
+    query = f"""
+        SELECT
+            id::text AS id,
+            status,
+            messenger_user_id,
+            messenger_channel_id,
+            created_at,
+            updated_at,
+            COALESCE(script_json->>'script_text', script_json->>'script', '') AS script_text,
+            COALESCE(audio_url, '') AS audio_url
+        FROM jobs
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY created_at DESC
+        LIMIT $2
+    """
+    rows = await pool.fetch(query, messenger_channel_id, safe_limit)
+    return [dict(row) for row in rows]
+
+
 async def find_jobs_by_prefix(
     job_prefix: str,
     messenger_user_id: str,
@@ -375,6 +410,51 @@ async def find_jobs_by_prefix(
     return [dict(row) for row in rows]
 
 
+async def find_jobs_by_prefix_in_channel(
+    job_prefix: str,
+    messenger_channel_id: str,
+    *,
+    require_script: bool = False,
+    require_audio: bool = False,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    pool = await get_db_pool()
+    normalized_prefix = (job_prefix or "").strip()
+    if not normalized_prefix:
+        return []
+
+    safe_limit = max(1, min(limit, 10))
+    where_clauses = [
+        "messenger_channel_id = $1",
+        "id::text ILIKE $2",
+    ]
+    if require_script:
+        where_clauses.append("COALESCE(script_json->>'script_text', script_json->>'script', '') <> ''")
+    if require_audio:
+        where_clauses.append("COALESCE(audio_url, '') <> ''")
+
+    query = f"""
+        SELECT
+            id::text AS id,
+            status,
+            messenger_user_id,
+            messenger_channel_id,
+            COALESCE(script_json->>'script_text', script_json->>'script', '') AS script_text,
+            COALESCE(audio_url, '') AS audio_url
+        FROM jobs
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY created_at DESC
+        LIMIT $3
+    """
+    rows = await pool.fetch(
+        query,
+        messenger_channel_id,
+        f"{normalized_prefix}%",
+        safe_limit,
+    )
+    return [dict(row) for row in rows]
+
+
 async def get_latest_job(
     messenger_user_id: str,
     messenger_channel_id: str,
@@ -384,6 +464,23 @@ async def get_latest_job(
 ) -> Optional[dict[str, Any]]:
     rows = await list_recent_jobs(
         messenger_user_id,
+        messenger_channel_id,
+        limit=1,
+        require_script=require_script,
+        require_audio=require_audio,
+    )
+    if not rows:
+        return None
+    return rows[0]
+
+
+async def get_latest_job_in_channel(
+    messenger_channel_id: str,
+    *,
+    require_script: bool = False,
+    require_audio: bool = False,
+) -> Optional[dict[str, Any]]:
+    rows = await list_recent_jobs_in_channel(
         messenger_channel_id,
         limit=1,
         require_script=require_script,

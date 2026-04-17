@@ -723,8 +723,8 @@ nano .env   # 또는 vi .env
 | `POSTGRES_PASSWORD` | DB 비밀번호 | |
 | `GATEWAY_INTERNAL_SECRET` | 내부 서비스 인증 키 | |
 | `DISCORD_BOT_TOKEN` | Discord Bot 토큰 | |
-| `DISCORD_ALLOWED_USER_IDS` | 허용 유저 ID (쉼표 구분) | `12345,67890` |
-| `DISCORD_ALLOWED_CHANNEL_IDS` | 허용 채널 ID (쉼표 구분) | `11111,22222` |
+| `DISCORD_ALLOWED_USER_IDS` | (레거시) 자동화 파이프라인에서는 미사용. 별도 `/server` Lambda 권한 모델에서만 사용 가능 | `12345,67890` |
+| `DISCORD_ALLOWED_CHANNEL_IDS` | Discord 자동화 허용 채널 ID (쉼표 구분). 봇 명령/버튼은 이 채널들에서만 동작 | `11111,22222` |
 | `AUTO_REPORT_MAX_ATTEMPTS_PER_DAY` | auto-report 일일 최대 시도 횟수(채널+노트북 기준) | `3` |
 | `AUTO_REPORT_STALE_MINUTES` | auto-report 진행중 job stale 판정(분) | `45` |
 | `DISCORD_GUILD_ID` | (선택) 슬래시 명령 즉시 반영용 Guild ID | `123456789012345678` |
@@ -790,7 +790,8 @@ TOPIC_CHANNELS=채널이름/채널ID+채널이름/채널ID+...
 - 채널이름: 노트북 및 보고서 식별 키로 사용됨
 - 채널ID: YouTube 채널 ID (UC로 시작하는 24자리)
 
-자동 보고서(auto-report) 경로에서는 `DISCORD_ALLOWED_CHANNEL_IDS`의 **첫 번째 채널 ID만** 전송 대상으로 사용합니다.
+자동 보고서(auto-report) 경로에서는 `DISCORD_ALLOWED_CHANNEL_IDS`의 **첫 번째 채널 ID만** 전송 대상으로 사용합니다.  
+허용 채널 안에서는 특정 유저 제한 없이 팀원 누구나 `/report`, `/tts`, `/jobs`, `/seedlab` 및 승인 버튼을 사용할 수 있습니다.
 
 ### 6. 전체 서비스 빌드 및 기동
 
@@ -1453,6 +1454,7 @@ DB에는 run 메타데이터만 저장합니다.
 3. 기준 음성(reference corpus) 해석
   - `SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH` 또는 `SEEDLAB_REFERENCE_AUDIO_S3_URI`가 있으면 기준 음성 집합을 로드
   - S3 사용 시 `manifest.json` + `audio/*.wav` 구조를 캐시 디렉터리(`SEEDLAB_REFERENCE_AUDIO_CACHE_DIR`)로 내려받아 사용
+  - 현재 기본 운영 reference set은 `s3://hari-contents-skn22/seed-lab-reference/hari-global-v1/manifest.json`
   - 기준 음성에서 화자/피치/리듬 centroid를 계산
 4. wav 직접 분석
   - `pitch_jump_rate`
