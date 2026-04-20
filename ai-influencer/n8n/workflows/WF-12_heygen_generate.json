@@ -94,7 +94,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const jobId = $('Extract Fields').item.json.job_id;\nconst channelId = $('Extract Fields').item.json.channel_id;\nconst userId = $('Extract Fields').item.json.user_id;\nconst audioUrl = ($('Extract Fields').item.json.audio_url || '').trim();\nconst heygenApiKey = ($env.HEYGEN_API_KEY || '').trim();\nconst avatarId = String($('Extract Fields').item.json.avatar_id || '').trim();\nconst useAvatarIvModel = Boolean($('Extract Fields').item.json.use_avatar_iv_model);\nconst videoWidth = 1080;\nconst videoHeight = 1920;\nconst speed = 1.3;\nconst captionEnabled = false;\nconst pollIntervalSeconds = Math.max(1, Number($env.HEYGEN_POLL_INTERVAL_SECONDS || 10));\nconst maxWaitSeconds = Math.max(pollIntervalSeconds, Number($env.HEYGEN_MAX_WAIT_SECONDS || 900));\nconst mockEnabled = ['1', 'true', 'yes', 'on'].includes(String($env.HEYGEN_MOCK_ENABLED || 'false').trim().toLowerCase());\nconst mockVideoUrl = String($env.HEYGEN_MOCK_VIDEO_URL || 'https://samplelib.com/lib/preview/mp4/sample-5s.mp4').trim();\nconst kstDate = new Intl.DateTimeFormat('en-CA', {\n  timeZone: 'Asia/Seoul',\n  year: 'numeric',\n  month: '2-digit',\n  day: '2-digit',\n}).format(new Date()).replace(/-/g, '');\nconst videoFilename = `${kstDate}-${jobId}.mp4`;\n\nfunction describeError(error) {\n  const responseBody = error?.response?.body;\n  if (responseBody) {\n    if (typeof responseBody === 'string') {\n      return responseBody;\n    }\n    try {\n      return JSON.stringify(responseBody);\n    } catch {\n      return String(responseBody);\n    }\n  }\n  return error && error.message ? error.message : String(error);\n}\n\nfunction audioHost(url) {\n  try {\n    return new URL(url).host;\n  } catch {\n    return '';\n  }\n}\n\nconst requestSnapshot = {\n  avatar_id: avatarId,\n  use_avatar_iv_model: useAvatarIvModel,\n  voice_type: 'audio',\n  has_audio_url: !!audioUrl,\n  audio_url_host: audioHost(audioUrl),\n  speed,\n  dimension: { width: videoWidth, height: videoHeight },\n  caption: captionEnabled,\n};\n\nfunction buildFailedMessage(pollError) {\n  const code = String(pollError?.code || '').trim();\n  const detail = String(pollError?.detail || '').trim();\n  const message = String(pollError?.message || '').trim();\n  const activity = String(pollError?.activity_name || '').trim();\n  const mergedDetail = detail || message;\n  const parts = [];\n  if (code) parts.push(code);\n  if (mergedDetail) parts.push(mergedDetail);\n  if (activity) parts.push(`activity=${activity}`);\n  return {\n    code,\n    detail: mergedDetail,\n    activity,\n    message: parts.join(' | ') || 'failed',\n    raw: pollError || {},\n  };\n}\n\ntry {\n  if (!audioUrl) {\n    throw new Error('audio_url is required');\n  }\n  if (!avatarId) {\n    throw new Error('avatar_id is required from approval step');\n  }\n\n  if (mockEnabled) {\n    if (!mockVideoUrl) {\n      throw new Error('HEYGEN_MOCK_VIDEO_URL is not configured');\n    }\n    return {\n      json: {\n        ok: true,\n        completed: true,\n        status: 'completed',\n        video_url: mockVideoUrl,\n        video_id: `mock-${jobId}`,\n        video_filename: videoFilename,\n        avatar_id: avatarId,\n        avatar_type: 'mock',\n        use_avatar_iv_model: useAvatarIvModel,\n        video_width: videoWidth,\n        video_height: videoHeight,\n        speed,\n        caption_enabled: captionEnabled,\n        mock_enabled: true,\n        request_snapshot: requestSnapshot,\n        job_id: jobId,\n        channel_id: channelId,\n        user_id: userId,\n      },\n    };\n  }\n\n  if (!heygenApiKey) {\n    throw new Error('HEYGEN_API_KEY is not configured');\n  }\n\n  const avatarDetails = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.heygen.com/v2/avatar/${encodeURIComponent(avatarId)}/details`,\n    headers: { 'X-Api-Key': heygenApiKey },\n    json: true,\n    timeout: 30000,\n  });\n  const avatarType = avatarDetails.data?.type || avatarDetails.data?.avatar?.type || 'avatar';\n  const appliedAvatarIvModel = avatarType === 'talking_photo' && useAvatarIvModel;\n  const character = avatarType === 'talking_photo'\n    ? {\n        type: 'talking_photo',\n        talking_photo_id: avatarId,\n        ...(appliedAvatarIvModel ? { use_avatar_iv_model: true } : {}),\n      }\n    : {\n        type: 'avatar',\n        avatar_id: avatarId,\n        avatar_style: 'normal',\n      };\n\n  const videoBody = {\n    video_inputs: [{\n      character,\n      voice: {\n        type: 'audio',\n        audio_url: audioUrl,\n        speed,\n      },\n    }],\n    dimension: { width: videoWidth, height: videoHeight },\n    caption: captionEnabled,\n  };\n\n  const videoData = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.heygen.com/v2/video/generate',\n    headers: {\n      'X-Api-Key': heygenApiKey,\n      'Content-Type': 'application/json',\n    },\n    body: videoBody,\n    json: true,\n    timeout: 300000,\n  });\n\n  const videoId = videoData.data?.video_id;\n  if (!videoId) {\n    throw new Error(`HeyGen create video returned no video_id: ${JSON.stringify(videoData)}`);\n  }\n\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n  const deadline = Date.now() + (maxWaitSeconds * 1000);\n  let videoUrl = '';\n  let status = 'processing';\n  let failedError = { code: '', detail: '', activity: '', message: '', raw: {} };\n\n  while (Date.now() < deadline) {\n    await sleep(pollIntervalSeconds * 1000);\n    const pollData = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `https://api.heygen.com/v1/video_status.get?video_id=${encodeURIComponent(videoId)}`,\n      headers: { 'X-Api-Key': heygenApiKey },\n      json: true,\n      timeout: 30000,\n    });\n\n    status = pollData.data?.status || 'processing';\n    if (status === 'completed') {\n      videoUrl = pollData.data?.video_url || '';\n      break;\n    }\n    if (status === 'failed') {\n      failedError = buildFailedMessage(pollData.data?.error);\n      break;\n    }\n  }\n\n  if (status !== 'completed' && status !== 'failed') {\n    status = 'timeout';\n  }\n\n  return {\n    json: {\n      ok: status === 'completed' && !!videoUrl,\n      completed: status === 'completed' && !!videoUrl,\n      status,\n      error: status === 'failed' ? failedError.message : '',\n      error_code: status === 'failed' ? failedError.code : '',\n      error_detail: status === 'failed' ? failedError.detail : '',\n      error_activity: status === 'failed' ? failedError.activity : '',\n      heygen_error: status === 'failed' ? failedError.raw : {},\n      video_url: videoUrl,\n      video_id: videoId,\n      video_filename: videoFilename,\n      avatar_id: avatarId,\n      avatar_type: avatarType,\n      use_avatar_iv_model: appliedAvatarIvModel,\n      video_width: videoWidth,\n      video_height: videoHeight,\n      speed,\n      caption_enabled: captionEnabled,\n      mock_enabled: false,\n      request_snapshot: requestSnapshot,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n} catch (e) {\n  const message = describeError(e);\n  return {\n    json: {\n      ok: false,\n      completed: false,\n      status: 'failed',\n      error: message,\n      request_snapshot: requestSnapshot,\n      video_url: '',\n      video_filename: videoFilename,\n      avatar_id: avatarId,\n      use_avatar_iv_model: useAvatarIvModel,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}",
+        "jsCode": "const jobId = $('Extract Fields').item.json.job_id;\nconst channelId = $('Extract Fields').item.json.channel_id;\nconst userId = $('Extract Fields').item.json.user_id;\nconst audioUrl = ($('Extract Fields').item.json.audio_url || '').trim();\nconst heygenApiKey = ($env.HEYGEN_API_KEY || '').trim();\nconst avatarId = String($('Extract Fields').item.json.avatar_id || '').trim();\nconst useAvatarIvModel = Boolean($('Extract Fields').item.json.use_avatar_iv_model);\nconst videoWidth = 1080;\nconst videoHeight = 1920;\nconst speed = 1.3;\nconst captionEnabled = false;\nconst pollIntervalSeconds = Math.max(1, Number($env.HEYGEN_POLL_INTERVAL_SECONDS || 10));\nconst maxWaitSeconds = Math.max(pollIntervalSeconds, Number($env.HEYGEN_MAX_WAIT_SECONDS || 900));\nconst mockEnabled = ['1', 'true', 'yes', 'on'].includes(String($env.HEYGEN_MOCK_ENABLED || 'false').trim().toLowerCase());\nconst mockVideoUrl = String($env.HEYGEN_MOCK_VIDEO_URL || 'https://samplelib.com/lib/preview/mp4/sample-5s.mp4').trim();\nconst kstDate = new Intl.DateTimeFormat('en-CA', {\n  timeZone: 'Asia/Seoul',\n  year: 'numeric',\n  month: '2-digit',\n  day: '2-digit',\n}).format(new Date()).replace(/-/g, '');\nconst videoFilename = `${kstDate}-${jobId}.mp4`;\n\nfunction describeError(error) {\n  const responseBody = error?.response?.body;\n  if (responseBody) {\n    if (typeof responseBody === 'string') {\n      return responseBody;\n    }\n    try {\n      return JSON.stringify(responseBody);\n    } catch {\n      return String(responseBody);\n    }\n  }\n  return error && error.message ? error.message : String(error);\n}\n\nfunction audioHost(url) {\n  try {\n    return new URL(url).host;\n  } catch {\n    return '';\n  }\n}\n\nfunction extractCost(payload) {\n  if (payload == null) return null;\n  if (typeof payload === 'number' && Number.isFinite(payload)) return payload;\n  if (Array.isArray(payload)) {\n    for (const item of payload) {\n      const found = extractCost(item);\n      if (found != null) return found;\n    }\n    return null;\n  }\n  if (typeof payload !== 'object') return null;\n  for (const key of ['cost_usd', 'costUsd', 'credits_cost_usd', 'creditsCostUsd', 'total_cost_usd', 'totalCostUsd', 'billed_cost_usd', 'billedCostUsd']) {\n    const found = extractCost(payload[key]);\n    if (found != null) return found;\n  }\n  for (const key of ['cost', 'billing', 'usage', 'data']) {\n    const found = extractCost(payload[key]);\n    if (found != null) return found;\n  }\n  return null;\n}\n\nconst requestSnapshot = {\n  avatar_id: avatarId,\n  use_avatar_iv_model: useAvatarIvModel,\n  voice_type: 'audio',\n  has_audio_url: !!audioUrl,\n  audio_url_host: audioHost(audioUrl),\n  speed,\n  dimension: { width: videoWidth, height: videoHeight },\n  caption: captionEnabled,\n};\n\nfunction buildFailedMessage(pollError) {\n  const code = String(pollError?.code || '').trim();\n  const detail = String(pollError?.detail || '').trim();\n  const message = String(pollError?.message || '').trim();\n  const activity = String(pollError?.activity_name || '').trim();\n  const mergedDetail = detail || message;\n  const parts = [];\n  if (code) parts.push(code);\n  if (mergedDetail) parts.push(mergedDetail);\n  if (activity) parts.push(`activity=${activity}`);\n  return {\n    code,\n    detail: mergedDetail,\n    activity,\n    message: parts.join(' | ') || 'failed',\n    raw: pollError || {},\n  };\n}\n\ntry {\n  if (!audioUrl) {\n    throw new Error('audio_url is required');\n  }\n  if (!avatarId) {\n    throw new Error('avatar_id is required from approval step');\n  }\n\n  if (mockEnabled) {\n    if (!mockVideoUrl) {\n      throw new Error('HEYGEN_MOCK_VIDEO_URL is not configured');\n    }\n    return {\n      json: {\n        ok: true,\n        completed: true,\n        status: 'completed',\n        video_url: mockVideoUrl,\n        video_id: `mock-${jobId}`,\n        video_filename: videoFilename,\n        avatar_id: avatarId,\n        avatar_type: 'mock',\n        use_avatar_iv_model: useAvatarIvModel,\n        video_width: videoWidth,\n        video_height: videoHeight,\n        speed,\n        caption_enabled: captionEnabled,\n        mock_enabled: true,\n        request_snapshot: requestSnapshot,\n        create_response: {},\n        poll_response: {},\n        cost_usd: null,\n        job_id: jobId,\n        channel_id: channelId,\n        user_id: userId,\n      },\n    };\n  }\n\n  if (!heygenApiKey) {\n    throw new Error('HEYGEN_API_KEY is not configured');\n  }\n\n  const avatarDetails = await this.helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.heygen.com/v2/avatar/${encodeURIComponent(avatarId)}/details`,\n    headers: { 'X-Api-Key': heygenApiKey },\n    json: true,\n    timeout: 30000,\n  });\n  const avatarType = avatarDetails.data?.type || avatarDetails.data?.avatar?.type || 'avatar';\n  const appliedAvatarIvModel = avatarType === 'talking_photo' && useAvatarIvModel;\n  const character = avatarType === 'talking_photo'\n    ? {\n        type: 'talking_photo',\n        talking_photo_id: avatarId,\n        ...(appliedAvatarIvModel ? { use_avatar_iv_model: true } : {}),\n      }\n    : {\n        type: 'avatar',\n        avatar_id: avatarId,\n        avatar_style: 'normal',\n      };\n\n  const videoBody = {\n    video_inputs: [{\n      character,\n      voice: {\n        type: 'audio',\n        audio_url: audioUrl,\n        speed,\n      },\n    }],\n    dimension: { width: videoWidth, height: videoHeight },\n    caption: captionEnabled,\n  };\n\n  const videoData = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.heygen.com/v2/video/generate',\n    headers: {\n      'X-Api-Key': heygenApiKey,\n      'Content-Type': 'application/json',\n    },\n    body: videoBody,\n    json: true,\n    timeout: 300000,\n  });\n\n  const videoId = videoData.data?.video_id;\n  if (!videoId) {\n    throw new Error(`HeyGen create video returned no video_id: ${JSON.stringify(videoData)}`);\n  }\n\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n  const deadline = Date.now() + (maxWaitSeconds * 1000);\n  let videoUrl = '';\n  let status = 'processing';\n  let failedError = { code: '', detail: '', activity: '', message: '', raw: {} };\n  let pollData = {};\n\n  while (Date.now() < deadline) {\n    await sleep(pollIntervalSeconds * 1000);\n    pollData = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `https://api.heygen.com/v1/video_status.get?video_id=${encodeURIComponent(videoId)}`,\n      headers: { 'X-Api-Key': heygenApiKey },\n      json: true,\n      timeout: 30000,\n    });\n\n    status = pollData.data?.status || 'processing';\n    if (status === 'completed') {\n      videoUrl = pollData.data?.video_url || '';\n      break;\n    }\n    if (status === 'failed') {\n      failedError = buildFailedMessage(pollData.data?.error);\n      break;\n    }\n  }\n\n  if (status !== 'completed' && status !== 'failed') {\n    status = 'timeout';\n  }\n\n  return {\n    json: {\n      ok: status === 'completed' && !!videoUrl,\n      completed: status === 'completed' && !!videoUrl,\n      status,\n      error: status === 'failed' ? failedError.message : '',\n      error_code: status === 'failed' ? failedError.code : '',\n      error_detail: status === 'failed' ? failedError.detail : '',\n      error_activity: status === 'failed' ? failedError.activity : '',\n      heygen_error: status === 'failed' ? failedError.raw : {},\n      video_url: videoUrl,\n      video_id: videoId,\n      video_filename: videoFilename,\n      avatar_id: avatarId,\n      avatar_type: avatarType,\n      use_avatar_iv_model: appliedAvatarIvModel,\n      video_width: videoWidth,\n      video_height: videoHeight,\n      speed,\n      caption_enabled: captionEnabled,\n      mock_enabled: false,\n      request_snapshot: requestSnapshot,\n      create_response: videoData,\n      poll_response: pollData,\n      cost_usd: extractCost(pollData) ?? extractCost(videoData),\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n} catch (e) {\n  const message = describeError(e);\n  return {\n    json: {\n      ok: false,\n      completed: false,\n      status: 'failed',\n      error: message,\n      request_snapshot: requestSnapshot,\n      create_response: {},\n      poll_response: {},\n      video_url: '',\n      video_filename: videoFilename,\n      avatar_id: avatarId,\n      use_avatar_iv_model: useAvatarIvModel,\n      job_id: jobId,\n      channel_id: channelId,\n      user_id: userId,\n    },\n  };\n}",
         "options": {},
         "mode": "runOnceForEachItem"
       },
@@ -142,8 +142,41 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-preview-ready",
+              "leftValue": "={{ ($json.status || '') === 'ready' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6d0a2615-4be6-4e40-8c1b-0cddb7333f6e",
+      "name": "IF Preview Ready",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1780,
+        200
+      ]
+    },
+    {
+      "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='WAITING_VIDEO_APPROVAL', error_message=NULL, video_url='{{ $('Send Video Preview').item.json.s3_uri || $('HeyGen Create + Poll').item.json.video_url }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('video_filename', '{{ $('HeyGen Create + Poll').item.json.video_filename }}')), updated_at=NOW() WHERE id='{{ $('HeyGen Create + Poll').item.json.job_id }}'",
+        "query": "UPDATE jobs SET status='WAITING_VIDEO_APPROVAL', error_message=NULL, video_url='{{ $('Send Video Preview').item.json.s3_uri || $('HeyGen Create + Poll').item.json.video_url }}', script_json = COALESCE(script_json, '{}'::jsonb) || jsonb_build_object('media_names', COALESCE(script_json->'media_names', '{}'::jsonb) || jsonb_build_object('video_filename', '{{ $('Send Video Preview').item.json.video_filename || $('HeyGen Create + Poll').item.json.video_filename }}')), updated_at=NOW() WHERE id='{{ $('HeyGen Create + Poll').item.json.job_id }}'",
         "options": {}
       },
       "id": "ba6a6936-c745-4840-8bac-34952aa64f4c",
@@ -151,8 +184,8 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1340,
-        200
+        2000,
+        120
       ],
       "credentials": {
         "postgres": {
@@ -186,6 +219,54 @@
       "position": [
         1560,
         200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status='FAILED', error_message='WF-12 영상 후처리 실패: {{ $('Send Video Preview').item.json.error_message || 'video preview failed' }}', updated_at=NOW() WHERE id='{{ $('Send Video Preview').item.json.job_id || $('HeyGen Create + Poll').item.json.job_id }}'",
+        "options": {}
+      },
+      "id": "2e23af42-0f80-4d4f-8fb7-b2f9e9691db3",
+      "name": "Set FAILED (Preview)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2000,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "d8ZfymPPaDvul4k2",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/send-text",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messenger_source: 'discord', messenger_channel_id: $('HeyGen Create + Poll').item.json.channel_id, job_id: $('Send Video Preview').item.json.job_id || $('HeyGen Create + Poll').item.json.job_id, text: '❌ 영상 생성은 완료됐지만 후처리/미리보기 전달에 실패했습니다.\\nJob ID: ' + (($('Send Video Preview').item.json.job_id || $('HeyGen Create + Poll').item.json.job_id).substring(0,8)) + '\\n사유: ' + ($('Send Video Preview').item.json.error_message || 'video preview failed') }) }}",
+        "options": {}
+      },
+      "id": "0bbdf6ca-1963-4fda-8263-965479ef71b1",
+      "name": "Send Preview Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2220,
+        300
       ]
     },
     {
@@ -307,7 +388,36 @@
       "main": [
         [
           {
+            "node": "IF Preview Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Preview Ready": {
+      "main": [
+        [
+          {
             "node": "Set WAITING_VIDEO_APPROVAL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set FAILED (Preview)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set FAILED (Preview)": {
+      "main": [
+        [
+          {
+            "node": "Send Preview Error",
             "type": "main",
             "index": 0
           }

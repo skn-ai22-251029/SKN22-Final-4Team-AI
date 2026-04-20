@@ -222,13 +222,25 @@ class SeedLabProgressRequest(BaseModel):
     evaluated_count: int = 0
     ready_count: int = 0
     failed_count: int = 0
+    eval_failed_count: int = 0
     total_count: int = 0
+    runpod_job_count: int = 0
+    gpu_active_sample_count: int = 0
+    remote_eval_failed_count: int = 0
+    remote_eval_last_error: str = ""
+    eval_executor_counts: dict = {}
+    avg_stage_timings_ms: dict = {}
     last_error: str = ""
     finished_at: str = ""
 
 
+class CostViewerLinkRequest(BaseModel):
+    messenger_user_id: str
+    messenger_channel_id: str
+
+
 class CostEventIngestRequest(BaseModel):
-    job_id: str
+    job_id: str = ""
     topic_text: str = ""
     stage: str
     process: str
@@ -240,6 +252,12 @@ class CostEventIngestRequest(BaseModel):
     usage_json: dict = {}
     raw_response_json: dict = {}
     cost_usd: Optional[float] = None
+    pricing_kind: str = ""
+    pricing_source: str = ""
+    api_key_family: str = ""
+    subject_type: str = ""
+    subject_key: str = ""
+    subject_label: str = ""
     error_type: str = ""
     error_message: str = ""
     idempotency_key: str = ""

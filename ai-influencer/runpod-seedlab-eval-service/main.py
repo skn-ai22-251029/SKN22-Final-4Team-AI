@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import secrets
 import sys
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -20,7 +22,11 @@ from seed_lab import (  # type: ignore
     DEFAULT_AUTO_EVAL_JUDGE_MODEL,
     DEFAULT_AUTO_EVAL_PROFILE,
     _auto_eval_audio_file,
+    _infer_module_device,
+    _load_distillmos_predictor,
+    _load_speaker_verifier,
     _resolve_asr_model_for_transcription,
+    _resolve_reference_audio_paths,
     _resolve_seedlab_eval_runtime,
     _resolve_openai_keys,
     _seedlab_runtime_capabilities,
@@ -55,6 +61,18 @@ class Settings(BaseSettings):
 
 settings = Settings()
 _GPU_RUNTIME = _resolve_seedlab_eval_runtime()
+_WARMUP_STATE: dict[str, Any] = {
+    "status": "pending",
+    "error": "",
+    "completed_at": "",
+    "reference_count_loaded": 0,
+    "reference_audio_source": "",
+    "reference_set_id": "",
+    "mos_device": "",
+    "speaker_device": "",
+    "gpu_ready": False,
+}
+_WARMUP_THREAD: Optional[threading.Thread] = None
 app = FastAPI(title="Runpod Seed Lab Eval Service")
 
 
@@ -132,6 +150,102 @@ def _download_audio_to_temp(audio_s3_uri: str, tmp_dir: Path) -> Path:
     return target
 
 
+def _warmup_runtime_state() -> dict[str, Any]:
+    runtime = _resolve_seedlab_eval_runtime()
+    resolved_device = str(runtime.get("resolved_device") or "cpu")
+    logger.info("seedlab warmup starting resolved_device=%s", resolved_device)
+    reference_audio_paths, reference_audio_source, reference_set_id = _resolve_reference_audio_paths(
+        run_dir=_job_dir(),
+        rec={},
+        explicit_local_path=settings.seedlab_reference_audio_local_path,
+        explicit_s3_uri=settings.seedlab_reference_audio_s3_uri,
+        reference_audio_cache_dir=settings.seedlab_reference_audio_cache_dir,
+    )
+    logger.info(
+        "seedlab warmup references ready count=%s source=%s set_id=%s",
+        len(reference_audio_paths),
+        reference_audio_source or "unknown",
+        reference_set_id or "unknown",
+    )
+    mos_device = ""
+    speaker_device = ""
+    if resolved_device:
+        logger.info("seedlab warmup loading distillmos device=%s", resolved_device)
+        model = _load_distillmos_predictor(resolved_device)
+        mos_device = _infer_module_device(model) or resolved_device
+        logger.info("seedlab warmup distillmos ready device=%s", mos_device)
+        logger.info("seedlab warmup loading speaker verifier device=%s", resolved_device)
+        verifier = _load_speaker_verifier(resolved_device)
+        speaker_device = _infer_module_device(verifier) or str(getattr(verifier, "device", "") or resolved_device)
+        logger.info("seedlab warmup speaker verifier ready device=%s", speaker_device)
+    gpu_ready = (
+        str(runtime.get("resolved_device") or "").startswith("cuda")
+        and str(mos_device or "").startswith("cuda")
+        and str(speaker_device or "").startswith("cuda")
+    )
+    logger.info(
+        "seedlab warmup completed gpu_ready=%s reference_count=%s mos_device=%s speaker_device=%s",
+        gpu_ready,
+        len(reference_audio_paths),
+        mos_device or "unknown",
+        speaker_device or "unknown",
+    )
+    return {
+        "status": "ready",
+        "error": "",
+        "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "reference_count_loaded": len(reference_audio_paths),
+        "reference_audio_source": reference_audio_source,
+        "reference_set_id": reference_set_id,
+        "mos_device": mos_device,
+        "speaker_device": speaker_device,
+        "gpu_ready": gpu_ready,
+    }
+
+
+def _ensure_runtime_warmup() -> None:
+    global _WARMUP_STATE
+    _WARMUP_STATE = {
+        **_WARMUP_STATE,
+        "status": "warming",
+        "error": "",
+    }
+    try:
+        _WARMUP_STATE = _warmup_runtime_state()
+    except Exception as e:
+        _WARMUP_STATE = {
+            **_WARMUP_STATE,
+            "status": "failed",
+            "error": str(e),
+            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "gpu_ready": False,
+        }
+        logger.exception("seedlab warmup failed")
+
+
+def _start_runtime_warmup() -> None:
+    global _WARMUP_THREAD, _WARMUP_STATE
+    if _WARMUP_THREAD is not None and _WARMUP_THREAD.is_alive():
+        return
+    _WARMUP_STATE = {
+        **_WARMUP_STATE,
+        "status": "warming",
+        "error": "",
+        "completed_at": "",
+        "gpu_ready": False,
+    }
+    _WARMUP_THREAD = threading.Thread(target=_ensure_runtime_warmup, name="seedlab-warmup", daemon=True)
+    _WARMUP_THREAD.start()
+
+
+def _assert_runtime_ready() -> None:
+    if str(_WARMUP_STATE.get("status") or "") != "ready":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"seedlab runtime warmup is not ready: {str(_WARMUP_STATE.get('error') or _WARMUP_STATE.get('status') or 'unknown')}",
+        )
+
+
 async def verify_secret(x_seedlab_secret: Optional[str] = Header(default=None)) -> None:
     expected = str(settings.seedlab_eval_shared_secret or "").strip()
     if not expected or not x_seedlab_secret or not secrets.compare_digest(x_seedlab_secret, expected):
@@ -141,7 +255,13 @@ async def verify_secret(x_seedlab_secret: Optional[str] = Header(default=None)) 
 AuthDep = Depends(verify_secret)
 
 
+@app.on_event("startup")
+async def startup_event() -> None:
+    _start_runtime_warmup()
+
+
 def _evaluate_sync(body: EvaluateRequest) -> dict[str, Any]:
+    _assert_runtime_ready()
     asr_api_key, judge_api_key = _resolve_openai_keys(
         explicit_shared_key="",
         explicit_asr_key="",
@@ -171,13 +291,26 @@ def _evaluate_sync(body: EvaluateRequest) -> dict[str, Any]:
             reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
             reference_audio_cache_dir=settings.seedlab_reference_audio_cache_dir,
             disable_llm_note=bool(body.disable_llm_note),
+            executor="runpod_gpu",
         )
+    evaluation["executor"] = str(evaluation.get("executor") or "runpod_gpu")
+    debug["executor"] = str(debug.get("executor") or "runpod_gpu")
+    remote_eval = debug.get("remote_eval") if isinstance(debug.get("remote_eval"), dict) else {}
+    remote_eval.update(
+        {
+            "executor": "runpod_gpu",
+            "gpu_acceleration_active": bool(debug.get("gpu_acceleration_active")),
+            "status": "completed",
+        }
+    )
+    debug["remote_eval"] = remote_eval
     return {"ok": True, "sample_id": sample_id, "evaluation": evaluation, "debug": debug, "status": "completed"}
 
 
 def _run_job(job_id: str, body: EvaluateRequest) -> None:
     current = _read_job(job_id)
-    _write_job(job_id, {**current, "status": "running", "error": ""})
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    _write_job(job_id, {**current, "status": "running", "error": "", "started_at": started_at})
     try:
         result = _evaluate_sync(body)
     except Exception as e:
@@ -189,10 +322,25 @@ def _run_job(job_id: str, body: EvaluateRequest) -> None:
                 "status": "failed",
                 "error": str(e),
                 "sample_id": str(body.sample_id or "").strip(),
+                "started_at": started_at,
+                "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             },
         )
         return
-    _write_job(job_id, {**current, **result, "status": "completed", "error": ""})
+    debug = result.get("debug") if isinstance(result.get("debug"), dict) else {}
+    remote_eval = debug.get("remote_eval") if isinstance(debug.get("remote_eval"), dict) else {}
+    remote_eval.update(
+        {
+            "job_id": job_id,
+            "submitted_at": str(current.get("queued_at") or current.get("created_at") or ""),
+            "started_at": started_at,
+            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "status": "completed",
+        }
+    )
+    debug["remote_eval"] = remote_eval
+    result["debug"] = debug
+    _write_job(job_id, {**current, **result, "status": "completed", "error": "", "started_at": started_at, "finished_at": remote_eval["completed_at"]})
 
 
 @app.post("/evaluate")
@@ -202,7 +350,9 @@ async def evaluate(body: EvaluateRequest, _: Any = AuthDep) -> dict[str, Any]:
 
 @app.post("/evaluate/jobs")
 async def evaluate_job_submit(body: EvaluateRequest, background_tasks: BackgroundTasks, _: Any = AuthDep) -> dict[str, Any]:
+    _assert_runtime_ready()
     job_id = uuid.uuid4().hex
+    queued_at = dt.datetime.now(dt.timezone.utc).isoformat()
     _write_job(
         job_id,
         {
@@ -210,6 +360,7 @@ async def evaluate_job_submit(body: EvaluateRequest, background_tasks: Backgroun
             "status": "queued",
             "sample_id": str(body.sample_id or "").strip(),
             "error": "",
+            "queued_at": queued_at,
         },
     )
     background_tasks.add_task(_run_job, job_id, body)
@@ -223,17 +374,33 @@ async def evaluate_job_status(job_id: str, _: Any = AuthDep) -> dict[str, Any]:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    capabilities = _seedlab_runtime_capabilities(
+        reference_audio_local_path=settings.seedlab_reference_audio_local_path,
+        reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
+    )
+    capabilities["reference_count"] = max(
+        int(capabilities.get("reference_count") or 0),
+        int(_WARMUP_STATE.get("reference_count_loaded") or 0),
+    )
+    capabilities["mos_device"] = str(_WARMUP_STATE.get("mos_device") or capabilities.get("mos_device") or "")
+    capabilities["speaker_device"] = str(_WARMUP_STATE.get("speaker_device") or capabilities.get("speaker_device") or "")
+    capabilities["gpu_acceleration_active"] = bool(_WARMUP_STATE.get("gpu_ready"))
     return {
-        "ok": True,
+        "ok": str(_WARMUP_STATE.get("status") or "") == "ready",
         "eval_mode": "runpod_pod",
         "job_api_enabled": True,
         "job_dir": str(_job_dir()),
-        "capabilities": _seedlab_runtime_capabilities(
-            reference_audio_local_path=settings.seedlab_reference_audio_local_path,
-            reference_audio_s3_uri=settings.seedlab_reference_audio_s3_uri,
-        ),
+        "capabilities": capabilities,
         "reference_audio_local_path_configured": bool((settings.seedlab_reference_audio_local_path or "").strip()),
         "reference_audio_s3_uri_configured": bool((settings.seedlab_reference_audio_s3_uri or "").strip()),
+        "warmup_status": str(_WARMUP_STATE.get("status") or "pending"),
+        "warmup_error": str(_WARMUP_STATE.get("error") or ""),
+        "reference_count_loaded": int(_WARMUP_STATE.get("reference_count_loaded") or 0),
+        "reference_audio_source": str(_WARMUP_STATE.get("reference_audio_source") or ""),
+        "reference_set_id": str(_WARMUP_STATE.get("reference_set_id") or ""),
+        "mos_device": str(_WARMUP_STATE.get("mos_device") or ""),
+        "speaker_device": str(_WARMUP_STATE.get("speaker_device") or ""),
+        "gpu_ready": bool(_WARMUP_STATE.get("gpu_ready")),
     }
 
 

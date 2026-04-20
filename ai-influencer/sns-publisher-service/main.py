@@ -7,9 +7,11 @@ import json
 import math
 import re
 import wave
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from typing import Any, Optional
+from urllib import request as urllib_request
 
 import psycopg2
 import requests
@@ -66,6 +68,7 @@ class CaptionArtifactRequest(BaseModel):
     audio_url: str = ""
     subtitle_script_text: str = ""
     tts_script_text: str = ""
+    selected_tts_timing: dict = Field(default_factory=dict)
 
 
 def _require_env(name: str) -> str:
@@ -73,6 +76,79 @@ def _require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required")
     return value
+
+
+def _estimate_youtube_asr_cost_usd(duration_sec: float) -> float | None:
+    rate = float(os.environ.get("YOUTUBE_ASR_COST_USD_PER_MINUTE", "0") or 0.0)
+    if duration_sec <= 0 or rate <= 0:
+        return None
+    return (duration_sec / 60.0) * rate
+
+
+def _post_cost_event(payload: dict[str, object]) -> None:
+    gateway_url = (os.environ.get("COST_TRACKING_GATEWAY_URL", "http://messenger-gateway:8080") or "").strip().rstrip("/")
+    secret = (os.environ.get("GATEWAY_INTERNAL_SECRET", "") or "").strip()
+    if not gateway_url or not secret:
+        return
+    request = urllib_request.Request(
+        f"{gateway_url}/internal/cost-events",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Internal-Secret": secret},
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=15) as response:
+        response.read()
+
+
+def _record_youtube_asr_cost_event(
+    *,
+    job_id: str,
+    context_label: str,
+    artifacts: dict[str, Any],
+    status: str = "success",
+    error_message: str = "",
+) -> None:
+    usage_json = {
+        "asr_model": artifacts.get("asr_model"),
+        "word_count": artifacts.get("word_count"),
+        "segment_count": artifacts.get("segment_count"),
+        "audio_size_bytes": artifacts.get("audio_size_bytes"),
+        "audio_duration_sec": artifacts.get("audio_duration_sec"),
+        "alignment_status": artifacts.get("alignment_status"),
+        "timing_source": artifacts.get("timing_source"),
+        "fallback_reason": artifacts.get("fallback_reason"),
+        "context": context_label,
+    }
+    cost_usd = _estimate_youtube_asr_cost_usd(float(artifacts.get("audio_duration_sec") or 0.0))
+    payload = {
+        "job_id": job_id,
+        "stage": "publish",
+        "process": "youtube_caption_asr",
+        "provider": "openai",
+        "attempt_no": 1,
+        "status": status,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "usage_json": usage_json,
+        "raw_response_json": {"request_json": artifacts.get("request_json") or {}, "context": context_label},
+        "cost_usd": cost_usd,
+        "pricing_kind": "estimated" if cost_usd is not None else "missing",
+        "pricing_source": "provider_usage_estimate" if cost_usd is not None else "unavailable",
+        "api_key_family": "youtube_asr",
+        "subject_type": "job",
+        "subject_key": job_id,
+        "subject_label": job_id,
+        "error_type": "" if not error_message else "youtube_caption_asr_error",
+        "error_message": error_message[:500],
+        "idempotency_key": (
+            f"youtube-asr:{context_label}:{job_id}:{artifacts.get('subtitle_sha256') or 'nohash'}:"
+            f"{int(time.time() * 1000)}"
+        ),
+    }
+    try:
+        _post_cost_event(payload)
+    except Exception as e:
+        logger.warning("[cost] youtube asr event post failed job_id=%s context=%s err=%s", job_id, context_label, e)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -163,6 +239,9 @@ def _build_caption_artifact_request_json(
     srt_content: str,
     alignment_status: str,
     cue_count: int,
+    timing_source: str,
+    fallback_reason: str,
+    selected_tts_timing: dict[str, float],
 ) -> dict[str, Any]:
     return {
         "enabled": True,
@@ -179,12 +258,14 @@ def _build_caption_artifact_request_json(
         "audio_size_bytes": audio_size_bytes,
         "word_count": len(words),
         "segment_count": len(segments),
-        "timing_source": "whisper_word_timestamps",
+        "timing_source": timing_source,
         "body_line_count": len(_split_alignment_sentences(subtitle_body_text)),
         "spoken_sentence_count": spoken_sentence_count,
         "display_sentence_count": display_sentence_count,
         "matched_sentence_count": matched_sentence_count,
         "alignment_status": alignment_status,
+        "fallback_reason": fallback_reason,
+        "selected_tts_timing": dict(selected_tts_timing or {}),
         "body_split_mode": _caption_body_split_mode(),
         "body_target_chars": _caption_body_target_chars(),
         "body_hard_max_chars": _caption_body_hard_max_chars(),
@@ -326,6 +407,17 @@ def _normalize_tts_timing(value: Any) -> dict[str, float]:
     if normalized["final_duration_sec"] <= normalized["ending_start_sec"]:
         return {}
     return normalized
+
+
+def _is_recoverable_caption_alignment_error(error: Exception) -> bool:
+    message = str(error or "")
+    recoverable_markers = (
+        "sentence count mismatch",
+        "failed to align sentence",
+        "ASR words exhausted before sentence",
+        "spoken sentences contain empty alignment target",
+    )
+    return any(marker in message for marker in recoverable_markers)
 
 
 def _download_binary_to_temp(url: str, *, suffix: str, timeout: tuple[int, int] = (15, 300)) -> str:
@@ -952,6 +1044,7 @@ def _build_caption_artifacts_for_audio_path(
     audio_path: str,
     subtitle_body_text: str,
     spoken_body_text: str,
+    selected_tts_timing: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     subtitle_text = _build_youtube_caption_text(
         PublishRequest(
@@ -984,29 +1077,59 @@ def _build_caption_artifacts_for_audio_path(
 
     language = _youtube_caption_language()
     words, segments, asr_model = _transcribe_words_and_segments(audio_path, language)
-    final_end_sec = _wav_duration_seconds(audio_path) or float(words[-1]["end"])
-    srt_content = _build_sentence_mapped_srt(
-        spoken_text=spoken_full_text,
-        display_text=subtitle_text,
-        words=words,
-        final_end_sec=final_end_sec,
-    )
-    cue_count = _count_srt_cues(srt_content)
+    audio_duration_sec = _wav_duration_seconds(audio_path) or float(words[-1]["end"])
+    final_end_sec = audio_duration_sec
     spoken_sentence_count = len(_split_alignment_sentences(spoken_full_text))
     display_sentence_count = len(_split_alignment_sentences(subtitle_text))
     matched_sentence_count = min(spoken_sentence_count, display_sentence_count)
+    normalized_tts_timing = _normalize_tts_timing(selected_tts_timing)
+    alignment_status = "ready"
+    timing_source = "whisper_word_timestamps"
+    fallback_reason = ""
+    try:
+        srt_content = _build_sentence_mapped_srt(
+            spoken_text=spoken_full_text,
+            display_text=subtitle_text,
+            words=words,
+            final_end_sec=final_end_sec,
+        )
+    except Exception as e:
+        if not _is_recoverable_caption_alignment_error(e):
+            raise
+        if not normalized_tts_timing:
+            raise RuntimeError(
+                f"{e}; selected_tts_timing is required for sectioned fallback"
+            ) from e
+        fallback_reason = str(e)
+        try:
+            srt_content = _build_sectioned_srt(
+                subtitle_body_text=subtitle_body_text,
+                segments=segments,
+                tts_timing=normalized_tts_timing,
+            )
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"{fallback_reason}; sectioned fallback failed: {fallback_error}"
+            ) from fallback_error
+        alignment_status = "fallback_sectioned"
+        timing_source = "selected_tts_timing+asr_segments"
+    cue_count = _count_srt_cues(srt_content)
     return {
         "subtitle_text": subtitle_text,
         "spoken_text": spoken_full_text,
         "srt_content": srt_content,
         "asr_model": asr_model,
         "audio_size_bytes": audio_size_bytes,
+        "audio_duration_sec": audio_duration_sec,
         "word_count": len(words),
         "segment_count": len(segments),
         "spoken_sentence_count": spoken_sentence_count,
         "display_sentence_count": display_sentence_count,
         "matched_sentence_count": matched_sentence_count,
-        "alignment_status": "ready",
+        "alignment_status": alignment_status,
+        "fallback_reason": fallback_reason,
+        "timing_source": timing_source,
+        "cue_count": cue_count,
         "subtitle_sha256": subtitle_hash,
         "caption_has_opening": caption_has_opening,
         "caption_has_ending": caption_has_ending,
@@ -1026,8 +1149,11 @@ def _build_caption_artifacts_for_audio_path(
             display_sentence_count=display_sentence_count,
             matched_sentence_count=matched_sentence_count,
             srt_content=srt_content,
-            alignment_status="ready",
+            alignment_status=alignment_status,
             cue_count=cue_count,
+            timing_source=timing_source,
+            fallback_reason=fallback_reason,
+            selected_tts_timing=normalized_tts_timing,
         ),
     }
 
@@ -1296,12 +1422,15 @@ def _upload_youtube_caption(
     try:
         script_json = _load_job_script_json(job_id)
         spoken_body_text = str(script_json.get("tts_script_text") or subtitle_body_text or "").strip()
+        selected_tts_timing = _normalize_tts_timing(script_json.get("selected_tts_timing"))
         artifacts = _build_caption_artifacts_for_audio_path(
             job_id=job_id,
             audio_path=audio_path,
             subtitle_body_text=subtitle_body_text,
             spoken_body_text=spoken_body_text,
+            selected_tts_timing=selected_tts_timing,
         )
+        _record_youtube_asr_cost_event(job_id=job_id, context_label="youtube_publish", artifacts=artifacts)
         caption_snippet = {
             "videoId": video_id,
             "language": _youtube_caption_language(),
@@ -1753,7 +1882,9 @@ async def caption_artifacts(body: CaptionArtifactRequest) -> dict:
             audio_path=audio_path,
             subtitle_body_text=body.subtitle_script_text,
             spoken_body_text=body.tts_script_text,
+            selected_tts_timing=body.selected_tts_timing,
         )
+        _record_youtube_asr_cost_event(job_id=body.job_id, context_label="caption_artifacts", artifacts=artifacts)
         return {
             "status": "ready",
             "job_id": body.job_id,
@@ -1767,6 +1898,9 @@ async def caption_artifacts(body: CaptionArtifactRequest) -> dict:
             "display_sentence_count": artifacts["display_sentence_count"],
             "matched_sentence_count": artifacts["matched_sentence_count"],
             "alignment_status": artifacts["alignment_status"],
+            "fallback_reason": artifacts["fallback_reason"],
+            "timing_source": artifacts["timing_source"],
+            "cue_count": artifacts["cue_count"],
             "subtitle_sha256": artifacts["subtitle_sha256"],
             "request_json": artifacts["request_json"],
         }

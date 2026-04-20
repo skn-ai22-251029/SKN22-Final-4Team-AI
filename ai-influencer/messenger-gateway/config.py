@@ -89,6 +89,8 @@ class Settings(BaseSettings):
     # Cost tracking
     cost_viewer_basic_user: str = ""
     cost_viewer_basic_password: str = ""
+    cost_viewer_public_base_url: str = ""
+    cost_viewer_link_ttl_seconds: int = 604800
     cost_usd_krw_rate: float = 1350.0
     cost_default_list_limit: int = 50
     cost_max_list_limit: int = 200

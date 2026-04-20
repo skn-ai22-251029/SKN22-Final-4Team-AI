@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 class Settings(BaseSettings):
     gateway_internal_secret: str
     notebooklm_default_notebook_id: str = ""
+    cost_tracking_gateway_url: str = "http://messenger-gateway:8080"
+    script_rewrite_input_cost_usd_per_1m: float = 0.0
+    script_rewrite_output_cost_usd_per_1m: float = 0.0
 
     class Config:
         env_file = ".env"
@@ -62,6 +65,7 @@ KST = _load_kst_timezone()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 _executor = ThreadPoolExecutor(max_workers=2)
+_COST_TRACKING_MARKER = "COST_TRACKING_JSON:"
 
 app = FastAPI(title="NotebookLM Service")
 
@@ -121,6 +125,99 @@ def _cua_cmd(script_path: Path, *args: str) -> list[str]:
         str(script_path),
         *args,
     ]
+
+
+def _extract_cost_tracking_summary(stdout: str, stderr: str) -> dict[str, object]:
+    for raw in [stdout or "", stderr or ""]:
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if not line.startswith(_COST_TRACKING_MARKER):
+                continue
+            try:
+                parsed = json.loads(line[len(_COST_TRACKING_MARKER):].strip())
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def _estimate_cua_cost_usd(summary: dict[str, object]) -> Optional[float]:
+    prompt_tokens = int(summary.get("prompt_tokens") or 0)
+    completion_tokens = int(summary.get("completion_tokens") or 0)
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+    input_rate = float(settings.script_rewrite_input_cost_usd_per_1m)
+    output_rate = float(settings.script_rewrite_output_cost_usd_per_1m)
+    if input_rate <= 0 and output_rate <= 0:
+        return None
+    return ((prompt_tokens / 1_000_000.0) * input_rate) + ((completion_tokens / 1_000_000.0) * output_rate)
+
+
+def _post_cost_event(payload: dict[str, object]) -> None:
+    gateway_url = (settings.cost_tracking_gateway_url or "").strip().rstrip("/")
+    secret = (settings.gateway_internal_secret or "").strip()
+    if not gateway_url or not secret:
+        return
+    request = urllib_request.Request(
+        f"{gateway_url}/internal/cost-events",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Internal-Secret": secret},
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=15) as response:
+        response.read()
+
+
+def _record_cua_cost_event(
+    *,
+    job_id: str = "",
+    process: str,
+    subject_type: str,
+    subject_key: str,
+    subject_label: str,
+    started_at: datetime,
+    ended_at: datetime,
+    status: str,
+    summary: dict[str, object],
+    error_message: str = "",
+) -> None:
+    if not summary:
+        return
+    if int(summary.get("request_count") or 0) <= 0 and int(summary.get("total_tokens") or 0) <= 0:
+        return
+    api_key_family = str(summary.get("api_key_family") or "").strip() or "cua_generate_report"
+    estimated_cost = _estimate_cua_cost_usd(summary)
+    payload = {
+        "job_id": job_id,
+        "topic_text": subject_label if subject_type == "operation" else "",
+        "stage": "notebook",
+        "process": process,
+        "provider": "openai",
+        "attempt_no": 1,
+        "status": status,
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "usage_json": summary,
+        "raw_response_json": {"source": "notebooklm-service-subprocess"},
+        "cost_usd": estimated_cost,
+        "pricing_kind": "estimated" if estimated_cost is not None else "missing",
+        "pricing_source": "provider_usage_estimate" if estimated_cost is not None else "unavailable",
+        "api_key_family": api_key_family,
+        "subject_type": subject_type,
+        "subject_key": subject_key,
+        "subject_label": subject_label,
+        "error_type": "" if not error_message else "cua_error",
+        "error_message": error_message[:500],
+        "idempotency_key": (
+            f"notebooklm:{process}:{subject_type}:{subject_key}:"
+            f"{int(started_at.timestamp() * 1000)}:{status}"
+        ),
+    }
+    try:
+        _post_cost_event(payload)
+    except Exception as e:
+        logger.warning("[cost] notebooklm event post failed process=%s subject=%s err=%s", process, subject_key, e)
 
 
 def _is_playwright_browser_missing(text: str) -> bool:
@@ -801,6 +898,7 @@ def _run_generate_report(
     )
 
     logger.info("[notebooklm] starting subprocess job_id=%s cmd=%s", job_id, cmd)
+    started_at = datetime.now(timezone.utc)
 
     try:
         result = subprocess.run(
@@ -819,6 +917,7 @@ def _run_generate_report(
 
     stdout = result.stdout or ""
     stderr = result.stderr or ""
+    cost_summary = _extract_cost_tracking_summary(stdout, stderr)
     logger.info("[notebooklm] subprocess done job_id=%s returncode=%d", job_id, result.returncode)
 
     # Playwright/CUA 디버깅이 가능하도록 stdout/stderr를 그대로 서비스 로그에 남긴다.
@@ -831,6 +930,18 @@ def _run_generate_report(
 
     if result.returncode != 0:
         error_msg = stderr.strip() or stdout.strip() or f"returncode={result.returncode}"
+        _record_cua_cost_event(
+            job_id=job_id,
+            process="cua_generate_report",
+            subject_type="job",
+            subject_key=job_id,
+            subject_label=job_id,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="failed",
+            summary=cost_summary,
+            error_message=error_msg,
+        )
         logger.error("[notebooklm] generate_report failed job_id=%s: %s", job_id, error_msg)
         return GenerateResponse(status="error", error=error_msg[:500])
 
@@ -842,6 +953,17 @@ def _run_generate_report(
     report_content = output_path.read_text(encoding="utf-8")
     file_bytes = output_path.read_bytes()
     file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+    _record_cua_cost_event(
+        job_id=job_id,
+        process="cua_generate_report",
+        subject_type="job",
+        subject_key=job_id,
+        subject_label=job_id,
+        started_at=started_at,
+        ended_at=datetime.now(timezone.utc),
+        status="success",
+        summary=cost_summary,
+    )
 
     logger.info("[notebooklm] report ready job_id=%s size=%d chars", job_id, len(report_content))
     _log_report_presence(notebook_url, source="generate", job_id=job_id)
@@ -1143,6 +1265,9 @@ def _run_check_and_add_source(
     """소스 추가 + 슬라이딩 윈도우 정리를 subprocess로 실행."""
     scripts_dir = SCRIPTS_DIR
     manage_script = scripts_dir / "manage_sources_cua.py"
+    started_at = datetime.now(timezone.utc)
+    subject_key = f"notebook:source:{channel_id or notebook_url or 'unknown'}"
+    subject_label = channel_name or channel_id or notebook_url or "NotebookLM source management"
 
     # Step 0: notebook_url이 없으면 채널명 기반 CUA fallback으로 먼저 노트북을 찾는다.
     if not notebook_url:
@@ -1176,14 +1301,36 @@ def _run_check_and_add_source(
         logger.info("[script] %s", line)
     for line in (result.stderr or "").strip().splitlines():
         logger.warning("[script:err] %s", line)
+    cost_summary = _extract_cost_tracking_summary(result.stdout or "", result.stderr or "")
 
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "").strip()[:400]
+        _record_cua_cost_event(
+            process="cua_manage_sources",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="failed",
+            summary=cost_summary,
+            error_message=err,
+        )
         return AddSourceResponse(status="error", error=err)
 
     stdout = result.stdout or ""
     if "Duplicate skipped:" in stdout:
         logger.info("[add-source] UI 기준 중복 건너뜀: %s", source_url)
+        _record_cua_cost_event(
+            process="cua_manage_sources",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="success",
+            summary=cost_summary,
+        )
         return AddSourceResponse(status="ok", duplicate=True)
 
     # Step 2: 최대 소스 수를 넘기면 cleanup 모드로 오래된 항목을 정리한다.
@@ -1207,6 +1354,16 @@ def _run_check_and_add_source(
         logger.warning("[add-source] cleanup 실패 (무시): %s", e)
 
     logger.info("[add-source] 완료: %s (cleaned=%d)", source_url, cleaned_up)
+    _record_cua_cost_event(
+        process="cua_manage_sources",
+        subject_type="operation",
+        subject_key=subject_key,
+        subject_label=subject_label,
+        started_at=started_at,
+        ended_at=datetime.now(timezone.utc),
+        status="success",
+        summary=cost_summary,
+    )
     return AddSourceResponse(status="ok", added=True, cleaned_up=cleaned_up)
 
 
@@ -1215,6 +1372,9 @@ def _run_create_notebook(name: str, channel_id: str, channel_name: str) -> Creat
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         output_path = tmp.name
+    started_at = datetime.now(timezone.utc)
+    subject_key = f"notebook:create:{channel_id or name}"
+    subject_label = channel_name or channel_id or name
 
     cmd = _cua_cmd(
         SCRIPTS_DIR / "create_notebook_cua.py",
@@ -1236,13 +1396,35 @@ def _run_create_notebook(name: str, channel_id: str, channel_name: str) -> Creat
         logger.info("[script] %s", line)
     for line in (result.stderr or "").strip().splitlines():
         logger.warning("[script:err] %s", line)
+    cost_summary = _extract_cost_tracking_summary(result.stdout or "", result.stderr or "")
 
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "").strip()[:400]
+        _record_cua_cost_event(
+            process="cua_create_notebook",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="failed",
+            summary=cost_summary,
+            error_message=err,
+        )
         return CreateNotebookResponse(status="error", error=err)
 
     try:
         data = json.loads(Path(output_path).read_text(encoding="utf-8"))
+        _record_cua_cost_event(
+            process="cua_create_notebook",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="success",
+            summary=cost_summary,
+        )
         return CreateNotebookResponse(
             status="success",
             notebook_url=data["notebook_url"],

@@ -72,6 +72,9 @@ AI_SCORE_KEYS = (
 _DISTILLMOS_PREDICTORS: dict[str, Any] = {}
 _SPEAKER_VERIFIERS: dict[str, Any] = {}
 _TORCH_RUNTIME: dict[str, Any] | None = None
+_REFERENCE_CORPUS_SUMMARIES: dict[str, dict[str, Any]] = {}
+_REFERENCE_SPEAKER_EMBEDDINGS: dict[tuple[str, str], Any] = {}
+_REFERENCE_CACHE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -109,6 +112,20 @@ def _seedlab_eval_model_cache_dir() -> Path:
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
     return path.resolve()
+
+
+def _path_cache_signature(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        stat = resolved.stat()
+        return f"{resolved}:{int(stat.st_mtime_ns)}:{int(stat.st_size)}"
+    except Exception:
+        return str(resolved)
+
+
+def _reference_paths_cache_key(reference_audio_paths: list[Path]) -> str:
+    signature = "|".join(_path_cache_signature(path) for path in reference_audio_paths if path.exists())
+    return hashlib.sha256(signature.encode("utf-8")).hexdigest()
 
 
 def _get_torch_runtime() -> dict[str, Any]:
@@ -263,6 +280,88 @@ def _load_distillmos_predictor(resolved_device: str) -> Any:
         model.eval()
     _DISTILLMOS_PREDICTORS[resolved_device] = model
     return model
+
+
+def _load_speaker_verifier(resolved_device: str) -> Any:
+    global _SPEAKER_VERIFIERS
+    verifier = _SPEAKER_VERIFIERS.get(resolved_device)
+    if verifier is not None:
+        return verifier
+
+    from speechbrain.inference.speaker import SpeakerRecognition  # type: ignore
+
+    verifier = SpeakerRecognition.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=str(_seedlab_eval_model_cache_dir() / "speechbrain"),
+        run_opts={"device": resolved_device},
+    )
+    _SPEAKER_VERIFIERS[resolved_device] = verifier
+    return verifier
+
+
+def _download_s3_file_if_missing(s3: Any, bucket: str, key: str, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            if target.stat().st_size > 0:
+                return
+        except Exception:
+            pass
+    s3.download_file(bucket, key, str(target))
+
+
+def _get_reference_corpus_summary(reference_audio_paths: list[Path]) -> dict[str, Any]:
+    cache_key = _reference_paths_cache_key(reference_audio_paths)
+    with _REFERENCE_CACHE_LOCK:
+        cached = _REFERENCE_CORPUS_SUMMARIES.get(cache_key)
+    if cached is not None:
+        return cached
+    summary = _build_reference_corpus_summary(reference_audio_paths)
+    with _REFERENCE_CACHE_LOCK:
+        _REFERENCE_CORPUS_SUMMARIES[cache_key] = summary
+    return summary
+
+
+def _load_reference_speaker_embeddings(reference_audio_paths: list[Path], resolved_device: str) -> tuple[Any, Any]:
+    cache_key = (resolved_device, _reference_paths_cache_key(reference_audio_paths))
+    with _REFERENCE_CACHE_LOCK:
+        cached = _REFERENCE_SPEAKER_EMBEDDINGS.get(cache_key)
+    verifier = _load_speaker_verifier(resolved_device)
+    if cached is not None:
+        return verifier, cached
+
+    import torch  # type: ignore
+
+    embeddings = []
+    with torch.no_grad():
+        for ref_path in reference_audio_paths:
+            waveform = verifier.load_audio(str(ref_path))
+            emb = verifier.encode_batch(waveform.unsqueeze(0), normalize=False).detach()
+            embeddings.append(emb)
+    if not embeddings:
+        raise RuntimeError("reference speaker embeddings are unavailable")
+    ref_embeddings = torch.cat(embeddings, dim=0)
+    with _REFERENCE_CACHE_LOCK:
+        _REFERENCE_SPEAKER_EMBEDDINGS[cache_key] = ref_embeddings
+    return verifier, ref_embeddings
+
+
+def _predict_speaker_similarity(
+    *,
+    audio_path: Path,
+    reference_audio_paths: list[Path],
+    resolved_device: str,
+) -> tuple[float, str]:
+    import torch  # type: ignore
+
+    verifier, ref_embeddings = _load_reference_speaker_embeddings(reference_audio_paths, resolved_device)
+    with torch.no_grad():
+        waveform = verifier.load_audio(str(audio_path))
+        sample_embedding = verifier.encode_batch(waveform.unsqueeze(0), normalize=False).detach()
+        score = verifier.similarity(sample_embedding.expand_as(ref_embeddings), ref_embeddings)
+    values = [float(item) for item in score.reshape(-1).detach().cpu().tolist()]
+    device = _infer_module_device(verifier) or str(getattr(verifier, "device", "") or resolved_device)
+    return (_pairwise_mean(values) or 0.0), device
 
 
 def _predict_distillmos_mos(audio_path: Path, resolved_device: str) -> tuple[float, str]:
@@ -962,6 +1061,9 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       <div class="row" style="margin-top:4px;">
         <span id="aiSummary" class="muted"></span>
       </div>
+      <div class="row" style="margin-top:4px;">
+        <span id="runStatusMeta" class="muted"></span>
+      </div>
     </div>
     <div class="panel">
       <h3 style="margin:0 0 10px 0;">즉석 생성 테스트 (파라미터 조정)</h3>
@@ -1039,9 +1141,11 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
     let serverConfig = {{
       openai_configured: false,
       auto_eval_on_add: true,
+      eval_mode: "",
     }};
     let serverConfigLoaded = false;
     let humanSort = {{ key: "", dir: "asc" }};
+    let lastRunStatus = null;
 
     function emptyEval() {{
       return {{
@@ -1459,6 +1563,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       updateSummary(state);
       updateAiSummary(aiState);
       updateAiHint(aiState);
+      updateRunStatusMeta(lastRunStatus);
       updateSortIndicators();
     }}
 
@@ -1466,13 +1571,18 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
       const total = Object.keys(aiMap).length;
       let ready = 0;
       let failed = 0;
+      let runpod = 0;
+      let gpu = 0;
       for (const value of Object.values(aiMap)) {{
         if (!value || typeof value !== "object") continue;
         if (String(value.auto_eval_status || "ready") === "ready") ready += 1;
         else failed += 1;
+        if (String(value.executor || "") === "runpod_gpu") runpod += 1;
+        const caps = value.capabilities && typeof value.capabilities === "object" ? value.capabilities : {{}};
+        if (caps.gpu_acceleration_active === true) gpu += 1;
       }}
       document.getElementById("aiSummary").textContent =
-        `rows: ${{total}} / ready: ${{ready}} / failed: ${{failed}}`;
+        `rows: ${{total}} / ready: ${{ready}} / failed: ${{failed}} / runpod: ${{runpod}} / gpu: ${{gpu}}`;
     }}
 
     function updateAiHint(aiMap) {{
@@ -1496,6 +1606,45 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
         return;
       }}
       aiHint.textContent = "아직 AI 평가 데이터가 없습니다. '평가 테이블에 추가' 체크 후 TTS 생성하거나 auto-eval을 실행하세요.";
+    }}
+
+    function updateRunStatusMeta(statusPayload) {{
+      const target = document.getElementById("runStatusMeta");
+      if (!target) return;
+      if (!statusPayload || typeof statusPayload !== "object") {{
+        target.textContent = "";
+        return;
+      }}
+      const executorCounts = statusPayload.eval_executor_counts && typeof statusPayload.eval_executor_counts === "object"
+        ? statusPayload.eval_executor_counts
+        : {{}};
+      const avgTimings = statusPayload.avg_stage_timings_ms && typeof statusPayload.avg_stage_timings_ms === "object"
+        ? statusPayload.avg_stage_timings_ms
+        : {{}};
+      const executorParts = Object.entries(executorCounts).map(([key, value]) => `${{String(key)}}=${{Number(value || 0)}}`);
+      const timingParts = [];
+      for (const key of ["reference_load", "asr", "signal_analysis", "judge_note", "total"]) {{
+        const value = Number(avgTimings[key]);
+        if (Number.isFinite(value) && value > 0) {{
+          timingParts.push(`${{key}}=${{value.toFixed(1)}}ms`);
+        }}
+      }}
+      const chunks = [
+        `mode=${{serverConfig.eval_mode || "-"}}`,
+        `runpod=${{Number(statusPayload.runpod_job_count || 0)}}`,
+        `gpu=${{Number(statusPayload.gpu_active_sample_count || 0)}}`,
+        `remote_failed=${{Number(statusPayload.remote_eval_failed_count || 0)}}`,
+      ];
+      if (executorParts.length > 0) {{
+        chunks.push(`executors=[${{executorParts.join(", ")}}]`);
+      }}
+      if (timingParts.length > 0) {{
+        chunks.push(`avg=[${{timingParts.join(", ")}}]`);
+      }}
+      if (statusPayload.remote_eval_last_error) {{
+        chunks.push(`last_remote_error=${{String(statusPayload.remote_eval_last_error).slice(0, 160)}}`);
+      }}
+      target.textContent = chunks.join(" / ");
     }}
 
     function toggleSort(key) {{
@@ -1627,8 +1776,11 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
 
     async function refreshRunStatus() {{
       try {{
-        return await apiGet("run-status");
+        lastRunStatus = await apiGet("run-status");
+        render(state);
+        return lastRunStatus;
       }} catch (_e) {{
+        lastRunStatus = null;
         return null;
       }}
     }}
@@ -1640,6 +1792,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
         serverConfig = {{
           openai_configured: !!(payload && payload.openai_configured),
           auto_eval_on_add: payload && payload.auto_eval_on_add !== false,
+          eval_mode: String((payload && payload.eval_mode) || ""),
         }};
         const p = payload && typeof payload === "object" ? (payload.default_tts_params || {{}}) : {{}};
         if (p.text_lang) pgTextLang.value = String(p.text_lang);
@@ -1659,6 +1812,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
         serverConfig = {{
           openai_configured: false,
           auto_eval_on_add: true,
+          eval_mode: "",
         }};
         // file:// 또는 API 미기동 상태에서는 무시
       }}
@@ -1784,6 +1938,7 @@ def _generate_review_html(run_id: str, records: list[dict[str, Any]], html_path:
     }}
     render(state);
     loadServerConfig()
+      .then(() => refreshRunStatus())
       .then(() => refreshHumanState(false))
       .then(() => refreshLiveRecords(false))
       .then(() => refreshAiState(true));
@@ -2554,7 +2709,7 @@ def _resolve_reference_audio_paths(
             manifest_key = manifest_key.rstrip("/") + "/manifest.json"
         manifest_local = cache_root / hashlib.sha256(f"{bucket}/{manifest_key}".encode("utf-8")).hexdigest() / "manifest.json"
         manifest_local.parent.mkdir(parents=True, exist_ok=True)
-        s3.download_file(bucket, manifest_key, str(manifest_local))
+        _download_s3_file_if_missing(s3, bucket, manifest_key, manifest_local)
         manifest = json.loads(manifest_local.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict):
             raise RuntimeError("reference manifest must be an object")
@@ -2572,7 +2727,7 @@ def _resolve_reference_audio_paths(
             if not rel_key:
                 continue
             local_path = manifest_local.parent / rel_key.replace("/", "_")
-            s3.download_file(bucket, rel_key, str(local_path))
+            _download_s3_file_if_missing(s3, bucket, rel_key, local_path)
             if local_path.exists():
                 local_files.append(local_path)
         if local_files:
@@ -2582,6 +2737,7 @@ def _resolve_reference_audio_paths(
 
 
 def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path] | None = None) -> dict[str, Any]:
+    analysis_started_at = time.perf_counter()
     samples, sample_rate = _read_wav_mono_samples(audio_path)
     if not samples or sample_rate <= 0:
         return {
@@ -2610,6 +2766,7 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
             "pitch_profile_similarity": None,
             "intonation_similarity": None,
             "reference_count": 0,
+            "timings_ms": {},
             "capabilities": {
                 "advanced_dsp_enabled": False,
                 "mos_enabled": False,
@@ -2618,7 +2775,10 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
                 "intonation_enabled": False,
             },
         }
+    timings_ms: dict[str, float] = {}
+    dsp_started_at = time.perf_counter()
     features = _prosody_features_from_samples(samples, sample_rate)
+    timings_ms["dsp"] = round((time.perf_counter() - dsp_started_at) * 1000, 3)
     duration_sec = float(features.get("duration_sec") or 0.0)
     voiced_ratio = float(features.get("voiced_ratio") or 0.0)
     f0_median_hz = float(features.get("f0_median_hz") or 0.0)
@@ -2660,7 +2820,9 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
         reference_count = len(reference_audio_paths)
         capabilities["reference_corpus_loaded"] = True
         capabilities["reference_count"] = reference_count
-        corpus = _build_reference_corpus_summary(reference_audio_paths)
+        reference_summary_started_at = time.perf_counter()
+        corpus = _get_reference_corpus_summary(reference_audio_paths)
+        timings_ms["reference_summary"] = round((time.perf_counter() - reference_summary_started_at) * 1000, 3)
         ref_median = float(corpus.get("f0_median_hz_mean") or 0.0)
         ref_iqr = float(corpus.get("f0_iqr_hz_mean") or 0.0)
         if ref_median > 0 and f0_median_hz > 0:
@@ -2676,35 +2838,27 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
         ]
         intonation_similarity = _mean(intonation_parts)
         capabilities["intonation_enabled"] = True
+        speaker_started_at = time.perf_counter()
         try:
             runtime = _resolve_seedlab_eval_runtime()
             resolved_device = str(runtime.get("resolved_device") or "cpu")
-            global _SPEAKER_VERIFIERS
-            verifier = _SPEAKER_VERIFIERS.get(resolved_device)
-            if verifier is None:
-                from speechbrain.inference.speaker import SpeakerRecognition  # type: ignore
-
-                verifier = SpeakerRecognition.from_hparams(
-                    source="speechbrain/spkrec-ecapa-voxceleb",
-                    savedir=str(_seedlab_eval_model_cache_dir() / "speechbrain"),
-                    run_opts={"device": resolved_device},
-                )
-                _SPEAKER_VERIFIERS[resolved_device] = verifier
-            speaker_scores: list[float] = []
-            for ref_path in reference_audio_paths:
-                score, _prediction = verifier.verify_files(str(ref_path), str(audio_path))
-                speaker_scores.append(float(score))
-            speaker_similarity_mean = _pairwise_mean(speaker_scores)
+            speaker_similarity_mean, speaker_device = _predict_speaker_similarity(
+                audio_path=audio_path,
+                reference_audio_paths=reference_audio_paths,
+                resolved_device=resolved_device,
+            )
             speaker_similarity = speaker_similarity_mean
             capabilities["speaker_similarity_enabled"] = speaker_similarity_mean is not None
-            speaker_device = _infer_module_device(verifier) or str(getattr(verifier, "device", "") or resolved_device)
             capabilities["speaker_device"] = speaker_device
             if _torch_device_is_cuda(speaker_device):
                 capabilities["gpu_acceleration_active"] = True
-        except Exception:
+        except Exception as e:
             speaker_similarity = None
+            capabilities["speaker_error"] = str(e)
+        timings_ms["speaker_similarity"] = round((time.perf_counter() - speaker_started_at) * 1000, 3)
 
     mos_pred = None
+    mos_started_at = time.perf_counter()
     try:
         runtime = _resolve_seedlab_eval_runtime()
         resolved_device = str(runtime.get("resolved_device") or "cpu")
@@ -2713,8 +2867,11 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
         capabilities["mos_device"] = mos_device
         if _torch_device_is_cuda(mos_device):
             capabilities["gpu_acceleration_active"] = True
-    except Exception:
+    except Exception as e:
         mos_pred = None
+        capabilities["mos_error"] = str(e)
+    timings_ms["distillmos"] = round((time.perf_counter() - mos_started_at) * 1000, 3)
+    timings_ms["total"] = round((time.perf_counter() - analysis_started_at) * 1000, 3)
 
     return {
         "duration_sec": round(duration_sec, 6),
@@ -2741,6 +2898,7 @@ def _analyze_audio_signal(audio_path: Path, *, reference_audio_paths: list[Path]
         "hard_artifact_reason": hard_artifact_reason,
         "worst_artifact_window_sec": worst_artifact_window_sec,
         "reference_count": reference_count,
+        "timings_ms": timings_ms,
         "capabilities": capabilities,
     }
 
@@ -2923,6 +3081,7 @@ def _empty_eval(note: str, *, status: str) -> dict[str, Any]:
         "prosody_fail_reason": "",
         "rank_excluded": False,
         "capabilities": {},
+        "executor": "",
         "reference_set_id": "",
         "note": note[:600],
         "selected": False,
@@ -2938,7 +3097,7 @@ def _openai_transcribe_audio(
     asr_model: str,
     language: str,
     timeout_seconds: int,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     payload = _http_post_multipart(
         "https://api.openai.com/v1/audio/transcriptions",
         fields={
@@ -2953,7 +3112,13 @@ def _openai_transcribe_audio(
     )
     text = str(payload.get("text") or "").strip()
     if text:
-        return text
+        usage = {
+            "model": asr_model,
+            "language": language,
+            "audio_size_bytes": int(audio_path.stat().st_size) if audio_path.exists() else 0,
+            "audio_duration_sec": round(_wav_duration_seconds(audio_path), 6),
+        }
+        return text, usage
     raise RuntimeError("empty transcript")
 
 
@@ -2965,7 +3130,7 @@ def _openai_generate_eval_note(
     script_text: str,
     transcript_text: str,
     metrics: dict[str, Any],
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     system_prompt = (
         "당신은 한국어 TTS 품질 평가자다. "
         "반드시 note 하나만 JSON 객체로 반환한다. "
@@ -3006,7 +3171,13 @@ def _openai_generate_eval_note(
     parsed = _extract_json_object(content)
     if not parsed:
         raise RuntimeError("judge returned non-json content")
-    return str(parsed.get("note") or "").strip()
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    return str(parsed.get("note") or "").strip(), {
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "model": judge_model,
+    }
 
 
 def _resolve_reference_audio_path(
@@ -3136,9 +3307,12 @@ def _auto_eval_audio_file(
     reference_audio_s3_uri: str,
     reference_audio_cache_dir: str,
     disable_llm_note: bool,
+    executor: str = "local",
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     started = time.time()
     try:
+        stage_timings_ms: dict[str, float] = {}
+        reference_started_at = time.perf_counter()
         reference_audio_paths, reference_audio_source, reference_set_id = _resolve_reference_audio_paths(
             run_dir=run_dir,
             rec=rec,
@@ -3146,20 +3320,31 @@ def _auto_eval_audio_file(
             explicit_s3_uri=reference_audio_s3_uri,
             reference_audio_cache_dir=reference_audio_cache_dir,
         )
-        transcript_text = _openai_transcribe_audio(
+        stage_timings_ms["reference_load"] = round((time.perf_counter() - reference_started_at) * 1000, 3)
+
+        asr_started_at = time.perf_counter()
+        transcript_text, asr_usage = _openai_transcribe_audio(
             api_key=asr_api_key,
             audio_path=audio_path,
             asr_model=asr_model,
             language=language,
             timeout_seconds=timeout_seconds,
         )
+        stage_timings_ms["asr"] = round((time.perf_counter() - asr_started_at) * 1000, 3)
         ref_norm = _normalize_compare_text(script_text)
         hyp_norm = _normalize_compare_text(transcript_text)
         char_acc = _char_accuracy(ref_norm, hyp_norm)
         length_ratio = (len(hyp_norm) / len(ref_norm)) if ref_norm else 0.0
         duration = _wav_duration_seconds(audio_path)
         chars_per_sec = (len(hyp_norm) / duration) if duration > 0 else 0.0
+
+        signal_started_at = time.perf_counter()
         signal = _analyze_audio_signal(audio_path, reference_audio_paths=reference_audio_paths)
+        stage_timings_ms["signal_analysis"] = round((time.perf_counter() - signal_started_at) * 1000, 3)
+        signal_timings = signal.get("timings_ms") if isinstance(signal.get("timings_ms"), dict) else {}
+        for key, value in signal_timings.items():
+            if isinstance(value, (int, float)):
+                stage_timings_ms[f"signal_{key}"] = round(float(value), 3)
         scored = _compute_hybrid_scores(
             char_accuracy=char_acc,
             length_ratio=length_ratio,
@@ -3177,9 +3362,11 @@ def _auto_eval_audio_file(
             "signal": signal,
         }
         raw_note = ""
+        judge_usage: dict[str, Any] = {}
+        note_started_at = time.perf_counter()
         if not disable_llm_note:
             try:
-                raw_note = _openai_generate_eval_note(
+                raw_note, judge_usage = _openai_generate_eval_note(
                     api_key=judge_api_key,
                     judge_model=judge_model,
                     timeout_seconds=timeout_seconds,
@@ -3189,9 +3376,12 @@ def _auto_eval_audio_file(
                 )
             except Exception as note_err:
                 raw_note = f"LLM note unavailable: {note_err}"
+        stage_timings_ms["judge_note"] = round((time.perf_counter() - note_started_at) * 1000, 3)
+        stage_timings_ms["total"] = round((time.time() - started) * 1000, 3)
         metrics_note = f"acc={char_acc:.3f}, len={length_ratio:.2f}, cps={chars_per_sec:.2f}"
         note = f"[AI] {metrics_note} | {raw_note}".strip()
 
+        capabilities = scored.get("capabilities") or signal.get("capabilities") or {}
         eval_obj = {
             "naturalness": scored["naturalness"],
             "pronunciation": scored["pronunciation"],
@@ -3207,7 +3397,8 @@ def _auto_eval_audio_file(
             "prosody_fail": scored["prosody_fail"],
             "prosody_fail_reason": scored["prosody_fail_reason"],
             "rank_excluded": scored["rank_excluded"],
-            "capabilities": scored.get("capabilities") or signal.get("capabilities") or {},
+            "capabilities": capabilities,
+            "executor": executor,
             "reference_set_id": reference_set_id,
             "note": note[:600],
             "selected": False,
@@ -3230,8 +3421,19 @@ def _auto_eval_audio_file(
             "reference_audio_source": reference_audio_source,
             "reference_audio_paths": [str(path) for path in reference_audio_paths],
             "reference_set_id": reference_set_id,
-            "resolved_device": (signal.get("capabilities") or {}).get("resolved_device"),
-            "gpu_acceleration_active": bool((signal.get("capabilities") or {}).get("gpu_acceleration_active")),
+            "executor": executor,
+            "resolved_device": (capabilities or {}).get("resolved_device"),
+            "gpu_acceleration_active": bool((capabilities or {}).get("gpu_acceleration_active")),
+            "stage_timings_ms": stage_timings_ms,
+            "remote_eval": {
+                "executor": executor,
+                "gpu_acceleration_active": bool((capabilities or {}).get("gpu_acceleration_active")),
+                "status": "completed",
+            },
+            "cost_tracking": {
+                "seedlab_asr": dict(asr_usage or {}),
+                "seedlab_judge": dict(judge_usage or {}),
+            },
             "signal_metrics": signal,
             "scored_metrics": scored,
             "elapsed_ms": int((time.time() - started) * 1000),
@@ -3240,11 +3442,13 @@ def _auto_eval_audio_file(
     except Exception as e:
         msg = str(e).strip() or "auto eval failed"
         eval_obj = _empty_eval(f"AUTO-EVAL FAILED: {msg}", status="failed")
+        eval_obj["executor"] = executor
         debug = {
             "sample_id": sample_id,
             "seed": seed,
             "script_id": script_id,
             "status": "failed",
+            "executor": executor,
             "error": msg,
             "elapsed_ms": int((time.time() - started) * 1000),
         }
@@ -3521,6 +3725,35 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
             if route == "/api/run-status":
                 rows = _read_jsonl_objects(live_records_path)
+                merged_evals = _merge_eval_maps([base_eval_path, live_eval_path])
+                executor_counts: dict[str, int] = {}
+                gpu_active_sample_count = 0
+                remote_eval_failed_count = 0
+                avg_stage_timings_ms: dict[str, float] = {}
+                timing_totals: dict[str, float] = {}
+                timing_samples = 0
+                for debug_row in _read_jsonl_objects(live_eval_debug_path):
+                    if not isinstance(debug_row, dict):
+                        continue
+                    executor = str(debug_row.get("executor") or "").strip()
+                    if executor:
+                        executor_counts[executor] = int(executor_counts.get(executor) or 0) + 1
+                    if bool(debug_row.get("gpu_acceleration_active")):
+                        gpu_active_sample_count += 1
+                    remote_eval = debug_row.get("remote_eval") if isinstance(debug_row.get("remote_eval"), dict) else {}
+                    if str(remote_eval.get("status") or "").strip().lower() == "failed":
+                        remote_eval_failed_count += 1
+                    timings = debug_row.get("stage_timings_ms") if isinstance(debug_row.get("stage_timings_ms"), dict) else {}
+                    if timings:
+                        timing_samples += 1
+                        for key, value in timings.items():
+                            if isinstance(value, (int, float)):
+                                timing_totals[key] = float(timing_totals.get(key) or 0.0) + float(value)
+                if timing_samples > 0:
+                    avg_stage_timings_ms = {
+                        key: round(total / timing_samples, 1)
+                        for key, total in timing_totals.items()
+                    }
                 return self._send_json(
                     200,
                     {
@@ -3529,8 +3762,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         "stage": "ready",
                         "generated_count": len(rows) or len(manifest_records),
                         "failed_count": sum(1 for row in rows if str(row.get("status") or "") == "failed"),
-                        "evaluated_count": len(_merge_eval_maps([base_eval_path, live_eval_path])),
+                        "evaluated_count": len(merged_evals),
                         "total_count": len(manifest_records) or len(rows),
+                        "eval_failed_count": sum(
+                            1 for value in merged_evals.values()
+                            if isinstance(value, dict) and str(value.get("auto_eval_status") or "").strip().lower() != "ready"
+                        ),
+                        "runpod_job_count": int(executor_counts.get("runpod_gpu") or 0),
+                        "gpu_active_sample_count": gpu_active_sample_count,
+                        "remote_eval_failed_count": remote_eval_failed_count,
+                        "remote_eval_last_error": "",
+                        "eval_executor_counts": executor_counts,
+                        "avg_stage_timings_ms": avg_stage_timings_ms,
                         "last_error": "",
                     },
                 )

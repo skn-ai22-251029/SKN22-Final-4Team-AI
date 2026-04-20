@@ -39,10 +39,10 @@ from utils.file_naming import build_filename
 from services.storage_service import presign_s3_uri, put_bytes_and_presign
 from models.job import (
     AutoReportRequest,
-    CostEventIngestRequest,
     ChannelSelectRequest,
     CharacterAvatarRequest,
     ConfirmActionRequest,
+    CostEventIngestRequest,
     HeygenSmokeTestRequest,
     IncomingMessageRequest,
     ListJobsRequest,
@@ -161,6 +161,14 @@ def _estimate_script_rewrite_cost_usd(usage: dict[str, Any]) -> Optional[float]:
     return ((prompt_tokens / 1_000_000.0) * input_rate) + ((completion_tokens / 1_000_000.0) * output_rate)
 
 
+def _estimated_pricing_kind(cost_usd: Optional[float]) -> str:
+    return "estimated" if cost_usd is not None else "missing"
+
+
+def _estimated_pricing_source(cost_usd: Optional[float]) -> str:
+    return "provider_usage_estimate" if cost_usd is not None else "unavailable"
+
+
 def _estimate_tts_cost_usd(script_text: str) -> Optional[float]:
     per_1k = float(settings.tts_cost_usd_per_1k_chars)
     if per_1k <= 0:
@@ -169,16 +177,54 @@ def _estimate_tts_cost_usd(script_text: str) -> Optional[float]:
     return (char_count / 1000.0) * per_1k
 
 
-def _estimate_heygen_cost_usd(raw_cost: Optional[float]) -> Optional[float]:
-    if raw_cost is not None:
+def _extract_heygen_cost_candidate(payload: Any) -> Optional[float]:
+    if isinstance(payload, (int, float)):
         try:
-            return float(raw_cost)
+            return float(payload)
         except Exception:
             return None
+    if isinstance(payload, dict):
+        for key in (
+            "cost_usd",
+            "costUsd",
+            "credits_cost_usd",
+            "creditsCostUsd",
+            "total_cost_usd",
+            "totalCostUsd",
+            "billed_cost_usd",
+            "billedCostUsd",
+        ):
+            if key in payload:
+                candidate = _extract_heygen_cost_candidate(payload.get(key))
+                if candidate is not None:
+                    return candidate
+        for key in ("cost", "billing", "usage", "data", "response_snapshot", "poll_response", "create_response"):
+            if key in payload:
+                candidate = _extract_heygen_cost_candidate(payload.get(key))
+                if candidate is not None:
+                    return candidate
+    if isinstance(payload, list):
+        for item in payload:
+            candidate = _extract_heygen_cost_candidate(item)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _resolve_heygen_cost(raw_cost: Optional[float], *payloads: Any) -> tuple[Optional[float], str, str]:
+    if raw_cost is not None:
+        try:
+            return float(raw_cost), "actual", "provider_actual"
+        except Exception:
+            pass
+    for payload in payloads:
+        candidate = _extract_heygen_cost_candidate(payload)
+        if candidate is not None:
+            return candidate, "actual", "provider_actual"
     fallback = float(settings.heygen_fallback_cost_usd_per_video)
     if fallback > 0:
-        return fallback
-    return None
+        return fallback, "estimated", "config_fallback"
+    return None, "missing", "unavailable"
 
 
 async def _record_cost_event_safe(**kwargs: Any) -> None:
@@ -292,6 +338,75 @@ def _merge_script_json_with_hardburn_failure(
         "hardburn_video_s3_uri": "",
         "srt_s3_uri": srt_s3_uri,
     }
+    return merged_script
+
+
+def _merge_script_json_with_video_preview_failure(
+    existing_script_json: dict[str, Any] | None,
+    *,
+    raw_video_filename: str = "",
+    hardburn_video_filename: str = "",
+    srt_filename: str = "",
+    raw_video_s3_uri: str = "",
+    hardburn_video_s3_uri: str = "",
+    srt_s3_uri: str = "",
+    failed_stage: str = "",
+    error: str,
+    caption_artifacts: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    merged_script = _as_script_json(existing_script_json)
+    media_names = merged_script.get("media_names") if isinstance(merged_script.get("media_names"), dict) else {}
+    if raw_video_filename:
+        media_names["raw_video_filename"] = raw_video_filename
+    if hardburn_video_filename:
+        media_names["hardburn_video_filename"] = hardburn_video_filename
+    if srt_filename:
+        media_names["srt_filename"] = srt_filename
+    if media_names:
+        merged_script["media_names"] = media_names
+
+    video_assets = merged_script.get("video_assets") if isinstance(merged_script.get("video_assets"), dict) else {}
+    if raw_video_s3_uri:
+        video_assets["raw_video_s3_uri"] = raw_video_s3_uri
+    if hardburn_video_s3_uri:
+        video_assets["hardburn_video_s3_uri"] = hardburn_video_s3_uri
+    if srt_s3_uri:
+        video_assets["srt_s3_uri"] = srt_s3_uri
+    if video_assets:
+        merged_script["video_assets"] = video_assets
+
+    video_hardburn = merged_script.get("video_hardburn") if isinstance(merged_script.get("video_hardburn"), dict) else {}
+    video_hardburn.update(
+        {
+            "status": "failed",
+            "error": str(error or ""),
+            "failed_stage": str(failed_stage or ""),
+            "raw_video_s3_uri": raw_video_s3_uri or str(video_hardburn.get("raw_video_s3_uri") or ""),
+            "hardburn_video_s3_uri": hardburn_video_s3_uri or str(video_hardburn.get("hardburn_video_s3_uri") or ""),
+            "srt_s3_uri": srt_s3_uri or str(video_hardburn.get("srt_s3_uri") or ""),
+        }
+    )
+    if isinstance(caption_artifacts, dict):
+        if caption_artifacts.get("subtitle_sha256"):
+            video_hardburn["subtitle_sha256"] = caption_artifacts.get("subtitle_sha256")
+        cue_count = caption_artifacts.get("cue_count") or caption_artifacts.get("display_sentence_count")
+        if cue_count:
+            video_hardburn["cue_count"] = cue_count
+        if caption_artifacts.get("asr_model"):
+            video_hardburn["asr_model"] = caption_artifacts.get("asr_model")
+        if caption_artifacts.get("matched_sentence_count") is not None:
+            video_hardburn["matched_sentence_count"] = caption_artifacts.get("matched_sentence_count")
+        if caption_artifacts.get("word_count") is not None:
+            video_hardburn["word_count"] = caption_artifacts.get("word_count")
+        if caption_artifacts.get("alignment_status"):
+            video_hardburn["alignment_status"] = caption_artifacts.get("alignment_status")
+        if caption_artifacts.get("timing_source"):
+            video_hardburn["timing_source"] = caption_artifacts.get("timing_source")
+        if caption_artifacts.get("fallback_reason"):
+            video_hardburn["fallback_reason"] = caption_artifacts.get("fallback_reason")
+        if isinstance(caption_artifacts.get("request_json"), dict):
+            video_hardburn["request_json"] = caption_artifacts.get("request_json")
+    merged_script["video_hardburn"] = video_hardburn
     return merged_script
 
 
@@ -923,6 +1038,7 @@ async def _build_caption_artifacts(
     audio_url: str,
     subtitle_script_text: str,
     tts_script_text: str,
+    selected_tts_timing: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     service_base_url = settings.sns_publisher_service_url.rstrip("/")
     if not service_base_url:
@@ -937,6 +1053,7 @@ async def _build_caption_artifacts(
             "audio_url": resolved_audio_url,
             "subtitle_script_text": subtitle_script_text,
             "tts_script_text": tts_script_text,
+            "selected_tts_timing": dict(selected_tts_timing or {}),
         },
         timeout=300.0,
     )
@@ -1335,6 +1452,11 @@ async def _run_wf13_heygen_generate(
     if not video_url:
         raise RuntimeError(f"HeyGen video generation incomplete: {status_value}")
 
+    heygen_cost_usd, heygen_pricing_kind, heygen_pricing_source = _resolve_heygen_cost(
+        None,
+        response_payload,
+        poll_payload,
+    )
     await _record_cost_event_safe(
         job_id=job_id,
         topic_text="",
@@ -1356,7 +1478,10 @@ async def _run_wf13_heygen_generate(
             "create_response": response_payload,
             "poll_response": poll_payload,
         },
-        cost_usd=_estimate_heygen_cost_usd(None),
+        cost_usd=heygen_cost_usd,
+        pricing_kind=heygen_pricing_kind,
+        pricing_source=heygen_pricing_source,
+        api_key_family="heygen",
         error_type="",
         error_message="",
         idempotency_key=f"wf13:heygen:{job_id}:{video_id}",
@@ -1467,6 +1592,9 @@ async def _finalize_video_auto(
             "hardburn_video_filename": hardburn_video_filename,
         },
         cost_usd=0.0,
+        pricing_kind="estimated",
+        pricing_source="provider_usage_estimate",
+        api_key_family="hardburn_subtitle",
         error_type="",
         error_message="",
         idempotency_key=f"wf13:hardburn:{job_id}:{hardburn_video_filename}",
@@ -1915,6 +2043,26 @@ def _split_script_sentences(script_text: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
+def _split_caption_alignment_sentences(script_text: str) -> list[str]:
+    normalized = " ".join((script_text or "").replace("\r", "\n").split())
+    if not normalized:
+        return []
+    parts = re.findall(r"[^.!?]+[.!?]?", normalized)
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def _build_fixed_caption_text(body_text: str) -> str:
+    body_lines = [line.strip() for line in (body_text or "").splitlines() if line.strip()]
+    if not body_lines:
+        return ""
+    output_lines = list(body_lines)
+    if output_lines[0] != TTS_SCRIPT_OPENING_LINE:
+        output_lines.insert(0, TTS_SCRIPT_OPENING_LINE)
+    if output_lines[-1] != SCRIPT_ENDING_LINE:
+        output_lines.append(SCRIPT_ENDING_LINE)
+    return "\n".join(output_lines).strip()
+
+
 def _clip(text: str, *, limit: int = 260) -> str:
     value = _sanitize_prompt_text((text or "").strip())
     if not value:
@@ -2139,6 +2287,13 @@ def _validate_subtitle_script(
     subtitle_has_alnum = bool(re.search(r"[A-Za-z0-9]", subtitle_script_text or ""))
     if report_has_alnum and not subtitle_has_alnum:
         raise RuntimeError("subtitle_script_text must preserve numeric/alphabetic notation from report")
+    spoken_sentence_count = len(_split_caption_alignment_sentences(_build_fixed_caption_text(tts_script_text)))
+    display_sentence_count = len(_split_caption_alignment_sentences(_build_fixed_caption_text(subtitle_script_text)))
+    if spoken_sentence_count != display_sentence_count:
+        raise RuntimeError(
+            "caption sentence count mismatch after fixed opening/ending: "
+            f"spoken={spoken_sentence_count} display={display_sentence_count}"
+        )
 
 
 def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
@@ -2255,6 +2410,7 @@ async def _rewrite_report_to_script(
                     "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
                     "model": settings.script_rewrite_model,
                 }
+            estimated_cost = _estimate_script_rewrite_cost_usd(usage_payload)
             await _record_cost_event_safe(
                 job_id=prompt_log.get("job_id", ""),
                 topic_text=str((prompt_log.get("job") or {}).get("concept_text") or ""),
@@ -2267,7 +2423,10 @@ async def _rewrite_report_to_script(
                 ended_at=datetime.now(timezone.utc),
                 usage_json=usage_payload,
                 raw_response_json={"prompt": tts_prompt, "has_choices": bool(response.choices)},
-                cost_usd=_estimate_script_rewrite_cost_usd(usage_payload),
+                cost_usd=estimated_cost,
+                pricing_kind=_estimated_pricing_kind(estimated_cost),
+                pricing_source=_estimated_pricing_source(estimated_cost),
+                api_key_family="rewrite",
                 error_type="",
                 error_message="",
                 idempotency_key=f"script:tts:{prompt_log.get('job_id','')}:{attempt_record['attempt']}",
@@ -2303,6 +2462,7 @@ async def _rewrite_report_to_script(
             raise RuntimeError(str(last_error or "tts rewrite failed after retries"))
 
         subtitle_script_text = _sanitize_prompt_text((seed_subtitle_script_text or "").strip())
+        subtitle_validation_error = ""
         for attempt in range(max(1, max_attempts)):
             use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
             subtitle_prompt = (
@@ -2311,6 +2471,7 @@ async def _rewrite_report_to_script(
                     tts_script_text=tts_script_text,
                     previous_script_text=subtitle_script_text,
                     char_count=_script_char_count(subtitle_script_text),
+                    validation_error=subtitle_validation_error,
                 )
                 if use_retry_prompt
                 else build_subtitle_from_tts_prompt(
@@ -2349,6 +2510,7 @@ async def _rewrite_report_to_script(
                     "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
                     "model": settings.script_rewrite_model,
                 }
+            estimated_cost = _estimate_script_rewrite_cost_usd(usage_payload)
             await _record_cost_event_safe(
                 job_id=prompt_log.get("job_id", ""),
                 topic_text=str((prompt_log.get("job") or {}).get("concept_text") or ""),
@@ -2361,13 +2523,17 @@ async def _rewrite_report_to_script(
                 ended_at=datetime.now(timezone.utc),
                 usage_json=usage_payload,
                 raw_response_json={"prompt": subtitle_prompt, "has_choices": bool(response.choices)},
-                cost_usd=_estimate_script_rewrite_cost_usd(usage_payload),
+                cost_usd=estimated_cost,
+                pricing_kind=_estimated_pricing_kind(estimated_cost),
+                pricing_source=_estimated_pricing_source(estimated_cost),
+                api_key_family="rewrite",
                 error_type="",
                 error_message="",
                 idempotency_key=f"script:subtitle:{prompt_log.get('job_id','')}:{attempt_record['attempt']}",
             )
             if not response.choices:
                 last_error = RuntimeError("subtitle rewrite returned no choices")
+                subtitle_validation_error = str(last_error)
                 attempt_record["validation_error"] = str(last_error)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
@@ -2378,6 +2544,7 @@ async def _rewrite_report_to_script(
             attempt_record["char_count"] = _script_char_count(subtitle_script_text)
             if not subtitle_script_text:
                 last_error = RuntimeError("subtitle rewrite returned empty content")
+                subtitle_validation_error = str(last_error)
                 attempt_record["validation_error"] = str(last_error)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
@@ -2400,6 +2567,7 @@ async def _rewrite_report_to_script(
                 return subtitle_script_text, tts_script_text
             except Exception as e:
                 last_error = e
+                subtitle_validation_error = str(e)
                 attempt_record["validation_error"] = str(e)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
     finally:
@@ -3175,6 +3343,7 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
 
     request_started_at = datetime.now(timezone.utc)
     call_nonce = int(request_started_at.timestamp() * 1000)
+    estimated_cost = _estimate_tts_cost_usd(script_text)
     async with httpx.AsyncClient(timeout=180.0) as client:
         endpoint = tts_api_url if tts_api_url.rstrip("/").endswith("/tts") else f"{tts_api_url.rstrip('/')}/tts"
         try:
@@ -3195,7 +3364,10 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
                 ended_at=datetime.now(timezone.utc),
                 usage_json={"seed": seed, "script_chars": _script_char_count(script_text)},
                 raw_response_json={"endpoint": endpoint},
-                cost_usd=_estimate_tts_cost_usd(script_text),
+                cost_usd=estimated_cost,
+                pricing_kind=_estimated_pricing_kind(estimated_cost),
+                pricing_source=_estimated_pricing_source(estimated_cost),
+                api_key_family="tts_generation",
                 error_type="tts_network_error",
                 error_message=f"{type(e).__name__}: {e}",
                 idempotency_key=f"tts:{job_id}:{seed}:network:{call_nonce}",
@@ -3213,7 +3385,10 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
                 ended_at=datetime.now(timezone.utc),
                 usage_json={"seed": seed, "script_chars": _script_char_count(script_text)},
                 raw_response_json={"endpoint": endpoint, "status_code": resp.status_code, "body": (resp.text or "")[:500]},
-                cost_usd=_estimate_tts_cost_usd(script_text),
+                cost_usd=estimated_cost,
+                pricing_kind=_estimated_pricing_kind(estimated_cost),
+                pricing_source=_estimated_pricing_source(estimated_cost),
+                api_key_family="tts_generation",
                 error_type=_classify_tts_error(resp.text or "", status_code=resp.status_code),
                 error_message=(resp.text or "")[:500],
                 idempotency_key=f"tts:{job_id}:{seed}:http:{resp.status_code}:{call_nonce}",
@@ -3234,7 +3409,10 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
                 "audio_bytes": len(resp.content or b""),
             },
             raw_response_json={"endpoint": endpoint, "status_code": resp.status_code},
-            cost_usd=_estimate_tts_cost_usd(script_text),
+            cost_usd=estimated_cost,
+            pricing_kind=_estimated_pricing_kind(estimated_cost),
+            pricing_source=_estimated_pricing_source(estimated_cost),
+            api_key_family="tts_generation",
             error_type="",
             error_message="",
             idempotency_key=f"tts:{job_id}:{seed}:success:{call_nonce}",
@@ -3899,6 +4077,60 @@ def _build_seedlab_link_from_run(run: dict[str, Any]) -> str:
     return f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
 
 
+def _cost_viewer_signing_secret_bytes() -> bytes:
+    raw = (settings.seedlab_signing_secret or "").strip() or (settings.gateway_internal_secret or "").strip()
+    if not raw:
+        raise HTTPException(status_code=503, detail="Cost viewer signing secret is not configured")
+    return raw.encode("utf-8")
+
+
+def _build_cost_viewer_signed_token(*, user_id: str, expires_at: datetime) -> str:
+    payload = {
+        "discord_user_id": user_id,
+        "exp": int(expires_at.timestamp()),
+    }
+    payload_raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(_cost_viewer_signing_secret_bytes(), payload_raw, hashlib.sha256).digest()
+    return f"{_b64url_encode(payload_raw)}.{_b64url_encode(sig)}"
+
+
+def _verify_cost_viewer_signed_token(token: str) -> dict[str, Any]:
+    try:
+        payload_part, sig_part = token.split(".", 1)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail="Invalid cost viewer token") from e
+    payload_raw = _b64url_decode(payload_part)
+    actual_sig = _b64url_decode(sig_part)
+    expected_sig = hmac.new(_cost_viewer_signing_secret_bytes(), payload_raw, hashlib.sha256).digest()
+    if not secrets.compare_digest(actual_sig, expected_sig):
+        raise HTTPException(status_code=403, detail="Invalid cost viewer token")
+    payload = json.loads(payload_raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=403, detail="Invalid cost viewer token payload")
+    expires_at = int(payload.get("exp") or 0)
+    if expires_at <= int(datetime.now(timezone.utc).timestamp()):
+        raise HTTPException(status_code=403, detail="Cost viewer link expired")
+    user_id = str(payload.get("discord_user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=403, detail="Invalid cost viewer token payload")
+    return payload
+
+
+def _resolve_cost_viewer_base_url() -> str:
+    base_url = (settings.cost_viewer_public_base_url or "").strip().rstrip("/")
+    if base_url:
+        return base_url
+    fallback = (settings.seedlab_public_base_url or "").strip().rstrip("/")
+    if fallback:
+        return fallback
+    raise HTTPException(status_code=503, detail="Cost viewer public base URL is not configured")
+
+
+def _build_cost_viewer_link(*, user_id: str, expires_at: datetime) -> str:
+    token = _build_cost_viewer_signed_token(user_id=user_id, expires_at=expires_at)
+    return f"{_resolve_cost_viewer_base_url()}/cost/r/{token}/"
+
+
 def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequest) -> str:
     run_id = str(run.get("run_id") or body.run_id)
     stage = (body.stage or body.status or "queued").strip().lower()
@@ -3908,6 +4140,12 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
     evaluated_count = max(0, int(body.evaluated_count or 0))
     ready_count = max(0, int(body.ready_count or 0))
     failed_count = max(0, int(body.failed_count or 0))
+    eval_failed_count = max(0, int(body.eval_failed_count or 0))
+    runpod_job_count = max(0, int(body.runpod_job_count or 0))
+    gpu_active_sample_count = max(0, int(body.gpu_active_sample_count or 0))
+    remote_eval_failed_count = max(0, int(body.remote_eval_failed_count or 0))
+    avg_stage_timings = body.avg_stage_timings_ms if isinstance(body.avg_stage_timings_ms, dict) else {}
+    executor_counts = body.eval_executor_counts if isinstance(body.eval_executor_counts, dict) else {}
     if stage == "queued":
         stage_label = "대기 중"
     elif stage == "generating":
@@ -3943,9 +4181,29 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
         f"실패: {failed_count}",
         ai_line,
     ]
+    if evaluated_count > 0 or runpod_job_count > 0 or remote_eval_failed_count > 0:
+        lines.append(
+            "실행: "
+            f"RunPod {runpod_job_count} / GPU {gpu_active_sample_count} / "
+            f"AI 실패 {eval_failed_count} / 원격 실패 {remote_eval_failed_count}"
+        )
+    if executor_counts:
+        executor_chunks = [f"{str(key)}={int(value or 0)}" for key, value in executor_counts.items()]
+        if executor_chunks:
+            lines.append(f"평가자: {', '.join(executor_chunks)}")
+    if avg_stage_timings:
+        timing_chunks = []
+        for key in ("reference_load", "asr", "signal_analysis", "judge_note", "total"):
+            value = avg_stage_timings.get(key)
+            if isinstance(value, (int, float)):
+                timing_chunks.append(f"{key}={round(float(value), 1)}ms")
+        if timing_chunks:
+            lines.append(f"평균 지연: {', '.join(timing_chunks)}")
     link = _build_seedlab_link_from_run(run)
     if link:
         lines.append(f"링크: {link}")
+    if body.remote_eval_last_error:
+        lines.append(f"원격 평가 오류: {_clip_text(str(body.remote_eval_last_error), 220)}")
     if body.last_error:
         lines.append(f"사유: {_clip_text(str(body.last_error), 250)}")
     return "\n".join(lines)
@@ -5142,6 +5400,14 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     if existing_job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     existing_script_json = _as_script_json(existing_job.get("script_json"))
+    subtitle_script_text = _get_subtitle_script_text(existing_script_json)
+    tts_script_text = _get_tts_script_text(existing_script_json)
+    audio_url = str(existing_job.get("audio_url") or "").strip()
+    selected_tts_timing = (
+        existing_script_json.get("selected_tts_timing")
+        if isinstance(existing_script_json.get("selected_tts_timing"), dict)
+        else {}
+    )
     normalized_video_filename = _normalize_video_filename(
         body.job_id,
         body.video_filename,
@@ -5150,93 +5416,69 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     hardburn_video_filename = _build_hardburn_video_filename(normalized_video_filename)
     srt_filename = _build_srt_filename(normalized_video_filename)
     video_started_at = datetime.now(timezone.utc)
+    video_resp: Optional[httpx.Response] = None
+    raw_stored = None
+    srt_stored = None
+    hardburn_stored = None
+    caption_artifacts: dict[str, Any] = {}
+    hardburn_video_bytes = b""
+    message_id = ""
+    hardburn_started_at = datetime.now(timezone.utc)
+    failed_stage = ""
     try:
+        if not subtitle_script_text:
+            raise RuntimeError("subtitle_script_text is required for hardburn")
+        if not tts_script_text:
+            raise RuntimeError("tts_script_text is required for hardburn")
+        if not audio_url:
+            raise RuntimeError("audio_url is required for hardburn")
+
+        failed_stage = "video_download"
         video_resp = await _http_client.get(body.video_url, timeout=300.0)
         video_resp.raise_for_status()
-    except Exception as e:
-        logger.error("[storage] video source download failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"Video download failed: {e}")
 
-    try:
+        failed_stage = "raw_video_upload"
         raw_stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_videos,
             filename=normalized_video_filename,
             content=video_resp.content,
             content_type=video_resp.headers.get("content-type") or "video/mp4",
         )
-    except Exception as e:
-        logger.error("[storage] video upload failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"Video upload failed: {e}")
 
-    subtitle_script_text = _get_subtitle_script_text(existing_script_json)
-    tts_script_text = _get_tts_script_text(existing_script_json)
-    audio_url = str(existing_job.get("audio_url") or "").strip()
-    if not subtitle_script_text:
-        raise HTTPException(status_code=400, detail="subtitle_script_text is required for hardburn")
-    if not tts_script_text:
-        raise HTTPException(status_code=400, detail="tts_script_text is required for hardburn")
-    if not audio_url:
-        raise HTTPException(status_code=400, detail="audio_url is required for hardburn")
-
-    hardburn_started_at = datetime.now(timezone.utc)
-    try:
+        failed_stage = "caption_artifacts"
         caption_artifacts = await _build_caption_artifacts(
             job_id=body.job_id,
             audio_url=audio_url,
             subtitle_script_text=subtitle_script_text,
             tts_script_text=tts_script_text,
+            selected_tts_timing=selected_tts_timing,
         )
-    except Exception as e:
-        logger.error("[hardburn] caption artifact generation failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"Caption artifact generation failed: {e}")
 
-    srt_content = str(caption_artifacts.get("srt_content") or "")
-    try:
+        failed_stage = "srt_upload"
+        srt_content = str(caption_artifacts.get("srt_content") or "")
         srt_stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_srt,
             filename=srt_filename,
             content=srt_content.encode("utf-8"),
             content_type="application/x-subrip; charset=utf-8",
         )
-    except Exception as e:
-        logger.error("[storage] srt upload failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"SRT upload failed: {e}")
 
-    try:
+        failed_stage = "hardburn_render"
         hardburn_video_bytes = await asyncio.to_thread(
             _render_hardburn_video_sync,
             raw_video_bytes=video_resp.content,
             srt_content=srt_content,
         )
-    except Exception as e:
-        logger.error("[hardburn] ffmpeg render failed job_id=%s: %s", body.job_id, e)
-        await job_service.update_job(
-            body.job_id,
-            script_json=_merge_script_json_with_hardburn_failure(
-                existing_script_json,
-                raw_video_filename=normalized_video_filename,
-                hardburn_video_filename=hardburn_video_filename,
-                srt_filename=srt_filename,
-                raw_video_s3_uri=raw_stored.s3_uri,
-                srt_s3_uri=srt_stored.s3_uri,
-                error=str(e),
-            ),
-            error_message=f"Hardburn render failed: {e}",
-        )
-        raise HTTPException(status_code=500, detail=f"Hardburn render failed: {e}")
 
-    try:
+        failed_stage = "hardburn_upload"
         hardburn_stored = put_bytes_and_presign(
             prefix=settings.media_s3_prefix_videos_with_subtitle,
             filename=hardburn_video_filename,
             content=hardburn_video_bytes,
             content_type="video/mp4",
         )
-    except Exception as e:
-        logger.error("[storage] hardburn video upload failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=f"Hardburn video upload failed: {e}")
 
-    try:
+        failed_stage = "discord_send"
         message_id = await _discord_adapter.send_video_preview(
             channel_id=body.channel_id,
             user_id=body.user_id,
@@ -5244,8 +5486,42 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
             video_url=hardburn_stored.presigned_url,
         )
     except Exception as e:
-        logger.error("[discord] send_video_preview failed job_id=%s: %s", body.job_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        detail = str(e.detail) if isinstance(e, HTTPException) else str(e)
+        error_message = f"Video preview failed at {failed_stage or 'unknown'}: {detail}"
+        logger.error("[video-preview] failed job_id=%s stage=%s err=%s", body.job_id, failed_stage, detail)
+        failed_script = _merge_script_json_with_video_preview_failure(
+            existing_script_json,
+            raw_video_filename=normalized_video_filename,
+            hardburn_video_filename=hardburn_video_filename,
+            srt_filename=srt_filename,
+            raw_video_s3_uri=raw_stored.s3_uri if raw_stored else "",
+            hardburn_video_s3_uri=hardburn_stored.s3_uri if hardburn_stored else "",
+            srt_s3_uri=srt_stored.s3_uri if srt_stored else "",
+            failed_stage=failed_stage,
+            error=error_message,
+            caption_artifacts=caption_artifacts,
+        )
+        try:
+            await job_service.update_job(
+                body.job_id,
+                status="FAILED",
+                error_message=error_message,
+                script_json=failed_script,
+            )
+        except Exception as update_err:
+            logger.error("[video-preview] failed to persist failure state job_id=%s: %s", body.job_id, update_err)
+        return {
+            "status": "failed",
+            "job_id": body.job_id,
+            "failed_stage": failed_stage,
+            "error_message": error_message,
+            "video_filename": hardburn_video_filename,
+            "raw_s3_uri": raw_stored.s3_uri if raw_stored else "",
+            "hardburn_s3_uri": hardburn_stored.s3_uri if hardburn_stored else "",
+            "srt_s3_uri": srt_stored.s3_uri if srt_stored else "",
+            "alignment_status": caption_artifacts.get("alignment_status") or "",
+            "fallback_reason": caption_artifacts.get("fallback_reason") or "",
+        }
 
     generated_content_id, generated_content_error = await _register_generated_content(
         job_id=body.job_id,
@@ -5256,6 +5532,12 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
     heygen_usage_json = body.heygen_usage_json if isinstance(body.heygen_usage_json, dict) else {}
     request_snapshot = body.heygen_request_snapshot if isinstance(body.heygen_request_snapshot, dict) else {}
     response_snapshot = body.heygen_response_snapshot if isinstance(body.heygen_response_snapshot, dict) else {}
+    heygen_cost_usd, heygen_pricing_kind, heygen_pricing_source = _resolve_heygen_cost(
+        body.heygen_cost_usd,
+        request_snapshot,
+        response_snapshot,
+        heygen_usage_json,
+    )
     await _record_cost_event_safe(
         job_id=body.job_id,
         topic_text=str(existing_job.get("concept_text") or "") if isinstance(existing_job, dict) else "",
@@ -5284,7 +5566,10 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
             "hardburn_video_s3_uri": hardburn_stored.s3_uri,
             "srt_s3_uri": srt_stored.s3_uri,
         },
-        cost_usd=_estimate_heygen_cost_usd(body.heygen_cost_usd),
+        cost_usd=heygen_cost_usd,
+        pricing_kind=heygen_pricing_kind,
+        pricing_source=heygen_pricing_source,
+        api_key_family="heygen",
         error_type="",
         error_message="",
         idempotency_key=f"video:heygen:{body.job_id}:{body.heygen_video_id or normalized_video_filename}",
@@ -5315,6 +5600,9 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
             "hardburn_video_filename": hardburn_video_filename,
         },
         cost_usd=0.0,
+        pricing_kind="estimated",
+        pricing_source="provider_usage_estimate",
+        api_key_family="hardburn_subtitle",
         error_type="",
         error_message="",
         idempotency_key=f"video:hardburn:{body.job_id}:{hardburn_video_filename}",
@@ -5345,11 +5633,13 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         "hardburn_video_s3_uri": hardburn_stored.s3_uri,
         "srt_s3_uri": srt_stored.s3_uri,
         "subtitle_sha256": caption_artifacts.get("subtitle_sha256"),
-        "cue_count": caption_artifacts.get("display_sentence_count"),
+        "cue_count": caption_artifacts.get("cue_count") or caption_artifacts.get("display_sentence_count"),
         "asr_model": caption_artifacts.get("asr_model"),
         "matched_sentence_count": caption_artifacts.get("matched_sentence_count"),
         "word_count": caption_artifacts.get("word_count"),
         "alignment_status": caption_artifacts.get("alignment_status"),
+        "fallback_reason": caption_artifacts.get("fallback_reason") or "",
+        "timing_source": caption_artifacts.get("timing_source") or "",
         "request_json": caption_artifacts.get("request_json") or {},
     }
     video_storage_url = hardburn_stored.s3_uri
@@ -5366,6 +5656,7 @@ async def send_video_preview(_: AuthDep, body: SendVideoPreviewRequest) -> dict:
         logger.warning("[cost] daily fixed allocation failed job_id=%s err=%s", body.job_id, e)
     logger.info("[discord] send_video_preview done job_id=%s", body.job_id)
     return {
+        "status": "ready",
         "job_id": body.job_id,
         "message_id": message_id,
         "video_filename": hardburn_video_filename,
@@ -6227,6 +6518,19 @@ async def seedlab_refresh_link(_: AuthDep, body: SeedLabRefreshLinkRequest) -> d
     return {"run_id": body.run_id, "seedlab_url": link, "expires_at": expires_at.isoformat()}
 
 
+@app.post("/internal/cost-viewer-link")
+async def cost_viewer_link(_: AuthDep, body: dict[str, Any]) -> dict:
+    user_id = str(body.get("messenger_user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="discord user id is required")
+    ttl_seconds = max(60, int(settings.cost_viewer_link_ttl_seconds or settings.seedlab_link_ttl_seconds))
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    return {
+        "cost_viewer_url": _build_cost_viewer_link(user_id=user_id, expires_at=expires_at),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
 @app.post("/internal/seedlab-progress")
 async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
     run = await job_service.get_seed_lab_run(body.run_id)
@@ -6361,7 +6665,57 @@ def _parse_ymd(text: str) -> Optional[date]:
         raise HTTPException(status_code=400, detail=f"invalid date format: {value} (expected YYYY-MM-DD)")
 
 
-def _cost_viewer_html() -> str:
+async def _costs_jobs_payload(
+    *,
+    from_date: str = "",
+    to_date: str = "",
+    q: str = "",
+    status_filter: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    subject_type: str = "all",
+) -> dict:
+    resolved_limit = max(1, min(int(limit), int(settings.cost_max_list_limit)))
+    return await cost_service.list_jobs_summary(
+        from_date=_parse_ymd(from_date),
+        to_date=_parse_ymd(to_date),
+        q=q,
+        status=status_filter,
+        limit=resolved_limit,
+        offset=offset,
+        subject_type=subject_type,
+    )
+
+
+async def _costs_job_detail_payload(job_id: str) -> dict:
+    try:
+        return await cost_service.get_job_detail(job_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+async def _costs_export_payload(
+    *,
+    job_id: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    subject_type: str = "all",
+) -> JSONResponse:
+    payload = await cost_service.export_payload(
+        job_id=job_id.strip(),
+        from_date=_parse_ymd(from_date),
+        to_date=_parse_ymd(to_date),
+        subject_type=(subject_type or "all").strip().lower(),
+    )
+    filename = f"cost-export-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _cost_viewer_html(api_base_path: str) -> str:
+    safe_api_base_path = json.dumps(api_base_path.rstrip("/"), ensure_ascii=False)
     return """<!doctype html>
 <html lang="ko">
 <head>
@@ -6369,153 +6723,422 @@ def _cost_viewer_html() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hari Cost Viewer</title>
   <style>
-    :root { --line:#d0d7de; --bg:#f7fafc; --panel:#ffffff; --text:#0f172a; --muted:#64748b; --accent:#0f766e; }
-    body { margin:0; padding:16px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
-    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-    input, select, button { padding:8px 10px; border:1px solid var(--line); border-radius:8px; font-size:13px; }
-    button.primary { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; }
-    table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:12px; }
-    th, td { border-bottom:1px solid var(--line); text-align:left; padding:8px; vertical-align:top; word-break:break-word; }
-    .muted { color:var(--muted); }
-    pre { background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; }
-    .ok { color:#166534; font-weight:700; }
-    .bad { color:#b91c1c; font-weight:700; }
+    :root {
+      --bg:#f5f7fa; --panel:#ffffff; --border:#d1d9e0;
+      --text:#1a2332; --muted:#6b7a8d;
+      --accent:#0e7c6b; --accent-soft:#e0f5f1;
+      --warn:#b45309; --warn-soft:#fef3c7;
+      --danger:#c0392b; --danger-soft:#fde8e8;
+      --info:#1e40af; --info-soft:#dbeafe;
+      --success:#166534; --success-soft:#dcfce7;
+    }
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;}
+    .container{max-width:1440px;margin:0 auto;padding:16px;}
+    h1{font-size:18px;font-weight:700;margin-bottom:14px;}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+    .filter-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
+    .filter-row label{font-size:11px;color:var(--muted);white-space:nowrap;}
+    input[type="date"],input[type="text"],select{height:32px;padding:0 10px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:#fff;color:var(--text);}
+    input[type="text"]{min-width:200px;}
+    button{height:32px;padding:0 14px;border:1px solid var(--border);border-radius:6px;font-size:12px;cursor:pointer;background:#fff;color:var(--text);white-space:nowrap;}
+    button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+    button:disabled{opacity:.4;cursor:default;}
+    button.sm{height:26px;padding:0 10px;font-size:11px;}
+    #statusBar{font-size:11px;color:var(--muted);margin-top:8px;min-height:16px;}
+    .summary-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px;}
+    .card{border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:#fafbfc;}
+    .card .clabel{font-size:10px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;}
+    .card .cusd{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:4px;}
+    .card .ckrw{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;margin-top:2px;}
+    .table-wrap{overflow-x:auto;}
+    table{width:100%;border-collapse:collapse;font-size:12px;}
+    thead{background:#f0f2f5;}
+    th{padding:8px 10px;text-align:left;font-weight:600;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid var(--border);white-space:nowrap;}
+    td{padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:middle;}
+    tr:last-child td{border-bottom:none;}
+    tr:hover td{background:#f8f9fc;}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap;}
+    .badge.job{background:#dbeafe;color:#1d4ed8;}
+    .badge.operation{background:#d1fae5;color:#065f46;}
+    .badge.published,.badge.success{background:var(--success-soft);color:var(--success);}
+    .badge.failed{background:var(--danger-soft);color:var(--danger);}
+    .badge.actual{background:var(--success-soft);color:var(--success);}
+    .badge.estimated{background:var(--warn-soft);color:var(--warn);}
+    .badge.fixed{background:var(--info-soft);color:var(--info);}
+    .badge.missing{background:var(--danger-soft);color:var(--danger);}
+    .badge.default{background:#e5e7eb;color:#374151;}
+    .stage-row{display:flex;gap:8px;align-items:center;}
+    .si{display:inline-flex;flex-direction:column;align-items:center;gap:1px;}
+    .si .ico{font-size:14px;line-height:1;}
+    .si .mark{font-size:11px;font-weight:800;line-height:1;}
+    .mark.ok{color:#16a34a;}
+    .mark.fail{color:#dc2626;}
+    .mark.skip{color:#d1d5db;}
+    .cost-cell .cusd2{font-weight:600;font-variant-numeric:tabular-nums;}
+    .cost-cell .ckrw2{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;}
+    .mono{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:11px;}
+    .pagination{display:flex;align-items:center;justify-content:space-between;padding:10px 4px 2px;font-size:12px;color:var(--muted);}
+    .page-btns{display:flex;gap:6px;align-items:center;}
+    #detailPanel{display:none;}
+    .detail-header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px;}
+    .detail-header .did{font-family:monospace;font-size:12px;word-break:break-all;color:var(--muted);}
+    .cost-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:12px;}
+    .cs-card{border:1px solid var(--border);border-radius:7px;padding:8px 10px;background:#fafbfc;}
+    .cs-card .cs-label{font-size:10px;color:var(--muted);font-weight:600;text-transform:uppercase;}
+    .cs-card .cs-val{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;}
+    .cs-card .cs-krw{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;}
+    .breakdown-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-bottom:12px;}
+    .bd-box{border:1px solid var(--border);border-radius:7px;padding:8px 10px;}
+    .bd-box h4{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px;}
+    .bd-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;gap:8px;}
+    .bd-key{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .bd-val{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;}
+    #eventsSection h3{font-size:13px;margin-bottom:8px;}
+    #eventsSection table th{font-size:10px;}
+    #eventsSection table td{font-size:11px;padding:7px 8px;}
+    .toggle-btn{margin-top:8px;}
+    #rawJson{display:none;margin-top:8px;font-size:11px;background:#f8fafc;border:1px solid var(--border);border-radius:7px;padding:10px;overflow:auto;max-height:400px;white-space:pre;font-family:monospace;}
+    .section-title{font-size:13px;font-weight:600;margin-bottom:8px;}
   </style>
 </head>
 <body>
+<div class="container">
+  <h1>&#x1F4B0; Cost Viewer</h1>
+
   <div class="panel">
-    <h2 style="margin:0 0 10px 0;">Cost Viewer</h2>
-    <div class="row">
-      <input id="fromDate" placeholder="from YYYY-MM-DD" />
-      <input id="toDate" placeholder="to YYYY-MM-DD" />
-      <input id="queryText" placeholder="job_id / 주제 검색" style="min-width:220px;" />
+    <div class="filter-row">
+      <label>From</label>
+      <input type="date" id="fromDate" />
+      <label>To</label>
+      <input type="date" id="toDate" />
+      <input type="text" id="queryText" placeholder="&#xC8FC;&#xC81C; / Job ID &#xAC80;&#xC0C9;" />
+      <select id="subjectTypeFilter">
+        <option value="all">&#xC804;&#xCCB4; &#xC720;&#xD615;</option>
+        <option value="job">Jobs</option>
+        <option value="operation">Operations</option>
+      </select>
       <select id="statusFilter">
-        <option value="">상태 전체</option>
+        <option value="">&#xC0C1;&#xD0DC; &#xC804;&#xCCB4;</option>
         <option value="PUBLISHED">PUBLISHED</option>
         <option value="WAITING_VIDEO_APPROVAL">WAITING_VIDEO_APPROVAL</option>
+        <option value="APPROVED">APPROVED</option>
         <option value="FAILED">FAILED</option>
       </select>
-      <button class="primary" id="searchBtn">조회</button>
-      <button id="exportRangeBtn">JSON Export(범위)</button>
+      <select id="pageSizeSelect">
+        <option value="25">25&#xAC1C;</option>
+        <option value="50" selected>50&#xAC1C;</option>
+        <option value="100">100&#xAC1C;</option>
+      </select>
+      <button class="primary" id="searchBtn">&#x1F50D; &#xC870;&#xD68C;</button>
+      <button id="exportRangeBtn">&#x2B07; JSON Export</button>
     </div>
-    <div class="row" style="margin-top:8px;">
-      <span id="summary" class="muted">-</span>
+    <div id="statusBar"></div>
+    <div class="summary-row">
+      <div class="card">
+        <div class="clabel">Main (&#xC2E4;&#xC81C;+&#xACE0;&#xC815;)</div>
+        <div class="cusd" id="mainCostUsd">$0.000000</div>
+        <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
+      </div>
+      <div class="card">
+        <div class="clabel">Estimated</div>
+        <div class="cusd" id="estimatedCostUsd">$0.000000</div>
+        <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
+      </div>
+      <div class="card">
+        <div class="clabel">Missing Events</div>
+        <div class="cusd" id="missingCount" style="color:var(--danger);">0</div>
+        <div class="ckrw">&#xBE44;&#xC6A9; &#xB204;&#xB77D; &#xAC74;</div>
+      </div>
+      <div class="card">
+        <div class="clabel">&#xC870;&#xD68C; &#xACB0;&#xACFC;</div>
+        <div class="cusd" id="rowCount">0&#xAC74;</div>
+        <div class="ckrw" id="totalCount">&#xC804;&#xCCB4; 0&#xAC74;</div>
+      </div>
     </div>
   </div>
+
   <div class="panel">
-    <table>
-      <thead>
-        <tr>
-          <th style="width:120px;">job_id</th>
-          <th style="width:220px;">topic</th>
-          <th style="width:120px;">status</th>
-          <th style="width:140px;">script(s/f)</th>
-          <th style="width:140px;">tts(s/f)</th>
-          <th style="width:140px;">video(s/f)</th>
-          <th style="width:120px;">USD</th>
-          <th style="width:120px;">KRW</th>
-          <th style="width:180px;">action</th>
-        </tr>
-      </thead>
-      <tbody id="rows"></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:70px;">&#xC720;&#xD615;</th>
+            <th style="width:88px;">Job ID</th>
+            <th>&#xC8FC;&#xC81C;</th>
+            <th style="width:120px;">&#xB2E8;&#xACC4;</th>
+            <th style="width:110px;">&#xC0C1;&#xD0DC;</th>
+            <th style="width:130px;">&#xBE44;&#xC6A9; Main</th>
+            <th style="width:130px;">Estimated</th>
+            <th style="width:108px;">&#xC0DD;&#xC131;&#xC77C; (KST)</th>
+            <th style="width:88px;">&#xC561;&#xC158;</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div class="pagination">
+      <span id="pageInfo" style="color:var(--muted);">-</span>
+      <div class="page-btns">
+        <button id="prevBtn" disabled>&#x2190; &#xC774;&#xC804;</button>
+        <button id="nextBtn" disabled>&#xB2E4;&#xC74C; &#x2192;</button>
+      </div>
+    </div>
   </div>
-  <div class="panel">
-    <h3 style="margin:0 0 8px 0;">Job Detail</h3>
-    <pre id="detailBox">job를 선택하면 상세 이벤트(JSON)가 표시됩니다.</pre>
+
+  <div class="panel" id="detailPanel">
+    <div class="detail-header">
+      <strong id="detailTitle" style="font-size:15px;"></strong>
+      <span class="did" id="detailId"></span>
+      <span id="detailStatus"></span>
+      <span style="color:var(--muted);font-size:11px;" id="detailDate"></span>
+    </div>
+    <div class="cost-summary" id="detailCostSummary"></div>
+    <div class="section-title">&#xBE0C;&#xB808;&#xC774;&#xD06C;&#xB2E4;&#xC6B4;</div>
+    <div class="breakdown-grid" id="detailBreakdown"></div>
+    <div id="eventsSection">
+      <h3>&#xC774;&#xBCA4;&#xD2B8; &#xD0C0;&#xC784;&#xB77C;&#xC778;</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:110px;">&#xC2DC;&#xAC01; (KST)</th>
+              <th style="width:70px;">Stage</th>
+              <th style="width:130px;">Process</th>
+              <th style="width:100px;">Provider</th>
+              <th style="width:80px;">Status</th>
+              <th style="width:80px;">Pricing</th>
+              <th style="width:100px;">USD</th>
+              <th style="width:90px;">KRW</th>
+              <th style="width:75px;">&#xC2DC;&#xAC04;</th>
+              <th>&#xC624;&#xB958;</th>
+            </tr>
+          </thead>
+          <tbody id="eventRows"></tbody>
+        </table>
+      </div>
+    </div>
+    <button class="sm toggle-btn" id="toggleRawBtn">{ } Raw JSON &#xBCF4;&#xAE30;</button>
+    <pre id="rawJson"></pre>
   </div>
-  <script>
-    async function fetchJson(url) {
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`HTTP ${resp.status}: ${text}`);
-      }
-      return await resp.json();
+</div>
+
+<script>
+  var apiBase = __API_BASE_PATH__;
+  var currentOffset = 0;
+  var currentTotal  = 0;
+
+  function pageSize() { return parseInt(document.getElementById("pageSizeSelect").value) || 50; }
+  function q(id) { return document.getElementById(id); }
+  function num(v) { var n = Number(v); return isNaN(n) ? 0 : n; }
+  function fmtUsd(v) { return "$" + num(v).toFixed(6); }
+  function fmtKrw(v) { return "\u20A9" + Math.round(num(v)).toLocaleString("ko-KR"); }
+  function shortText(v, max) { var s = String(v || ""); return s.length <= max ? s : s.slice(0, max - 1) + "\u2026"; }
+  function toKST(iso) {
+    if (!iso) return "\u2013";
+    try { return new Date(iso).toLocaleString("ko-KR", { timeZone:"Asia/Seoul", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false }); }
+    catch(e) { return String(iso).slice(0,16); }
+  }
+  function badge(text, cls) { return '<span class="badge ' + cls + '">' + text + '</span>'; }
+  function statusBadge(s) {
+    var u = String(s || "").toUpperCase();
+    if (!u) return "\u2013";
+    if (u === "PUBLISHED") return badge(u, "published");
+    if (u === "FAILED")    return badge(u, "failed");
+    return badge(u, "default");
+  }
+  function pricingBadge(pk) {
+    var p = String(pk || "").toLowerCase();
+    return ["actual","estimated","fixed","missing"].indexOf(p) >= 0 ? badge(p, p) : badge(p || "\u2013", "default");
+  }
+  function statusEvBadge(st) {
+    var s = String(st || "").toLowerCase();
+    if (s === "success") return badge("success", "success");
+    if (s === "failed")  return badge("failed",  "failed");
+    return badge(st || "\u2013", "default");
+  }
+  function durFmt(ms) {
+    var n = Number(ms);
+    if (!ms || isNaN(n)) return "\u2013";
+    if (n < 1000)  return n + "ms";
+    if (n < 60000) return (n / 1000).toFixed(1) + "s";
+    return Math.floor(n / 60000) + "m" + Math.round((n % 60000) / 1000) + "s";
+  }
+  function stageIcons(rec) {
+    function mark(s, f) {
+      if (num(s) > 0) return '<span class="mark ok">\u2713</span>';
+      if (num(f) > 0) return '<span class="mark fail">\u2717</span>';
+      return '<span class="mark skip">\u2013</span>';
     }
+    return '<div class="stage-row">'
+      + '<div class="si"><span class="ico">\uD83D\uDCDD</span>' + mark(rec.script_success, rec.script_failed) + '</div>'
+      + '<div class="si"><span class="ico">\uD83C\uDF99</span>' + mark(rec.tts_success,    rec.tts_failed)    + '</div>'
+      + '<div class="si"><span class="ico">\uD83C\uDFAC</span>' + mark(rec.video_success,  rec.video_failed)  + '</div>'
+      + '</div>';
+  }
 
-    function q(id) { return document.getElementById(id); }
-    function num(v) { return Number(v || 0); }
-    function usd(v) { return num(v).toFixed(6); }
-    function krw(v) { return Math.round(num(v)).toLocaleString(); }
+  async function fetchJson(url) {
+    var resp = await fetch(url);
+    if (!resp.ok) { var t = await resp.text(); throw new Error("HTTP " + resp.status + ": " + t.slice(0,200)); }
+    return resp.json();
+  }
+  function buildListUrl(offset) {
+    var p = new URLSearchParams();
+    var from = q("fromDate").value, to = q("toDate").value;
+    var qs = q("queryText").value.trim(), st = q("statusFilter").value.trim();
+    var stype = q("subjectTypeFilter").value.trim();
+    if (from)  p.set("from", from);
+    if (to)    p.set("to", to);
+    if (qs)    p.set("q", qs);
+    if (st)    p.set("status", st);
+    if (stype) p.set("subject_type", stype);
+    p.set("limit", pageSize()); p.set("offset", offset);
+    return apiBase + "/api/jobs?" + p.toString();
+  }
+  function buildExportUrl() {
+    var p = new URLSearchParams();
+    var from = q("fromDate").value, to = q("toDate").value;
+    var stype = q("subjectTypeFilter").value.trim();
+    if (from) p.set("from", from); if (to) p.set("to", to); if (stype) p.set("subject_type", stype);
+    return apiBase + "/api/export?" + p.toString();
+  }
 
-    function buildListUrl() {
-      const params = new URLSearchParams();
-      const from = q("fromDate").value.trim();
-      const to = q("toDate").value.trim();
-      const query = q("queryText").value.trim();
-      const status = q("statusFilter").value.trim();
-      if (from) params.set("from", from);
-      if (to) params.set("to", to);
-      if (query) params.set("q", query);
-      if (status) params.set("status", status);
-      params.set("limit", "100");
-      params.set("offset", "0");
-      return "/costs/api/jobs?" + params.toString();
-    }
-
-    function buildExportUrl() {
-      const params = new URLSearchParams();
-      const from = q("fromDate").value.trim();
-      const to = q("toDate").value.trim();
-      if (from) params.set("from", from);
-      if (to) params.set("to", to);
-      return "/costs/api/export?" + params.toString();
-    }
-
-    async function loadRows() {
+  async function loadRows(offset) {
+    q("statusBar").textContent = "\uC870\uD68C \uC911\u2026";
+    q("rows").innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
+    try {
+      var data = await fetchJson(buildListUrl(offset));
+      currentOffset = offset; currentTotal = num(data.total);
+      var items = Array.isArray(data.items) ? data.items : [];
+      var mu = 0, mk = 0, eu = 0, ek = 0, ms = 0;
       q("rows").innerHTML = "";
-      q("summary").textContent = "조회 중...";
-      const data = await fetchJson(buildListUrl());
-      const items = Array.isArray(data.items) ? data.items : [];
-      for (const rec of items) {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${String(rec.job_id || "").slice(0, 8)}</td>
-          <td>${String(rec.topic_text || "").slice(0, 120)}</td>
-          <td>${String(rec.status || "")}</td>
-          <td>${rec.script_success}/${rec.script_failed}</td>
-          <td>${rec.tts_success}/${rec.tts_failed}</td>
-          <td>${rec.video_success}/${rec.video_failed}</td>
-          <td>${usd(rec.total_cost_usd)}</td>
-          <td>${krw(rec.total_cost_krw)}</td>
-          <td></td>
-        `;
-        const actionTd = tr.children[8];
-        const detailBtn = document.createElement("button");
-        detailBtn.className = "primary";
-        detailBtn.textContent = "상세";
-        detailBtn.onclick = async () => {
-          const detail = await fetchJson(`/costs/api/jobs/${rec.job_id}`);
-          q("detailBox").textContent = JSON.stringify(detail, null, 2);
-        };
-        const exportBtn = document.createElement("button");
-        exportBtn.textContent = "JSON";
-        exportBtn.style.marginLeft = "6px";
-        exportBtn.onclick = () => {
-          window.open(`/costs/api/export?job_id=${encodeURIComponent(rec.job_id)}`, "_blank");
-        };
-        actionTd.appendChild(detailBtn);
-        actionTd.appendChild(exportBtn);
+      for (var i = 0; i < items.length; i++) {
+        var rec = items[i]; var byP = rec.by_pricing_kind || {};
+        var mainKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
+        var estKrw  = num((byP.estimated||{}).cost_krw);
+        mu += num(rec.main_cost_usd); mk += mainKrw;
+        eu += num(rec.estimated_cost_usd); ek += estKrw;
+        ms += num(rec.missing_cost_event_count);
+        var shortKey = String(rec.subject_key || rec.job_id || "").slice(0, 8);
+        var tr = document.createElement("tr");
+        tr.innerHTML =
+          '<td>' + badge(rec.subject_type || "job", rec.subject_type || "job") + '</td>'
+          + '<td><span class="mono" title="' + (rec.subject_key||"") + '">' + shortKey + '</span></td>'
+          + '<td>' + shortText(rec.subject_label || rec.topic_text || "", 60) + '</td>'
+          + '<td>' + stageIcons(rec) + '</td>'
+          + '<td>' + statusBadge(rec.status) + '</td>'
+          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.main_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(mainKrw) + '</div></td>'
+          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.estimated_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(estKrw) + '</div></td>'
+          + '<td style="color:var(--muted);">' + toKST(rec.created_at) + '</td>'
+          + '<td></td>';
+        (function(r, row) {
+          var td = row.cells[8];
+          var db = document.createElement("button"); db.className = "sm primary"; db.textContent = "\uC0C1\uC138";
+          db.onclick = function() { loadDetail(String(r.subject_key || r.job_id || "")); };
+          var eb = document.createElement("button"); eb.className = "sm"; eb.textContent = "JSON"; eb.style.marginLeft = "4px";
+          eb.onclick = function() { window.open(apiBase + "/api/export?job_id=" + encodeURIComponent(r.subject_key || r.job_id || ""), "_blank"); };
+          td.appendChild(db); td.appendChild(eb);
+        })(rec, tr);
         q("rows").appendChild(tr);
       }
-      q("summary").textContent = `total=${data.total} rows=${items.length}`;
+      q("mainCostUsd").textContent = fmtUsd(mu); q("mainCostKrw").textContent = fmtKrw(mk);
+      q("estimatedCostUsd").textContent = fmtUsd(eu); q("estimatedCostKrw").textContent = fmtKrw(ek);
+      q("missingCount").textContent = String(ms);
+      q("rowCount").textContent = items.length + "\uAC74";
+      q("totalCount").textContent = "\uC804\uCCB4 " + currentTotal + "\uAC74";
+      var ps = pageSize(), fr = currentOffset + 1, to2 = Math.min(currentOffset + items.length, currentTotal);
+      q("pageInfo").textContent = currentTotal > 0 ? fr + "\u2013" + to2 + " / \uC804\uCCB4 " + currentTotal + "\uAC74" : "\uACB0\uACFC \uC5C6\uC74C";
+      q("prevBtn").disabled = currentOffset <= 0;
+      q("nextBtn").disabled = (currentOffset + ps) >= currentTotal;
+      q("statusBar").textContent = "\uB9C8\uC9C0\uB9C9 \uC870\uD68C: " + new Date().toLocaleTimeString("ko-KR");
+    } catch(e) {
+      q("statusBar").textContent = "\uC624\uB958: " + e.message;
+      q("rows").innerHTML = '<tr><td colspan="9" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
     }
+  }
 
-    q("searchBtn").addEventListener("click", async () => {
-      try { await loadRows(); } catch (e) { q("summary").textContent = String(e); }
-    });
-    q("exportRangeBtn").addEventListener("click", () => window.open(buildExportUrl(), "_blank"));
-    loadRows().catch((e) => q("summary").textContent = String(e));
-  </script>
+  function renderBreakdown(title, obj) {
+    var entries = Object.entries(obj || {}).sort(function(a,b){ return num(b[1].cost_usd)-num(a[1].cost_usd); });
+    var rows = entries.length
+      ? entries.map(function(p){ return '<div class="bd-row"><span class="bd-key">' + shortText(p[0],30) + '</span><span class="bd-val">' + fmtUsd(p[1].cost_usd) + ' \u00B7 ' + p[1].count + '\uAC74</span></div>'; }).join("")
+      : '<div class="bd-row"><span class="bd-key" style="color:var(--muted);">\uC5C6\uC74C</span></div>';
+    return '<div class="bd-box"><h4>' + title + '</h4>' + rows + '</div>';
+  }
+
+  async function loadDetail(subjectKey) {
+    q("detailPanel").style.display = "block";
+    q("detailPanel").scrollIntoView({ behavior:"smooth", block:"start" });
+    q("detailTitle").textContent = "\uBD88\uB7EC\uC624\uB294 \uC911\u2026";
+    q("detailId").textContent    = subjectKey;
+    q("detailStatus").innerHTML  = ""; q("detailDate").textContent = "";
+    q("detailCostSummary").innerHTML = ""; q("detailBreakdown").innerHTML = "";
+    q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:16px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
+    q("rawJson").style.display = "none"; q("toggleRawBtn").textContent = "{ } Raw JSON \uBCF4\uAE30";
+    try {
+      var det = await fetchJson(apiBase + "/api/jobs/" + encodeURIComponent(subjectKey));
+      var sub = det.subject || {}, sum = det.summary || {};
+      var events = Array.isArray(det.events) ? det.events : [];
+      q("detailTitle").textContent = shortText(sub.subject_label || sub.topic_text || subjectKey, 70);
+      q("detailId").textContent    = subjectKey;
+      q("detailStatus").innerHTML  = statusBadge(sub.status);
+      q("detailDate").textContent  = toKST(sub.created_at);
+      var byP = sum.by_pricing_kind || {};
+      var mKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
+      q("detailCostSummary").innerHTML =
+          '<div class="cs-card"><div class="cs-label">Main (\uC2E4\uC81C+\uACE0\uC815)</div><div class="cs-val">'    + fmtUsd(sum.main_cost_usd)      + '</div><div class="cs-krw">' + fmtKrw(mKrw)                               + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">Actual</div><div class="cs-val">'                               + fmtUsd(sum.actual_cost_usd)    + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw)    + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">Fixed (\uC778\uD504\uB77C)</div><div class="cs-val">'          + fmtUsd(sum.fixed_cost_usd)     + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw)     + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">Estimated</div><div class="cs-val">'                            + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">Missing \uC774\uBCA4\uD2B8</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
+      q("detailBreakdown").innerHTML =
+          renderBreakdown("By Stage",          sum.by_stage)
+        + renderBreakdown("By Process",        sum.by_process)
+        + renderBreakdown("By Provider",       sum.by_provider)
+        + renderBreakdown("By API Key Family", sum.by_api_key_family)
+        + renderBreakdown("By Pricing Kind",   sum.by_pricing_kind);
+      if (!events.length) {
+        q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:12px;">\uC774\uBCA4\uD2B8 \uC5C6\uC74C</td></tr>';
+      } else {
+        var html = "";
+        for (var j = 0; j < events.length; j++) {
+          var ev = events[j];
+          html += '<tr>'
+            + '<td style="white-space:nowrap;">' + toKST(ev.created_at)                    + '</td>'
+            + '<td>' + String(ev.stage    || "") + '</td>'
+            + '<td>' + String(ev.process  || "") + '</td>'
+            + '<td>' + String(ev.provider || "") + '</td>'
+            + '<td>' + statusEvBadge(ev.status)  + '</td>'
+            + '<td>' + pricingBadge(ev.pricing_kind) + '</td>'
+            + '<td class="mono">' + (ev.cost_usd != null ? fmtUsd(ev.cost_usd) : "\u2013") + '</td>'
+            + '<td class="mono">' + (ev.cost_krw != null ? fmtKrw(ev.cost_krw) : "\u2013") + '</td>'
+            + '<td style="white-space:nowrap;">' + durFmt(ev.duration_ms) + '</td>'
+            + '<td style="color:var(--danger);max-width:200px;word-break:break-word;">' + shortText(String(ev.error_message||"").trim(), 80) + '</td>'
+            + '</tr>';
+        }
+        q("eventRows").innerHTML = html;
+      }
+      q("rawJson").textContent = JSON.stringify(det, null, 2);
+    } catch(e) { q("detailTitle").textContent = "\uC624\uB958: " + e.message; }
+  }
+
+  q("searchBtn").addEventListener("click",    function() { currentOffset = 0; loadRows(0).catch(function(e){ q("statusBar").textContent = String(e); }); });
+  q("prevBtn").addEventListener("click",      function() { loadRows(Math.max(0, currentOffset - pageSize())).catch(function(e){ q("statusBar").textContent = String(e); }); });
+  q("nextBtn").addEventListener("click",      function() { loadRows(currentOffset + pageSize()).catch(function(e){ q("statusBar").textContent = String(e); }); });
+  q("exportRangeBtn").addEventListener("click", function() { window.open(buildExportUrl(), "_blank"); });
+  q("toggleRawBtn").addEventListener("click", function() {
+    var el = q("rawJson"), vis = el.style.display !== "none";
+    el.style.display = vis ? "none" : "block";
+    q("toggleRawBtn").textContent = vis ? "{ } Raw JSON \uBCF4\uAE30" : "{ } Raw JSON \uC228\uAE30\uAE30";
+  });
+  loadRows(0).catch(function(e){ q("statusBar").textContent = String(e); });
+</script>
 </body>
-</html>"""
+</html>""".replace("__API_BASE_PATH__", safe_api_base_path)
 
 
 @app.get("/costs", response_class=HTMLResponse)
 async def costs_page(_: CostViewerAuthDep) -> HTMLResponse:
-    return HTMLResponse(_cost_viewer_html())
+    return HTMLResponse(_cost_viewer_html("/costs"))
 
 
 @app.get("/costs/api/jobs")
@@ -6525,27 +7148,24 @@ async def costs_jobs(
     to_date: str = Query("", alias="to"),
     q: str = Query("", alias="q"),
     status_filter: str = Query("", alias="status"),
+    subject_type: str = Query("all", alias="subject_type"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict:
-    resolved_limit = max(1, min(int(limit), int(settings.cost_max_list_limit)))
-    payload = await cost_service.list_jobs_summary(
-        from_date=_parse_ymd(from_date),
-        to_date=_parse_ymd(to_date),
+    return await _costs_jobs_payload(
+        from_date=from_date,
+        to_date=to_date,
         q=q,
-        status=status_filter,
-        limit=resolved_limit,
+        status_filter=status_filter,
+        subject_type=subject_type,
+        limit=limit,
         offset=offset,
     )
-    return payload
 
 
 @app.get("/costs/api/jobs/{job_id}")
 async def costs_job_detail(_: CostViewerAuthDep, job_id: str) -> dict:
-    try:
-        return await cost_service.get_job_detail(job_id)
-    except RuntimeError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    return await _costs_job_detail_payload(job_id)
 
 
 @app.get("/costs/api/export")
@@ -6554,16 +7174,65 @@ async def costs_export(
     job_id: str = Query(""),
     from_date: str = Query("", alias="from"),
     to_date: str = Query("", alias="to"),
+    subject_type: str = Query("all", alias="subject_type"),
 ) -> JSONResponse:
-    payload = await cost_service.export_payload(
-        job_id=job_id.strip(),
-        from_date=_parse_ymd(from_date),
-        to_date=_parse_ymd(to_date),
+    return await _costs_export_payload(
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+        subject_type=subject_type,
     )
-    filename = f"cost-export-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
-    return JSONResponse(
-        content=payload,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+
+
+@app.get("/cost/r/{token}/", response_class=HTMLResponse)
+async def costs_signed_page(token: str) -> HTMLResponse:
+    _verify_cost_viewer_signed_token(token)
+    return HTMLResponse(_cost_viewer_html(f"/cost/r/{token}"))
+
+
+@app.get("/cost/r/{token}/api/jobs")
+async def costs_signed_jobs(
+    token: str,
+    from_date: str = Query("", alias="from"),
+    to_date: str = Query("", alias="to"),
+    q: str = Query("", alias="q"),
+    status_filter: str = Query("", alias="status"),
+    subject_type: str = Query("all", alias="subject_type"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    _verify_cost_viewer_signed_token(token)
+    return await _costs_jobs_payload(
+        from_date=from_date,
+        to_date=to_date,
+        q=q,
+        status_filter=status_filter,
+        subject_type=subject_type,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/cost/r/{token}/api/jobs/{job_id}")
+async def costs_signed_job_detail(token: str, job_id: str) -> dict:
+    _verify_cost_viewer_signed_token(token)
+    return await _costs_job_detail_payload(job_id)
+
+
+@app.get("/cost/r/{token}/api/export")
+async def costs_signed_export(
+    token: str,
+    job_id: str = Query(""),
+    from_date: str = Query("", alias="from"),
+    to_date: str = Query("", alias="to"),
+    subject_type: str = Query("all", alias="subject_type"),
+) -> JSONResponse:
+    _verify_cost_viewer_signed_token(token)
+    return await _costs_export_payload(
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+        subject_type=subject_type,
     )
 
 

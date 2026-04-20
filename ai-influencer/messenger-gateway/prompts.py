@@ -179,11 +179,17 @@ def build_subtitle_retry_prompt(
     tts_script_text: str,
     previous_script_text: str,
     char_count: int,
+    validation_error: str = "",
 ) -> str:
     if char_count < 280:
         adjustment = f"자막 길이가 짧아졌다. 최소 {280 - char_count}자를 더 보존하라."
     elif char_count > 350:
         adjustment = f"자막 길이가 길어졌다. 최소 {char_count - 350}자를 줄이되 의미는 유지하라."
+    elif "caption sentence count mismatch" in validation_error:
+        adjustment = (
+            "고정 오프닝과 엔딩을 붙인 뒤에도 TTS용 대본과 자막용 대본의 문장 수가 정확히 같아야 한다. "
+            "문장을 합치거나 쪼개지 말고, TTS 문장 경계를 그대로 유지하라."
+        )
     else:
         adjustment = "길이는 맞지만 내용 보존 규칙을 어겼으니 수정하라."
     return (

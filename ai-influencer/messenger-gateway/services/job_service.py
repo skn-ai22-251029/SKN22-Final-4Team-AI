@@ -71,6 +71,12 @@ async def _ensure_schema(pool: asyncpg.Pool) -> None:
                 usage_json           JSONB NOT NULL DEFAULT '{}'::jsonb,
                 raw_response_json    JSONB NOT NULL DEFAULT '{}'::jsonb,
                 cost_usd             NUMERIC,
+                pricing_kind         TEXT NOT NULL DEFAULT '',
+                pricing_source       TEXT NOT NULL DEFAULT '',
+                api_key_family       TEXT NOT NULL DEFAULT '',
+                subject_type         TEXT NOT NULL DEFAULT '',
+                subject_key          TEXT NOT NULL DEFAULT '',
+                subject_label        TEXT NOT NULL DEFAULT '',
                 usd_krw_rate         NUMERIC,
                 cost_krw             NUMERIC,
                 error_type           TEXT,
@@ -81,9 +87,84 @@ async def _ensure_schema(pool: asyncpg.Pool) -> None:
             )
             """
         )
+        await conn.execute("ALTER TABLE cost_events ADD COLUMN IF NOT EXISTS pricing_kind TEXT NOT NULL DEFAULT ''")
+        await conn.execute("ALTER TABLE cost_events ADD COLUMN IF NOT EXISTS pricing_source TEXT NOT NULL DEFAULT ''")
+        await conn.execute("ALTER TABLE cost_events ADD COLUMN IF NOT EXISTS api_key_family TEXT NOT NULL DEFAULT ''")
+        await conn.execute("ALTER TABLE cost_events ADD COLUMN IF NOT EXISTS subject_type TEXT NOT NULL DEFAULT ''")
+        await conn.execute("ALTER TABLE cost_events ADD COLUMN IF NOT EXISTS subject_key TEXT NOT NULL DEFAULT ''")
+        await conn.execute("ALTER TABLE cost_events ADD COLUMN IF NOT EXISTS subject_label TEXT NOT NULL DEFAULT ''")
+        await conn.execute(
+            """
+            UPDATE cost_events
+            SET pricing_kind = CASE
+                WHEN COALESCE(pricing_kind, '') <> '' THEN pricing_kind
+                WHEN provider IN ('aws_fixed', 'runpod_fixed') OR process = 'daily_fixed_allocation' THEN 'fixed'
+                WHEN cost_usd IS NULL THEN 'missing'
+                ELSE 'estimated'
+            END
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE cost_events
+            SET pricing_source = CASE
+                WHEN COALESCE(pricing_source, '') <> '' THEN pricing_source
+                WHEN provider IN ('aws_fixed', 'runpod_fixed') OR process = 'daily_fixed_allocation' THEN 'fixed_allocation'
+                WHEN provider = 'heygen' AND cost_usd IS NOT NULL THEN 'config_fallback'
+                WHEN cost_usd IS NULL THEN 'unavailable'
+                ELSE 'legacy_backfill'
+            END
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE cost_events
+            SET api_key_family = CASE
+                WHEN COALESCE(api_key_family, '') <> '' THEN api_key_family
+                WHEN process IN ('tts_script_rewrite', 'subtitle_script_rewrite') THEN 'rewrite'
+                WHEN process = 'generate_tts_audio' THEN 'tts_generation'
+                WHEN process = 'heygen_generate' THEN 'heygen'
+                WHEN process = 'hardburn_subtitle' THEN 'hardburn_subtitle'
+                WHEN provider IN ('aws_fixed', 'runpod_fixed') OR process = 'daily_fixed_allocation' THEN 'infra_fixed'
+                ELSE provider
+            END
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE cost_events
+            SET subject_type = CASE
+                WHEN COALESCE(subject_type, '') <> '' THEN subject_type
+                WHEN job_id IS NULL THEN 'operation'
+                ELSE 'job'
+            END
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE cost_events
+            SET subject_key = CASE
+                WHEN COALESCE(subject_key, '') <> '' THEN subject_key
+                WHEN job_id IS NOT NULL THEN job_id::text
+                ELSE CONCAT('legacy:', process, ':', provider, ':', id::text)
+            END
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE cost_events
+            SET subject_label = CASE
+                WHEN COALESCE(subject_label, '') <> '' THEN subject_label
+                WHEN job_id IS NOT NULL THEN COALESCE(NULLIF(topic_text, ''), job_id::text)
+                ELSE CONCAT('legacy operation: ', process, ' / ', provider)
+            END
+            """
+        )
         await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_job_created_idx ON cost_events(job_id, created_at DESC)")
         await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_stage_status_created_idx ON cost_events(stage, status, created_at DESC)")
         await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_provider_created_idx ON cost_events(provider, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_subject_created_idx ON cost_events(subject_type, subject_key, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cost_events_api_family_created_idx ON cost_events(api_key_family, created_at DESC)")
         await conn.execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS heygen_avatar_id TEXT")
         await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS status TEXT")
         await conn.execute("ALTER TABLE platform_posts ADD COLUMN IF NOT EXISTS platform_post_url TEXT")

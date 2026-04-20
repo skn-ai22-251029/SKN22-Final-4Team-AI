@@ -26,6 +26,8 @@ from generate_report_cua import (
     _ensure_logged_in,
     _assert_allowed_url,
     _run_cua_loop,
+    emit_cost_tracking_summary,
+    set_cost_tracker_api_key_family,
 )
 from openai import OpenAI
 
@@ -370,6 +372,7 @@ def find_notebook_url_by_name_cua(page, client, channel_name: str) -> str:
 # ─────────────────────────────────────────
 
 def main():
+    set_cost_tracker_api_key_family("cua_manage_sources")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=["list", "add", "delete", "cleanup", "find"])
     parser.add_argument("--notebook-url", default="")
@@ -473,4 +476,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        emit_cost_tracking_summary()

@@ -11,7 +11,7 @@ TTS test script="./scripts/seed_lab_quickstart.sh"
 
 ```
 [Discord 사용자]
-      │  /report   /jobs   /tts   /seedlab
+      │  /report   /jobs   /tts   /seedlab   /cost
       ▼
 [discord-bot]  ──────────────────────────────────→  [messenger-gateway :8080]
                                                               │  /internal/*
@@ -237,6 +237,11 @@ flowchart TD
 - `job_id`는 전체 UUID/8자리 prefix/미입력 모두 허용
 - 미입력 시 현재 사용자+채널의 최근 `script_text` 보유 job 자동 선택
 - 실행 경로: `/internal/tts-generate` → WF-11
+
+### `/cost`
+
+- 실행 경로: `/internal/cost-viewer-link`
+- Discord ephemeral 응답으로 Cost Viewer signed link 반환
 
 ### `/heygen [job_id]`
 
@@ -791,7 +796,7 @@ TOPIC_CHANNELS=채널이름/채널ID+채널이름/채널ID+...
 - 채널ID: YouTube 채널 ID (UC로 시작하는 24자리)
 
 자동 보고서(auto-report) 경로에서는 `DISCORD_ALLOWED_CHANNEL_IDS`의 **첫 번째 채널 ID만** 전송 대상으로 사용합니다.  
-허용 채널 안에서는 특정 유저 제한 없이 팀원 누구나 `/report`, `/tts`, `/jobs`, `/seedlab` 및 승인 버튼을 사용할 수 있습니다.
+허용 채널 안에서는 특정 유저 제한 없이 팀원 누구나 `/report`, `/tts`, `/jobs`, `/seedlab`, `/cost` 및 승인 버튼을 사용할 수 있습니다.
 
 ### 6. 전체 서비스 빌드 및 기동
 
@@ -1076,6 +1081,7 @@ python register_command.py \
 | `POST` | `/internal/report-to-video` | discord-bot | 보고서 → 영상 제작 요청 |
 | `POST` | `/internal/tts-generate` | discord-bot | `/tts [job_id]` 수동 WF-11 실행 (미입력 시 최근 job 자동 선택) |
 | `POST` | `/internal/jobs` | discord-bot | `/jobs [purpose]` 최근 job 목록 조회 (`all/tts/heygen`) |
+| `POST` | `/internal/cost-viewer-link` | discord-bot | `/cost` signed Cost Viewer 링크 발급 |
 | `GET`  | `/health` | 모니터링 | 헬스체크 |
 
 ---
@@ -1321,6 +1327,8 @@ Discord 명령:
 | `SEEDLAB_SIGNING_SECRET` | gateway | signed link HMAC 서명 |
 | `SEEDLAB_LINK_TTL_SECONDS` | gateway | 링크 만료 시간 |
 | `SEEDLAB_PUBLIC_BASE_URL` | gateway | Discord에 전달할 외부 접속 베이스 URL |
+| `COST_VIEWER_PUBLIC_BASE_URL` | gateway | `/cost` signed link 외부 접속 베이스 URL. 비우면 `SEEDLAB_PUBLIC_BASE_URL` 사용 |
+| `COST_VIEWER_LINK_TTL_SECONDS` | gateway | `/cost` signed link 만료 시간 |
 | `SEEDLAB_GATEWAY_URL` | seed-lab-service | 진행률 push 대상 gateway 주소 |
 | `SEEDLAB_RUN_ROOT` | seed-lab-service | run 디렉터리 루트 |
 | `SEEDLAB_DEFAULT_DATASET` | seed-lab-service | 서버 기준 기본 dataset |
@@ -1589,6 +1597,15 @@ Import/Export 정책:
   - 실패 시 `사유`
 
 진행 메시지는 새 메시지를 계속 쌓지 않고 같은 메시지를 edit합니다.
+
+### Cost Viewer 운영 구조 (`/cost`)
+
+- Discord `/cost`
+  - discord-bot이 gateway의 `/internal/cost-viewer-link` 호출
+  - gateway가 signed 링크를 발급
+  - Discord ephemeral 응답으로 링크 전달
+- 사용자는 로그인 없이 signed 링크로 바로 Cost Viewer 진입
+- gateway의 direct `/costs` 경로는 기존 Basic Auth fallback/admin 용도로 유지
 
 ### 자동 수집 확인
 

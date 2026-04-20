@@ -31,6 +31,8 @@ from generate_report_cua import (
     _assert_allowed_url,
     _ensure_logged_in,
     _run_cua_loop,
+    emit_cost_tracking_summary,
+    set_cost_tracker_api_key_family,
 )
 from openai import OpenAI
 
@@ -170,6 +172,7 @@ def _build_openai_client() -> OpenAI:
 # ─────────────────────────────────────────
 
 def main():
+    set_cost_tracker_api_key_family("cua_create_notebook")
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", required=True, help="노트북 표시 이름 (예: '노마드코더 2025-03-18')")
     parser.add_argument("--channel-id", required=True, help="YouTube 채널 ID (예: 'UCUpJs89fSBXNolQGOYKn0YQ')")
@@ -208,4 +211,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        emit_cost_tracking_summary()

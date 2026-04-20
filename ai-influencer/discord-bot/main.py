@@ -476,6 +476,37 @@ async def seedlab_command(
         await _safe_reply(interaction, f"❌ /seedlab 실패: {_clip_text(str(e), 500)}", ephemeral=True)
 
 
+@bot.tree.command(name="cost", description="Cost Viewer signed 링크를 반환합니다")
+async def cost_command(interaction: discord.Interaction) -> None:
+    user_id = str(interaction.user.id)
+    logger.info("[/cost] invoked user=%s channel=%s", user_id, interaction.channel_id)
+
+    try:
+        if await _reject_if_channel_disallowed(interaction):
+            return
+
+        await _safe_defer(interaction, ephemeral=True)
+        result = await gateway_call(
+            "/internal/cost-viewer-link",
+            {
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+            },
+        )
+        await _safe_reply(
+            interaction,
+            _clip_text(
+                "💰 Cost Viewer 링크 생성 완료\n"
+                f"link: {str(result.get('cost_viewer_url') or '')}\n"
+                f"expires_at: {str(result.get('expires_at') or '')}"
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.exception("[/cost] failed user=%s channel=%s", user_id, interaction.channel_id)
+        await _safe_reply(interaction, f"❌ /cost 실패: {_clip_text(str(e), 500)}", ephemeral=True)
+
+
 @bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
 async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)

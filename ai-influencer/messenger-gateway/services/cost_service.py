@@ -7,6 +7,8 @@ from services import job_service
 
 
 KST = timezone(timedelta(hours=9))
+PRICING_KINDS = {"actual", "estimated", "fixed", "missing"}
+SUBJECT_TYPES = {"job", "operation"}
 
 
 def _to_json(value: Any) -> str:
@@ -35,9 +37,149 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _normalize_pricing_kind(
+    pricing_kind: str,
+    *,
+    pricing_source: str,
+    provider: str,
+    process: str,
+    cost_usd: Optional[float],
+) -> str:
+    normalized = str(pricing_kind or "").strip().lower()
+    if normalized in PRICING_KINDS:
+        return normalized
+    if provider in {"aws_fixed", "runpod_fixed"} or process == "daily_fixed_allocation":
+        return "fixed"
+    if str(pricing_source or "").strip().lower() == "provider_actual":
+        return "actual"
+    if cost_usd is None:
+        return "missing"
+    return "estimated"
+
+
+def _normalize_pricing_source(pricing_source: str, *, pricing_kind: str, provider: str, process: str) -> str:
+    normalized = str(pricing_source or "").strip().lower()
+    if normalized:
+        return normalized
+    if pricing_kind == "fixed" or provider in {"aws_fixed", "runpod_fixed"} or process == "daily_fixed_allocation":
+        return "fixed_allocation"
+    if pricing_kind == "actual":
+        return "provider_actual"
+    if pricing_kind == "estimated":
+        return "provider_usage_estimate"
+    return "unavailable"
+
+
+def _normalize_api_key_family(api_key_family: str, *, process: str, provider: str) -> str:
+    normalized = str(api_key_family or "").strip()
+    if normalized:
+        return normalized
+    if process in {"tts_script_rewrite", "subtitle_script_rewrite"}:
+        return "rewrite"
+    if process == "generate_tts_audio":
+        return "tts_generation"
+    if process == "heygen_generate":
+        return "heygen"
+    if process == "hardburn_subtitle":
+        return "hardburn_subtitle"
+    if provider in {"aws_fixed", "runpod_fixed"} or process == "daily_fixed_allocation":
+        return "infra_fixed"
+    return str(provider or "unknown").strip() or "unknown"
+
+
+def _normalize_subject_type(subject_type: str, *, job_id: str) -> str:
+    normalized = str(subject_type or "").strip().lower()
+    if normalized in SUBJECT_TYPES:
+        return normalized
+    return "job" if str(job_id or "").strip() else "operation"
+
+
+def _normalize_subject_key(subject_key: str, *, subject_type: str, job_id: str, process: str, provider: str) -> str:
+    normalized = str(subject_key or "").strip()
+    if normalized:
+        return normalized
+    if subject_type == "job" and str(job_id or "").strip():
+        return str(job_id).strip()
+    return f"operation:{process or 'unknown'}:{provider or 'unknown'}"
+
+
+def _normalize_subject_label(
+    subject_label: str,
+    *,
+    subject_type: str,
+    topic_text: str,
+    subject_key: str,
+    process: str,
+    provider: str,
+) -> str:
+    normalized = str(subject_label or "").strip()
+    if normalized:
+        return normalized
+    if subject_type == "job":
+        topic = str(topic_text or "").strip()
+        return topic or subject_key
+    return f"{process or 'operation'} / {provider or 'unknown'}"
+
+
+def _kst_day_range(target_date: date) -> tuple[datetime, datetime]:
+    start_kst = datetime.combine(target_date, time(0, 0, 0), tzinfo=KST)
+    end_kst = start_kst + timedelta(days=1)
+    return start_kst.astimezone(timezone.utc), end_kst.astimezone(timezone.utc)
+
+
+def _bucket_add(bucket: dict[str, dict[str, float | int]], key: str, cost_usd: Optional[float], cost_krw: Optional[float]) -> None:
+    if not key:
+        key = "(empty)"
+    item = bucket.setdefault(key, {"cost_usd": 0.0, "cost_krw": 0.0, "count": 0})
+    item["count"] = int(item.get("count") or 0) + 1
+    item["cost_usd"] = round(float(item.get("cost_usd") or 0.0) + float(cost_usd or 0.0), 6)
+    item["cost_krw"] = round(float(item.get("cost_krw") or 0.0) + float(cost_krw or 0.0), 3)
+
+
+def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {
+        "total_events": len(events),
+        "total_cost_usd": 0.0,
+        "total_cost_krw": 0.0,
+        "actual_cost_usd": 0.0,
+        "estimated_cost_usd": 0.0,
+        "fixed_cost_usd": 0.0,
+        "missing_cost_event_count": 0,
+        "main_cost_usd": 0.0,
+        "by_stage": {},
+        "by_process": {},
+        "by_provider": {},
+        "by_api_key_family": {},
+        "by_subject_type": {},
+        "by_pricing_kind": {},
+    }
+    for event in events:
+        cost_usd = _safe_float(event.get("cost_usd")) or 0.0
+        cost_krw = _safe_float(event.get("cost_krw")) or 0.0
+        pricing_kind = str(event.get("pricing_kind") or "").strip().lower() or "missing"
+        summary["total_cost_usd"] = round(float(summary["total_cost_usd"]) + cost_usd, 6)
+        summary["total_cost_krw"] = round(float(summary["total_cost_krw"]) + cost_krw, 3)
+        if pricing_kind == "actual":
+            summary["actual_cost_usd"] = round(float(summary["actual_cost_usd"]) + cost_usd, 6)
+        elif pricing_kind == "estimated":
+            summary["estimated_cost_usd"] = round(float(summary["estimated_cost_usd"]) + cost_usd, 6)
+        elif pricing_kind == "fixed":
+            summary["fixed_cost_usd"] = round(float(summary["fixed_cost_usd"]) + cost_usd, 6)
+        else:
+            summary["missing_cost_event_count"] = int(summary["missing_cost_event_count"]) + 1
+        _bucket_add(summary["by_stage"], str(event.get("stage") or "").strip(), cost_usd, cost_krw)
+        _bucket_add(summary["by_process"], str(event.get("process") or "").strip(), cost_usd, cost_krw)
+        _bucket_add(summary["by_provider"], str(event.get("provider") or "").strip(), cost_usd, cost_krw)
+        _bucket_add(summary["by_api_key_family"], str(event.get("api_key_family") or "").strip(), cost_usd, cost_krw)
+        _bucket_add(summary["by_subject_type"], str(event.get("subject_type") or "").strip(), cost_usd, cost_krw)
+        _bucket_add(summary["by_pricing_kind"], pricing_kind, cost_usd, cost_krw)
+    summary["main_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(summary["fixed_cost_usd"]), 6)
+    return summary
+
+
 async def record_event(
     *,
-    job_id: str,
+    job_id: str = "",
     topic_text: str = "",
     stage: str,
     process: str,
@@ -49,6 +191,12 @@ async def record_event(
     usage_json: Optional[dict[str, Any]] = None,
     raw_response_json: Optional[dict[str, Any]] = None,
     cost_usd: Optional[float] = None,
+    pricing_kind: str = "",
+    pricing_source: str = "",
+    api_key_family: str = "",
+    subject_type: str = "",
+    subject_key: str = "",
+    subject_label: str = "",
     error_type: str = "",
     error_message: str = "",
     idempotency_key: str = "",
@@ -57,24 +205,59 @@ async def record_event(
     started = _coerce_dt(started_at)
     ended = _coerce_dt(ended_at)
     duration_ms = int(max(0.0, (ended - started).total_seconds()) * 1000)
-    rate = float(settings.cost_usd_krw_rate)
+    normalized_job_id = str(job_id or "").strip()
     normalized_cost = _safe_float(cost_usd)
+    normalized_pricing_kind = _normalize_pricing_kind(
+        pricing_kind,
+        pricing_source=pricing_source,
+        provider=provider,
+        process=process,
+        cost_usd=normalized_cost,
+    )
+    normalized_pricing_source = _normalize_pricing_source(
+        pricing_source,
+        pricing_kind=normalized_pricing_kind,
+        provider=provider,
+        process=process,
+    )
+    normalized_api_key_family = _normalize_api_key_family(api_key_family, process=process, provider=provider)
+    normalized_subject_type = _normalize_subject_type(subject_type, job_id=normalized_job_id)
+    normalized_subject_key = _normalize_subject_key(
+        subject_key,
+        subject_type=normalized_subject_type,
+        job_id=normalized_job_id,
+        process=process,
+        provider=provider,
+    )
+    normalized_subject_label = _normalize_subject_label(
+        subject_label,
+        subject_type=normalized_subject_type,
+        topic_text=topic_text,
+        subject_key=normalized_subject_key,
+        process=process,
+        provider=provider,
+    )
+    rate = float(settings.cost_usd_krw_rate)
     async with pool.acquire() as conn:
         result = await conn.execute(
             """
             INSERT INTO cost_events (
                 job_id, topic_text, stage, process, provider, attempt_no, status,
                 started_at, ended_at, duration_ms, usage_json, raw_response_json,
-                cost_usd, usd_krw_rate, cost_krw, error_type, error_message, idempotency_key
+                cost_usd, pricing_kind, pricing_source, api_key_family,
+                subject_type, subject_key, subject_label,
+                usd_krw_rate, cost_krw, error_type, error_message, idempotency_key
             ) VALUES (
-                $1::uuid, $2, $3, $4, $5, $6, $7,
+                NULLIF($1, '')::uuid, $2, $3, $4, $5, $6, $7,
                 $8, $9, $10, $11::jsonb, $12::jsonb,
-                $13, $14, $15, $16, $17, $18
+                $13, $14, $15, $16,
+                $17, $18, $19,
+                $20, $21, $22, $23, $24
             )
             ON CONFLICT (idempotency_key)
             DO NOTHING
             """,
-            job_id,
+            normalized_job_id,
             (topic_text or "").strip(),
             stage,
             process,
@@ -87,6 +270,12 @@ async def record_event(
             _to_json(usage_json),
             _to_json(raw_response_json),
             normalized_cost,
+            normalized_pricing_kind,
+            normalized_pricing_source,
+            normalized_api_key_family,
+            normalized_subject_type,
+            normalized_subject_key,
+            normalized_subject_label[:500],
             rate,
             _cost_krw(normalized_cost),
             (error_type or "").strip(),
@@ -110,16 +299,16 @@ async def ingest_event(payload: dict[str, Any]) -> bool:
         usage_json=payload.get("usage_json") if isinstance(payload.get("usage_json"), dict) else {},
         raw_response_json=payload.get("raw_response_json") if isinstance(payload.get("raw_response_json"), dict) else {},
         cost_usd=_safe_float(payload.get("cost_usd")),
+        pricing_kind=str(payload.get("pricing_kind") or "").strip(),
+        pricing_source=str(payload.get("pricing_source") or "").strip(),
+        api_key_family=str(payload.get("api_key_family") or "").strip(),
+        subject_type=str(payload.get("subject_type") or "").strip(),
+        subject_key=str(payload.get("subject_key") or "").strip(),
+        subject_label=str(payload.get("subject_label") or "").strip(),
         error_type=str(payload.get("error_type") or "").strip(),
         error_message=str(payload.get("error_message") or "").strip(),
         idempotency_key=str(payload.get("idempotency_key") or "").strip(),
     )
-
-
-def _kst_day_range(target_date: date) -> tuple[datetime, datetime]:
-    start_kst = datetime.combine(target_date, time(0, 0, 0), tzinfo=KST)
-    end_kst = start_kst + timedelta(days=1)
-    return start_kst.astimezone(timezone.utc), end_kst.astimezone(timezone.utc)
 
 
 async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
@@ -134,6 +323,7 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
             FROM cost_events
             WHERE stage='video'
               AND status='success'
+              AND job_id IS NOT NULL
               AND created_at >= $1
               AND created_at < $2
             ORDER BY job_id
@@ -176,6 +366,9 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
                 provider="aws_fixed",
                 status="success",
                 cost_usd=(aws_fixed / eligible_count) if eligible_count > 0 else 0.0,
+                pricing_kind="fixed",
+                pricing_source="fixed_allocation",
+                api_key_family="infra_fixed",
                 usage_json={"cost_date_kst": target_date.isoformat()},
                 raw_response_json={"allocation_method": "daily_even_split"},
                 idempotency_key=f"infra:aws:{target_date.isoformat()}:{job_id}",
@@ -188,6 +381,9 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
                 provider="runpod_fixed",
                 status="success",
                 cost_usd=(runpod_fixed / eligible_count) if eligible_count > 0 else 0.0,
+                pricing_kind="fixed",
+                pricing_source="fixed_allocation",
+                api_key_family="infra_fixed",
                 usage_json={"cost_date_kst": target_date.isoformat()},
                 raw_response_json={"allocation_method": "daily_even_split"},
                 idempotency_key=f"infra:runpod:{target_date.isoformat()}:{job_id}",
@@ -201,6 +397,55 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
     }
 
 
+async def _fetch_subject_events(
+    conn: Any,
+    *,
+    subject_type: str,
+    subject_keys: list[str],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    if not subject_keys:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT
+          id::text AS event_id,
+          COALESCE(job_id::text, '') AS job_id,
+          stage,
+          process,
+          provider,
+          attempt_no,
+          status,
+          started_at,
+          ended_at,
+          duration_ms,
+          usage_json,
+          raw_response_json,
+          cost_usd,
+          pricing_kind,
+          pricing_source,
+          api_key_family,
+          subject_type,
+          subject_key,
+          subject_label,
+          cost_krw,
+          error_type,
+          error_message,
+          created_at
+        FROM cost_events
+        WHERE subject_type = $1
+          AND subject_key = ANY($2::text[])
+        ORDER BY created_at ASC
+        """,
+        subject_type,
+        subject_keys,
+    )
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        record = dict(row)
+        grouped.setdefault((str(record.get("subject_type") or ""), str(record.get("subject_key") or "")), []).append(record)
+    return grouped
+
+
 async def list_jobs_summary(
     *,
     from_date: Optional[date],
@@ -209,94 +454,191 @@ async def list_jobs_summary(
     status: str,
     limit: int,
     offset: int,
+    subject_type: str = "all",
 ) -> dict[str, Any]:
     pool = await job_service.get_db_pool()
-    where = []
-    params: list[Any] = []
-    if from_date:
-        start_utc, _ = _kst_day_range(from_date)
-        params.append(start_utc)
-        where.append(f"j.created_at >= ${len(params)}")
-    if to_date:
-        _, end_utc = _kst_day_range(to_date)
-        params.append(end_utc)
-        where.append(f"j.created_at < ${len(params)}")
-    if q.strip():
-        params.append(f"%{q.strip()}%")
-        where.append(f"(j.id::text ILIKE ${len(params)} OR COALESCE(j.concept_text,'') ILIKE ${len(params)})")
-    if status.strip():
-        params.append(status.strip())
-        where.append(f"j.status = ${len(params)}")
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    params.extend([max(1, limit), max(0, offset)])
+    normalized_subject_type = (subject_type or "all").strip().lower()
+    include_jobs = normalized_subject_type in {"all", "job"}
+    include_operations = normalized_subject_type in {"all", "operation"}
+    search = (q or "").strip()
+    max_fetch = max(1, int(limit)) + max(0, int(offset))
+    items: list[dict[str, Any]] = []
+    total_jobs = 0
+    total_operations = 0
+
     async with pool.acquire() as conn:
-        count_row = await conn.fetchrow(
-            f"SELECT COUNT(*)::int AS cnt FROM jobs j {where_sql}",
-            *params[:-2],
+        if include_jobs:
+            where = []
+            params: list[Any] = []
+            if from_date:
+                start_utc, _ = _kst_day_range(from_date)
+                params.append(start_utc)
+                where.append(f"j.created_at >= ${len(params)}")
+            if to_date:
+                _, end_utc = _kst_day_range(to_date)
+                params.append(end_utc)
+                where.append(f"j.created_at < ${len(params)}")
+            if search:
+                params.append(f"%{search}%")
+                where.append(f"(j.id::text ILIKE ${len(params)} OR COALESCE(j.concept_text,'') ILIKE ${len(params)})")
+            if status.strip():
+                params.append(status.strip())
+                where.append(f"j.status = ${len(params)}")
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            count_row = await conn.fetchrow(f"SELECT COUNT(*)::int AS cnt FROM jobs j {where_sql}", *params)
+            total_jobs = int(count_row["cnt"] if count_row else 0)
+            params.append(max_fetch)
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                  'job' AS subject_type,
+                  j.id::text AS subject_key,
+                  COALESCE(j.concept_text, '') AS subject_label,
+                  j.id::text AS job_id,
+                  COALESCE(j.concept_text, '') AS topic_text,
+                  j.status,
+                  j.created_at,
+                  j.updated_at
+                FROM jobs j
+                {where_sql}
+                ORDER BY j.created_at DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+            items.extend(dict(row) for row in rows)
+
+        if include_operations:
+            where = ["subject_type = 'operation'"]
+            params = []
+            if from_date:
+                start_utc, _ = _kst_day_range(from_date)
+                params.append(start_utc)
+                where.append(f"created_at >= ${len(params)}")
+            if to_date:
+                _, end_utc = _kst_day_range(to_date)
+                params.append(end_utc)
+                where.append(f"created_at < ${len(params)}")
+            if search:
+                params.append(f"%{search}%")
+                where.append(
+                    f"(subject_key ILIKE ${len(params)} OR COALESCE(subject_label,'') ILIKE ${len(params)} OR COALESCE(topic_text,'') ILIKE ${len(params)})"
+                )
+            where_sql = "WHERE " + " AND ".join(where)
+            count_row = await conn.fetchrow(
+                f"SELECT COUNT(DISTINCT subject_key)::int AS cnt FROM cost_events {where_sql}",
+                *params,
+            )
+            total_operations = int(count_row["cnt"] if count_row else 0)
+            params.append(max_fetch)
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                  'operation' AS subject_type,
+                  subject_key,
+                  COALESCE(MAX(NULLIF(subject_label, '')), MAX(NULLIF(topic_text, '')), subject_key) AS subject_label,
+                  '' AS job_id,
+                  COALESCE(MAX(NULLIF(topic_text, '')), MAX(NULLIF(subject_label, '')), subject_key) AS topic_text,
+                  '' AS status,
+                  MAX(created_at) AS created_at,
+                  MAX(created_at) AS updated_at
+                FROM cost_events
+                {where_sql}
+                GROUP BY subject_key
+                ORDER BY MAX(created_at) DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+            items.extend(dict(row) for row in rows)
+
+        items.sort(key=lambda item: item.get("created_at") or datetime.fromtimestamp(0, timezone.utc), reverse=True)
+        selected = items[offset : offset + max(1, int(limit))]
+        job_keys = [str(item["subject_key"]) for item in selected if item.get("subject_type") == "job"]
+        operation_keys = [str(item["subject_key"]) for item in selected if item.get("subject_type") == "operation"]
+        event_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        event_map.update(await _fetch_subject_events(conn, subject_type="job", subject_keys=job_keys))
+        event_map.update(await _fetch_subject_events(conn, subject_type="operation", subject_keys=operation_keys))
+
+    enriched: list[dict[str, Any]] = []
+    for item in selected:
+        subject_key = str(item.get("subject_key") or "")
+        subject_type_value = str(item.get("subject_type") or "")
+        events = event_map.get((subject_type_value, subject_key), [])
+        summary = _summarize_events(events)
+        stage_counts = {
+            "script_success": sum(1 for event in events if event.get("stage") == "script" and event.get("status") == "success"),
+            "script_failed": sum(1 for event in events if event.get("stage") == "script" and event.get("status") == "failed"),
+            "tts_success": sum(1 for event in events if event.get("stage") == "tts" and event.get("status") == "success"),
+            "tts_failed": sum(1 for event in events if event.get("stage") == "tts" and event.get("status") == "failed"),
+            "video_success": sum(1 for event in events if event.get("stage") == "video" and event.get("status") == "success"),
+            "video_failed": sum(1 for event in events if event.get("stage") == "video" and event.get("status") == "failed"),
+        }
+        enriched.append(
+            {
+                **item,
+                **stage_counts,
+                **summary,
+            }
         )
-        rows = await conn.fetch(
-            f"""
-            SELECT
-              j.id::text AS job_id,
-              COALESCE(j.concept_text, '') AS topic_text,
-              j.status,
-              j.created_at,
-              j.updated_at,
-              COALESCE(a.total_cost_usd, 0) AS total_cost_usd,
-              COALESCE(a.total_cost_krw, 0) AS total_cost_krw,
-              COALESCE(a.script_success, 0) AS script_success,
-              COALESCE(a.script_failed, 0) AS script_failed,
-              COALESCE(a.tts_success, 0) AS tts_success,
-              COALESCE(a.tts_failed, 0) AS tts_failed,
-              COALESCE(a.video_success, 0) AS video_success,
-              COALESCE(a.video_failed, 0) AS video_failed
-            FROM jobs j
-            LEFT JOIN (
-              SELECT
-                job_id,
-                SUM(COALESCE(cost_usd, 0)) AS total_cost_usd,
-                SUM(COALESCE(cost_krw, 0)) AS total_cost_krw,
-                COUNT(*) FILTER (WHERE stage='script' AND status='success') AS script_success,
-                COUNT(*) FILTER (WHERE stage='script' AND status='failed') AS script_failed,
-                COUNT(*) FILTER (WHERE stage='tts' AND status='success') AS tts_success,
-                COUNT(*) FILTER (WHERE stage='tts' AND status='failed') AS tts_failed,
-                COUNT(*) FILTER (WHERE stage='video' AND status='success') AS video_success,
-                COUNT(*) FILTER (WHERE stage='video' AND status='failed') AS video_failed
-              FROM cost_events
-              GROUP BY job_id
-            ) a ON a.job_id = j.id
-            {where_sql}
-            ORDER BY j.created_at DESC
-            LIMIT ${len(params)-1} OFFSET ${len(params)}
-            """,
-            *params,
-        )
+
     return {
-        "total": int(count_row["cnt"] if count_row else 0),
-        "limit": max(1, limit),
-        "offset": max(0, offset),
-        "items": [dict(row) for row in rows],
+        "total": total_jobs + total_operations,
+        "limit": max(1, int(limit)),
+        "offset": max(0, int(offset)),
+        "subject_type": normalized_subject_type,
+        "items": enriched,
     }
 
 
-async def get_job_detail(job_id: str) -> dict[str, Any]:
+async def get_job_detail(subject_key: str) -> dict[str, Any]:
     pool = await job_service.get_db_pool()
     async with pool.acquire() as conn:
         job = await conn.fetchrow(
             """
-            SELECT id::text AS job_id, status, COALESCE(concept_text,'') AS topic_text, created_at, updated_at
+            SELECT
+              'job' AS subject_type,
+              id::text AS subject_key,
+              COALESCE(concept_text, '') AS subject_label,
+              id::text AS job_id,
+              status,
+              COALESCE(concept_text, '') AS topic_text,
+              created_at,
+              updated_at
             FROM jobs
             WHERE id::text = $1
             """,
-            job_id,
+            subject_key,
         )
+        subject_row = job
         if job is None:
-            raise RuntimeError("job not found")
+            subject_row = await conn.fetchrow(
+                """
+                SELECT
+                  'operation' AS subject_type,
+                  subject_key,
+                  COALESCE(MAX(NULLIF(subject_label, '')), MAX(NULLIF(topic_text, '')), subject_key) AS subject_label,
+                  '' AS job_id,
+                  '' AS status,
+                  COALESCE(MAX(NULLIF(topic_text, '')), MAX(NULLIF(subject_label, '')), subject_key) AS topic_text,
+                  MIN(created_at) AS created_at,
+                  MAX(created_at) AS updated_at
+                FROM cost_events
+                WHERE subject_type = 'operation'
+                  AND subject_key = $1
+                GROUP BY subject_key
+                """,
+                subject_key,
+            )
+        if subject_row is None:
+            raise RuntimeError("subject not found")
+        subject_dict = dict(subject_row)
+        subject_type_value = str(subject_dict.get("subject_type") or "")
         events = await conn.fetch(
             """
             SELECT
               id::text AS event_id,
-              job_id::text AS job_id,
+              COALESCE(job_id::text, '') AS job_id,
               stage,
               process,
               provider,
@@ -308,36 +650,45 @@ async def get_job_detail(job_id: str) -> dict[str, Any]:
               usage_json,
               raw_response_json,
               cost_usd,
+              pricing_kind,
+              pricing_source,
+              api_key_family,
+              subject_type,
+              subject_key,
+              subject_label,
               cost_krw,
               error_type,
               error_message,
               created_at
             FROM cost_events
-            WHERE job_id::text = $1
+            WHERE subject_type = $1
+              AND subject_key = $2
             ORDER BY created_at ASC
             """,
-            job_id,
+            subject_type_value,
+            subject_key,
         )
-    total_cost_usd = sum(float(event["cost_usd"] or 0) for event in events)
-    total_cost_krw = sum(float(event["cost_krw"] or 0) for event in events)
+    event_dicts = [dict(event) for event in events]
     return {
-        "job": dict(job),
-        "summary": {
-            "total_events": len(events),
-            "total_cost_usd": total_cost_usd,
-            "total_cost_krw": total_cost_krw,
-        },
-        "events": [dict(event) for event in events],
+        "subject": subject_dict,
+        "summary": _summarize_events(event_dicts),
+        "events": event_dicts,
     }
 
 
-async def export_payload(*, job_id: str = "", from_date: Optional[date] = None, to_date: Optional[date] = None) -> dict[str, Any]:
+async def export_payload(
+    *,
+    job_id: str = "",
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    subject_type: str = "all",
+) -> dict[str, Any]:
     if job_id.strip():
         detail = await get_job_detail(job_id.strip())
         return {
             "meta": {
-                "mode": "job",
-                "job_id": job_id.strip(),
+                "mode": "subject",
+                "subject_key": job_id.strip(),
                 "exported_at": datetime.now(timezone.utc).isoformat(),
                 "usd_krw_rate": settings.cost_usd_krw_rate,
             },
@@ -350,12 +701,14 @@ async def export_payload(*, job_id: str = "", from_date: Optional[date] = None, 
         status="",
         limit=max(settings.cost_max_list_limit, 5000),
         offset=0,
+        subject_type=subject_type,
     )
     return {
         "meta": {
             "mode": "range",
             "from_date": from_date.isoformat() if from_date else "",
             "to_date": to_date.isoformat() if to_date else "",
+            "subject_type": subject_type,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "usd_krw_rate": settings.cost_usd_krw_rate,
         },

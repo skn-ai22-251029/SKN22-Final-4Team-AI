@@ -34,6 +34,7 @@ from seed_lab import (  # type: ignore
     LIVE_RECORDS_JSONL,
     _auto_eval_single_record,
     _build_run_id,
+    _empty_eval,
     _expand_seed_list_with_random,
     _generate_review_html,
     _load_human_eval_map,
@@ -94,6 +95,9 @@ class Settings(BaseSettings):
     seedlab_sample_s3_bucket: str = ""
     seedlab_sample_s3_prefix: str = "seed-lab-samples"
     seedlab_sample_s3_region: str = "ap-northeast-2"
+    seedlab_asr_cost_usd_per_minute: float = 0.0
+    seedlab_judge_input_cost_usd_per_1m: float = 0.0
+    seedlab_judge_output_cost_usd_per_1m: float = 0.0
 
     class Config:
         env_file = ".env"
@@ -168,8 +172,15 @@ def _meta_from_state(state: dict[str, Any]) -> dict[str, Any]:
         "retries": int(state.get("retries") or 2),
         "ready_count": int(state.get("ready_count") or 0),
         "failed_count": int(state.get("failed_count") or 0),
+        "eval_failed_count": int(state.get("eval_failed_count") or 0),
         "network_fail_count": int(state.get("network_fail_count") or 0),
         "http_502_count": int(state.get("http_502_count") or 0),
+        "runpod_job_count": int(state.get("runpod_job_count") or 0),
+        "gpu_active_sample_count": int(state.get("gpu_active_sample_count") or 0),
+        "remote_eval_failed_count": int(state.get("remote_eval_failed_count") or 0),
+        "remote_eval_last_error": str(state.get("remote_eval_last_error") or ""),
+        "eval_executor_counts": dict(state.get("eval_executor_counts") or {}),
+        "avg_stage_timings_ms": dict(state.get("avg_stage_timings_ms") or {}),
     }
 
 
@@ -207,7 +218,14 @@ async def _notify_gateway_progress(state: dict[str, Any]) -> None:
         "evaluated_count": int(state.get("evaluated_count") or 0),
         "ready_count": int(state.get("ready_count") or 0),
         "failed_count": int(state.get("failed_count") or 0),
+        "eval_failed_count": int(state.get("eval_failed_count") or 0),
         "total_count": int(state.get("total_count") or 0),
+        "runpod_job_count": int(state.get("runpod_job_count") or 0),
+        "gpu_active_sample_count": int(state.get("gpu_active_sample_count") or 0),
+        "remote_eval_failed_count": int(state.get("remote_eval_failed_count") or 0),
+        "remote_eval_last_error": str(state.get("remote_eval_last_error") or ""),
+        "eval_executor_counts": dict(state.get("eval_executor_counts") or {}),
+        "avg_stage_timings_ms": dict(state.get("avg_stage_timings_ms") or {}),
         "last_error": str(state.get("last_error") or ""),
         "finished_at": str(state.get("finished_at") or ""),
     }
@@ -233,6 +251,140 @@ def _update_state(run_id: str, **kwargs: Any) -> dict[str, Any]:
     state.update(kwargs)
     _save_state(state)
     return state
+
+
+def _estimate_seedlab_asr_cost_usd(usage: dict[str, Any]) -> float | None:
+    duration_sec = float(usage.get("audio_duration_sec") or 0.0)
+    rate = float(settings.seedlab_asr_cost_usd_per_minute or 0.0)
+    if duration_sec <= 0 or rate <= 0:
+        return None
+    return (duration_sec / 60.0) * rate
+
+
+def _estimate_seedlab_judge_cost_usd(usage: dict[str, Any]) -> float | None:
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    input_rate = float(settings.seedlab_judge_input_cost_usd_per_1m or 0.0)
+    output_rate = float(settings.seedlab_judge_output_cost_usd_per_1m or 0.0)
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+    if input_rate <= 0 and output_rate <= 0:
+        return None
+    return ((prompt_tokens / 1_000_000.0) * input_rate) + ((completion_tokens / 1_000_000.0) * output_rate)
+
+
+async def _notify_gateway_cost_event(payload: dict[str, Any]) -> None:
+    gateway_url = (settings.seedlab_gateway_url or "").strip().rstrip("/")
+    secret = (settings.gateway_internal_secret or "").strip()
+    if not gateway_url or not secret:
+        return
+
+    def _post() -> None:
+        req = urllib.request.Request(
+            f"{gateway_url}/internal/cost-events",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Internal-Secret": secret},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+
+    try:
+        await asyncio.to_thread(_post)
+    except Exception as e:
+        logger.warning("seedlab cost notify failed subject=%s err=%s", payload.get("subject_key"), e)
+
+
+async def _record_seedlab_cost_events(run_id: str, sample_id: str, debug_obj: dict[str, Any]) -> None:
+    cost_tracking = debug_obj.get("cost_tracking") if isinstance(debug_obj.get("cost_tracking"), dict) else {}
+    subject_key = f"seedlab:{run_id}"
+    subject_label = f"SeedLab run {run_id}"
+    asr_usage = cost_tracking.get("seedlab_asr") if isinstance(cost_tracking.get("seedlab_asr"), dict) else {}
+    judge_usage = cost_tracking.get("seedlab_judge") if isinstance(cost_tracking.get("seedlab_judge"), dict) else {}
+    if asr_usage:
+        cost_usd = _estimate_seedlab_asr_cost_usd(asr_usage)
+        await _notify_gateway_cost_event(
+            {
+                "job_id": "",
+                "stage": "seedlab",
+                "process": "seedlab_asr",
+                "provider": "openai",
+                "attempt_no": 1,
+                "status": "success",
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "usage_json": {**asr_usage, "sample_id": sample_id, "executor": debug_obj.get("executor")},
+                "raw_response_json": {"source": "seed-lab-service"},
+                "cost_usd": cost_usd,
+                "pricing_kind": "estimated" if cost_usd is not None else "missing",
+                "pricing_source": "provider_usage_estimate" if cost_usd is not None else "unavailable",
+                "api_key_family": "seedlab_asr",
+                "subject_type": "operation",
+                "subject_key": subject_key,
+                "subject_label": subject_label,
+                "idempotency_key": f"seedlab:asr:{run_id}:{sample_id}",
+            }
+        )
+    if judge_usage:
+        cost_usd = _estimate_seedlab_judge_cost_usd(judge_usage)
+        await _notify_gateway_cost_event(
+            {
+                "job_id": "",
+                "stage": "seedlab",
+                "process": "seedlab_judge",
+                "provider": "openai",
+                "attempt_no": 1,
+                "status": "success",
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "usage_json": {**judge_usage, "sample_id": sample_id, "executor": debug_obj.get("executor")},
+                "raw_response_json": {"source": "seed-lab-service"},
+                "cost_usd": cost_usd,
+                "pricing_kind": "estimated" if cost_usd is not None else "missing",
+                "pricing_source": "provider_usage_estimate" if cost_usd is not None else "unavailable",
+                "api_key_family": "seedlab_judge",
+                "subject_type": "operation",
+                "subject_key": subject_key,
+                "subject_label": subject_label,
+                "idempotency_key": f"seedlab:judge:{run_id}:{sample_id}",
+            }
+        )
+
+
+def _merge_stage_timing_averages(state: dict[str, Any], debug_obj: dict[str, Any]) -> None:
+    timings = debug_obj.get("stage_timings_ms") if isinstance(debug_obj.get("stage_timings_ms"), dict) else {}
+    if not timings:
+        return
+    totals = state.get("stage_timing_totals_ms") if isinstance(state.get("stage_timing_totals_ms"), dict) else {}
+    sample_count = int(state.get("stage_timing_sample_count") or 0) + 1
+    for key, value in timings.items():
+        if isinstance(value, (int, float)):
+            totals[key] = round(float(totals.get(key) or 0.0) + float(value), 3)
+    state["stage_timing_totals_ms"] = totals
+    state["stage_timing_sample_count"] = sample_count
+    state["avg_stage_timings_ms"] = {
+        key: round(float(total) / sample_count, 1)
+        for key, total in totals.items()
+        if isinstance(total, (int, float))
+    }
+
+
+def _record_eval_progress(state: dict[str, Any], eval_obj: dict[str, Any], debug_obj: dict[str, Any]) -> None:
+    executor = str(eval_obj.get("executor") or debug_obj.get("executor") or "").strip() or "unknown"
+    executor_counts = state.get("eval_executor_counts") if isinstance(state.get("eval_executor_counts"), dict) else {}
+    executor_counts[executor] = int(executor_counts.get(executor) or 0) + 1
+    state["eval_executor_counts"] = executor_counts
+    if executor == "runpod_gpu":
+        state["runpod_job_count"] = int(state.get("runpod_job_count") or 0) + 1
+    if bool(debug_obj.get("gpu_acceleration_active")):
+        state["gpu_active_sample_count"] = int(state.get("gpu_active_sample_count") or 0) + 1
+    if str(eval_obj.get("auto_eval_status") or "").strip().lower() != "ready":
+        state["eval_failed_count"] = int(state.get("eval_failed_count") or 0) + 1
+    remote_eval = debug_obj.get("remote_eval") if isinstance(debug_obj.get("remote_eval"), dict) else {}
+    if str(remote_eval.get("status") or "").strip().lower() == "failed":
+        state["remote_eval_failed_count"] = int(state.get("remote_eval_failed_count") or 0) + 1
+        state["remote_eval_last_error"] = str(debug_obj.get("error") or remote_eval.get("error") or "")
+    _merge_stage_timing_averages(state, debug_obj)
 
 
 def _normalize_record_for_service(rec: dict[str, Any]) -> dict[str, Any]:
@@ -406,6 +558,7 @@ def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[st
     job_id = str(submitted.get("job_id") or "").strip()
     if not job_id:
         raise RuntimeError("runpod eval submit did not return job_id")
+    submitted_at = dt.datetime.now(dt.timezone.utc).isoformat()
     deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
     parsed = submitted
     while True:
@@ -413,7 +566,28 @@ def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[st
         if status_value in {"completed", "succeeded"}:
             break
         if status_value in {"failed", "error"}:
-            raise RuntimeError(f"runpod eval job failed: {parsed.get('error') or 'unknown error'}")
+            sample_id = str(parsed.get("sample_id") or payload["sample_id"]).strip()
+            detail = str(parsed.get("error") or "unknown error")
+            evaluation = _empty_eval(f"RUNPOD-EVAL FAILED: {detail}", status="failed")
+            evaluation["executor"] = "runpod_gpu"
+            debug = {
+                "sample_id": sample_id,
+                "seed": int(rec.get("seed") or 0),
+                "script_id": str(rec.get("script_id") or ""),
+                "status": "failed",
+                "executor": "runpod_gpu",
+                "error": detail,
+                "remote_eval": {
+                    "executor": "runpod_gpu",
+                    "job_id": job_id,
+                    "submitted_at": submitted_at,
+                    "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "status": status_value,
+                    "error": detail,
+                    "gpu_acceleration_active": False,
+                },
+            }
+            return sample_id, evaluation, debug
         if dt.datetime.now(dt.timezone.utc).timestamp() >= deadline:
             raise RuntimeError(f"runpod eval polling timeout job_id={job_id}")
         time.sleep(poll_interval)
@@ -428,22 +602,28 @@ def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[st
     debug = parsed.get("debug")
     if not sample_id or not isinstance(evaluation, dict) or not isinstance(debug, dict):
         raise RuntimeError("runpod eval returned invalid payload")
+    evaluation["executor"] = str(evaluation.get("executor") or "runpod_gpu")
+    debug["executor"] = str(debug.get("executor") or "runpod_gpu")
+    remote_eval = debug.get("remote_eval") if isinstance(debug.get("remote_eval"), dict) else {}
+    remote_eval.update(
+        {
+            "executor": "runpod_gpu",
+            "job_id": job_id,
+            "submitted_at": submitted_at,
+            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "status": "completed",
+            "gpu_acceleration_active": bool(debug.get("gpu_acceleration_active")),
+        }
+    )
+    debug["remote_eval"] = remote_eval
     return sample_id, evaluation, debug
 
 
 def _evaluate_record_with_fallback(run_id: str, run_dir: Path, rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
     if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
-        try:
-            if _sample_s3_enabled():
-                _ensure_record_audio_uploaded(run_id, run_dir, rec)
-            return _call_runpod_eval(rec)
-        except Exception as e:
-            logger.warning(
-                "seedlab remote eval failed, falling back to local run_id=%s sample_id=%s err=%s",
-                run_id,
-                rec.get("sample_id"),
-                e,
-            )
+        if _sample_s3_enabled():
+            _ensure_record_audio_uploaded(run_id, run_dir, rec)
+        return _call_runpod_eval(rec)
     return _auto_eval_single_record(run_dir=run_dir, rec=rec, **_local_eval_kwargs())
 
 
@@ -457,6 +637,13 @@ def _run_status_payload(run_id: str) -> dict[str, Any]:
         "failed_count": int(state.get("failed_count") or 0),
         "evaluated_count": int(state.get("evaluated_count") or 0),
         "total_count": int(state.get("total_count") or 0),
+        "eval_failed_count": int(state.get("eval_failed_count") or 0),
+        "runpod_job_count": int(state.get("runpod_job_count") or 0),
+        "gpu_active_sample_count": int(state.get("gpu_active_sample_count") or 0),
+        "remote_eval_failed_count": int(state.get("remote_eval_failed_count") or 0),
+        "remote_eval_last_error": str(state.get("remote_eval_last_error") or ""),
+        "eval_executor_counts": dict(state.get("eval_executor_counts") or {}),
+        "avg_stage_timings_ms": dict(state.get("avg_stage_timings_ms") or {}),
         "last_error": str(state.get("last_error") or ""),
         "started_at": str(state.get("started_at") or ""),
         "finished_at": str(state.get("finished_at") or ""),
@@ -583,7 +770,21 @@ async def _run_generation_pipeline(run_id: str) -> None:
     _generate_review_html(run_id, records, run_dir / "index.html")
 
     if _openai_enabled() and records:
-        state = _update_state(run_id, status="auto_evaluating", stage="auto_evaluating", evaluated_count=0)
+        state = _update_state(
+            run_id,
+            status="auto_evaluating",
+            stage="auto_evaluating",
+            evaluated_count=0,
+            eval_failed_count=0,
+            runpod_job_count=0,
+            gpu_active_sample_count=0,
+            remote_eval_failed_count=0,
+            remote_eval_last_error="",
+            eval_executor_counts={},
+            stage_timing_totals_ms={},
+            stage_timing_sample_count=0,
+            avg_stage_timings_ms={},
+        )
         await _notify_gateway_progress(state)
         asr_model_resolved, _asr_warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
         eval_out = run_dir / "auto_eval.json"
@@ -602,7 +803,15 @@ async def _run_generation_pipeline(run_id: str) -> None:
             ]
             eval_done = 0
             for fut in concurrent.futures.as_completed(futures):
-                sample_id, eval_obj, debug_obj = fut.result()
+                try:
+                    sample_id, eval_obj, debug_obj = fut.result()
+                except Exception as e:
+                    state["remote_eval_failed_count"] = int(state.get("remote_eval_failed_count") or 0) + 1
+                    state["remote_eval_last_error"] = str(e)
+                    state["last_error"] = str(e)
+                    _save_state(state)
+                    await _notify_gateway_progress(state)
+                    raise
                 _upsert_eval_entry(
                     eval_out,
                     run_id=run_id,
@@ -617,6 +826,8 @@ async def _run_generation_pipeline(run_id: str) -> None:
                     fp.write(json.dumps(debug_obj, ensure_ascii=False) + "\n")
                 eval_done += 1
                 state["evaluated_count"] = eval_done
+                _record_eval_progress(state, eval_obj, debug_obj)
+                await _record_seedlab_cost_events(run_id, sample_id, debug_obj)
                 _save_state(state)
                 await _notify_gateway_progress(state)
 
@@ -736,7 +947,16 @@ async def create_run(_: Any = AuthDep, body: RunCreateRequest | None = None) -> 
         "generated_count": 0,
         "evaluated_count": 0,
         "failed_count": 0,
+        "eval_failed_count": 0,
         "ready_count": 0,
+        "runpod_job_count": 0,
+        "gpu_active_sample_count": 0,
+        "remote_eval_failed_count": 0,
+        "remote_eval_last_error": "",
+        "eval_executor_counts": {},
+        "stage_timing_totals_ms": {},
+        "stage_timing_sample_count": 0,
+        "avg_stage_timings_ms": {},
         "total_count": requested_samples * takes_per_seed * len(selected_scripts),
         "last_error": "",
         "created_at": _utcnow().isoformat(),
