@@ -233,6 +233,7 @@ services:
       HEYGEN_FALLBACK_COST_USD_PER_VIDEO: ${HEYGEN_FALLBACK_COST_USD_PER_VIDEO:-0}
       AWS_DAILY_FIXED_USD: ${AWS_DAILY_FIXED_USD:-0}
       RUNPOD_DAILY_FIXED_USD: ${RUNPOD_DAILY_FIXED_USD:-0}
+      RUNPOD_GPU_COST_USD_PER_HOUR: ${RUNPOD_GPU_COST_USD_PER_HOUR:-0}
     volumes:
       - ./runtime/tts-fixed:/app/runtime/tts-fixed:ro
     ports:

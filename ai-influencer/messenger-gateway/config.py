@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     heygen_fallback_cost_usd_per_video: float = 0.0
     aws_daily_fixed_usd: float = 0.0
     runpod_daily_fixed_usd: float = 0.0
+    runpod_gpu_cost_usd_per_hour: float = 0.0  # RTX 2000 Ada Pod 단가 (예: 0.24)
 
     class Config:
         env_file = ".env"

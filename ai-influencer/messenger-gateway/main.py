@@ -91,14 +91,16 @@ _HARDBURN_FONT_NAME = "Noto Sans CJK KR"
 _HARDBURN_FONT_DIRS = (
     "/usr/share/fonts/opentype/noto",
     "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/truetype/custom",
     "/usr/share/fonts",
 )
 _HARDBURN_FORCE_STYLE = (
-    "FontName=Noto Sans CJK KR,"
+    "FontName=Jua,"
     "FontSize=13,"
     "PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00000000,"
-    "BackColour=&H80000000,"
+    "BackColour=&H00000000,"
+    "BorderStyle=1,"
     "Outline=2,"
     "Shadow=0,"
     "MarginV=30,"
@@ -177,6 +179,14 @@ def _estimate_tts_cost_usd(script_text: str) -> Optional[float]:
     return (char_count / 1000.0) * per_1k
 
 
+def _estimate_tts_cost_usd_from_duration(duration_ms: float) -> Optional[float]:
+    """RunPod Pod GPU 시간 기반 TTS 비용 계산 (RUNPOD_GPU_COST_USD_PER_HOUR 설정 시 우선 사용)."""
+    gpu_rate = float(settings.runpod_gpu_cost_usd_per_hour)
+    if gpu_rate <= 0 or duration_ms <= 0:
+        return None
+    return (duration_ms / 1000.0) / 3600.0 * gpu_rate
+
+
 def _extract_heygen_cost_candidate(payload: Any) -> Optional[float]:
     if isinstance(payload, (int, float)):
         try:
@@ -198,7 +208,8 @@ def _extract_heygen_cost_candidate(payload: Any) -> Optional[float]:
                 candidate = _extract_heygen_cost_candidate(payload.get(key))
                 if candidate is not None:
                     return candidate
-        for key in ("cost", "billing", "usage", "data", "response_snapshot", "poll_response", "create_response"):
+        # NOTE: "cost" 키는 HeyGen Credits 단위로 USD가 아님 → 의도적으로 제외
+        for key in ("billing", "usage", "data", "response_snapshot", "poll_response", "create_response"):
             if key in payload:
                 candidate = _extract_heygen_cost_candidate(payload.get(key))
                 if candidate is not None:
@@ -3394,6 +3405,18 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
                 idempotency_key=f"tts:{job_id}:{seed}:http:{resp.status_code}:{call_nonce}",
             )
             raise RuntimeError(_format_tts_api_error(resp.status_code, resp.text))
+        # 성공: 실제 duration_ms 기반 GPU 비용 계산 (GPU 단가 설정 시 우선 사용)
+        success_ended_at = datetime.now(timezone.utc)
+        actual_duration_ms = (success_ended_at - request_started_at).total_seconds() * 1000
+        gpu_cost = _estimate_tts_cost_usd_from_duration(actual_duration_ms)
+        if gpu_cost is not None:
+            tts_cost_usd = gpu_cost
+            tts_pricing_kind = "estimated"
+            tts_pricing_source = "gpu_duration_estimate"
+        else:
+            tts_cost_usd = estimated_cost
+            tts_pricing_kind = _estimated_pricing_kind(estimated_cost)
+            tts_pricing_source = _estimated_pricing_source(estimated_cost)
         await _record_cost_event_safe(
             job_id=job_id,
             stage="tts",
@@ -3402,16 +3425,18 @@ async def _generate_tts_audio_content(job_id: str, script_text: str, *, seed: Op
             attempt_no=1,
             status="success",
             started_at=request_started_at,
-            ended_at=datetime.now(timezone.utc),
+            ended_at=success_ended_at,
             usage_json={
                 "seed": seed,
                 "script_chars": _script_char_count(script_text),
                 "audio_bytes": len(resp.content or b""),
+                "duration_ms": round(actual_duration_ms),
+                "gpu_rate_usd_per_hour": float(settings.runpod_gpu_cost_usd_per_hour),
             },
             raw_response_json={"endpoint": endpoint, "status_code": resp.status_code},
-            cost_usd=estimated_cost,
-            pricing_kind=_estimated_pricing_kind(estimated_cost),
-            pricing_source=_estimated_pricing_source(estimated_cost),
+            cost_usd=tts_cost_usd,
+            pricing_kind=tts_pricing_kind,
+            pricing_source=tts_pricing_source,
             api_key_family="tts_generation",
             error_type="",
             error_message="",
@@ -6808,9 +6833,9 @@ def _cost_viewer_html(api_base_path: str) -> str:
 
   <div class="panel">
     <div class="filter-row">
-      <label>From</label>
+      <label>시작일(From)</label>
       <input type="date" id="fromDate" />
-      <label>To</label>
+      <label>종료일(To)</label>
       <input type="date" id="toDate" />
       <input type="text" id="queryText" placeholder="&#xC8FC;&#xC81C; / Job ID &#xAC80;&#xC0C9;" />
       <select id="subjectTypeFilter">
@@ -6841,12 +6866,12 @@ def _cost_viewer_html(api_base_path: str) -> str:
         <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
       </div>
       <div class="card">
-        <div class="clabel">Estimated</div>
+        <div class="clabel">추정 (Estimated)</div>
         <div class="cusd" id="estimatedCostUsd">$0.000000</div>
         <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
       </div>
       <div class="card">
-        <div class="clabel">Missing Events</div>
+        <div class="clabel">비용 누락 이벤트</div>
         <div class="cusd" id="missingCount" style="color:var(--danger);">0</div>
         <div class="ckrw">&#xBE44;&#xC6A9; &#xB204;&#xB77D; &#xAC74;</div>
       </div>
@@ -6903,11 +6928,11 @@ def _cost_viewer_html(api_base_path: str) -> str:
           <thead>
             <tr>
               <th style="width:110px;">&#xC2DC;&#xAC01; (KST)</th>
-              <th style="width:70px;">Stage</th>
-              <th style="width:130px;">Process</th>
-              <th style="width:100px;">Provider</th>
-              <th style="width:80px;">Status</th>
-              <th style="width:80px;">Pricing</th>
+              <th style="width:70px;">단계(Stage)</th>
+              <th style="width:130px;">프로세스(Process)</th>
+              <th style="width:100px;">제공자(Provider)</th>
+              <th style="width:80px;">상태</th>
+              <th style="width:80px;">과금방식</th>
               <th style="width:100px;">USD</th>
               <th style="width:90px;">KRW</th>
               <th style="width:75px;">&#xC2DC;&#xAC04;</th>
@@ -6971,9 +6996,9 @@ def _cost_viewer_html(api_base_path: str) -> str:
       return '<span class="mark skip">\u2013</span>';
     }
     return '<div class="stage-row">'
-      + '<div class="si"><span class="ico">\uD83D\uDCDD</span>' + mark(rec.script_success, rec.script_failed) + '</div>'
-      + '<div class="si"><span class="ico">\uD83C\uDF99</span>' + mark(rec.tts_success,    rec.tts_failed)    + '</div>'
-      + '<div class="si"><span class="ico">\uD83C\uDFAC</span>' + mark(rec.video_success,  rec.video_failed)  + '</div>'
+      + '<div class="si"><span class="ico">\U0001F4DD</span>' + mark(rec.script_success, rec.script_failed) + '</div>'
+      + '<div class="si"><span class="ico">\U0001F399</span>' + mark(rec.tts_success,    rec.tts_failed)    + '</div>'
+      + '<div class="si"><span class="ico">\U0001F3AC</span>' + mark(rec.video_success,  rec.video_failed)  + '</div>'
       + '</div>';
   }
 
@@ -7086,16 +7111,16 @@ def _cost_viewer_html(api_base_path: str) -> str:
       var mKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
       q("detailCostSummary").innerHTML =
           '<div class="cs-card"><div class="cs-label">Main (\uC2E4\uC81C+\uACE0\uC815)</div><div class="cs-val">'    + fmtUsd(sum.main_cost_usd)      + '</div><div class="cs-krw">' + fmtKrw(mKrw)                               + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">Actual</div><div class="cs-val">'                               + fmtUsd(sum.actual_cost_usd)    + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw)    + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">Fixed (\uC778\uD504\uB77C)</div><div class="cs-val">'          + fmtUsd(sum.fixed_cost_usd)     + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw)     + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">Estimated</div><div class="cs-val">'                            + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">Missing \uC774\uBCA4\uD2B8</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
+        + '<div class="cs-card"><div class="cs-label">실제 비용 (Actual)</div><div class="cs-val">'                               + fmtUsd(sum.actual_cost_usd)    + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw)    + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">인프라 유지 (\uC778\uD504\uB77C)</div><div class="cs-val">'          + fmtUsd(sum.fixed_cost_usd)     + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw)     + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">추정치 (Estimated)</div><div class="cs-val">'                            + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">비용 누락 \uC774\uBCA4\uD2B8</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
       q("detailBreakdown").innerHTML =
-          renderBreakdown("By Stage",          sum.by_stage)
-        + renderBreakdown("By Process",        sum.by_process)
-        + renderBreakdown("By Provider",       sum.by_provider)
-        + renderBreakdown("By API Key Family", sum.by_api_key_family)
-        + renderBreakdown("By Pricing Kind",   sum.by_pricing_kind);
+          renderBreakdown("단계별 (Stage)",          sum.by_stage)
+        + renderBreakdown("프로세스별 (Process)",    sum.by_process)
+        + renderBreakdown("제공자별 (Provider)",     sum.by_provider)
+        + renderBreakdown("API 키별",               sum.by_api_key_family)
+        + renderBreakdown("과금 방식별 (Pricing)",   sum.by_pricing_kind);
       if (!events.length) {
         q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:12px;">\uC774\uBCA4\uD2B8 \uC5C6\uC74C</td></tr>';
       } else {
