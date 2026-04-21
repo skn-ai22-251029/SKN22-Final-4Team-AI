@@ -197,26 +197,32 @@ async def call_wf12_heygen_generate(
 async def call_wf08_sns_upload(
     job_id: str,
     video_url: str,
+    audio_url: str,
     channel_id: str,
     targets: list[str],
     video_filename: str = "",
     title: str = "",
     description: str = "",
     caption: str = "",
+    subtitle_script_text: str = "",
 ) -> None:
     if not video_url:
         raise ValueError("video_url is required for WF-08 upload")
+    if not audio_url:
+        raise ValueError("audio_url is required for WF-08 upload")
     if not targets:
         raise ValueError("targets are required for WF-08 upload")
     payload = {
         "job_id": job_id,
         "video_url": video_url,
+        "audio_url": audio_url,
         "channel_id": channel_id,
         "targets": targets,
         "video_filename": video_filename,
         "title": title,
         "description": description,
         "caption": caption,
+        "subtitle_script_text": subtitle_script_text,
     }
     await _post_with_retry(settings.n8n_wf08_webhook_url, payload)
     logger.info("call_wf08_sns_upload job_id=%s targets=%s video_filename=%s", job_id, ",".join(targets), video_filename)

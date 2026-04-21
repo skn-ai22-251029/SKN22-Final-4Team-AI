@@ -2,12 +2,14 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib import request as urllib_request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, Header, HTTPException, status
@@ -28,6 +30,9 @@ logger = logging.getLogger(__name__)
 class Settings(BaseSettings):
     gateway_internal_secret: str
     notebooklm_default_notebook_id: str = ""
+    cost_tracking_gateway_url: str = "http://messenger-gateway:8080"
+    script_rewrite_input_cost_usd_per_1m: float = 0.0
+    script_rewrite_output_cost_usd_per_1m: float = 0.0
 
     class Config:
         env_file = ".env"
@@ -60,6 +65,7 @@ KST = _load_kst_timezone()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 _executor = ThreadPoolExecutor(max_workers=2)
+_COST_TRACKING_MARKER = "COST_TRACKING_JSON:"
 
 app = FastAPI(title="NotebookLM Service")
 
@@ -93,8 +99,11 @@ def _cua_subprocess_env() -> dict:
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "NO_PROXY",
-        "OPENAI_CUA_API_KEY",
-        "OPENAI_API_KEY",      # fallback only
+        "OPENAI_FALLBACK_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_API_KEY_CUA_CREATE_NOTEBOOK",
+        "OPENAI_API_KEY_CUA_MANAGE_SOURCES",
+        "OPENAI_API_KEY_CUA_GENERATE_REPORT",
         "GOOGLE_EMAIL",
         "GOOGLE_PASSWORD",
         "NOTEBOOKLM_DATA_DIR",
@@ -116,6 +125,99 @@ def _cua_cmd(script_path: Path, *args: str) -> list[str]:
         str(script_path),
         *args,
     ]
+
+
+def _extract_cost_tracking_summary(stdout: str, stderr: str) -> dict[str, object]:
+    for raw in [stdout or "", stderr or ""]:
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if not line.startswith(_COST_TRACKING_MARKER):
+                continue
+            try:
+                parsed = json.loads(line[len(_COST_TRACKING_MARKER):].strip())
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def _estimate_cua_cost_usd(summary: dict[str, object]) -> Optional[float]:
+    prompt_tokens = int(summary.get("prompt_tokens") or 0)
+    completion_tokens = int(summary.get("completion_tokens") or 0)
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+    input_rate = float(settings.script_rewrite_input_cost_usd_per_1m)
+    output_rate = float(settings.script_rewrite_output_cost_usd_per_1m)
+    if input_rate <= 0 and output_rate <= 0:
+        return None
+    return ((prompt_tokens / 1_000_000.0) * input_rate) + ((completion_tokens / 1_000_000.0) * output_rate)
+
+
+def _post_cost_event(payload: dict[str, object]) -> None:
+    gateway_url = (settings.cost_tracking_gateway_url or "").strip().rstrip("/")
+    secret = (settings.gateway_internal_secret or "").strip()
+    if not gateway_url or not secret:
+        return
+    request = urllib_request.Request(
+        f"{gateway_url}/internal/cost-events",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Internal-Secret": secret},
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=15) as response:
+        response.read()
+
+
+def _record_cua_cost_event(
+    *,
+    job_id: str = "",
+    process: str,
+    subject_type: str,
+    subject_key: str,
+    subject_label: str,
+    started_at: datetime,
+    ended_at: datetime,
+    status: str,
+    summary: dict[str, object],
+    error_message: str = "",
+) -> None:
+    if not summary:
+        return
+    if int(summary.get("request_count") or 0) <= 0 and int(summary.get("total_tokens") or 0) <= 0:
+        return
+    api_key_family = str(summary.get("api_key_family") or "").strip() or "cua_generate_report"
+    estimated_cost = _estimate_cua_cost_usd(summary)
+    payload = {
+        "job_id": job_id,
+        "topic_text": subject_label if subject_type == "operation" else "",
+        "stage": "notebook",
+        "process": process,
+        "provider": "openai",
+        "attempt_no": 1,
+        "status": status,
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "usage_json": summary,
+        "raw_response_json": {"source": "notebooklm-service-subprocess"},
+        "cost_usd": estimated_cost,
+        "pricing_kind": "estimated" if estimated_cost is not None else "missing",
+        "pricing_source": "provider_usage_estimate" if estimated_cost is not None else "unavailable",
+        "api_key_family": api_key_family,
+        "subject_type": subject_type,
+        "subject_key": subject_key,
+        "subject_label": subject_label,
+        "error_type": "" if not error_message else "cua_error",
+        "error_message": error_message[:500],
+        "idempotency_key": (
+            f"notebooklm:{process}:{subject_type}:{subject_key}:"
+            f"{int(started_at.timestamp() * 1000)}:{status}"
+        ),
+    }
+    try:
+        _post_cost_event(payload)
+    except Exception as e:
+        logger.warning("[cost] notebooklm event post failed process=%s subject=%s err=%s", process, subject_key, e)
 
 
 def _is_playwright_browser_missing(text: str) -> bool:
@@ -235,6 +337,25 @@ class NotebookStateResponse(BaseModel):
     has_reports: bool = False
     latest_source_url: str = ""
     latest_source_title: str = ""
+    error: Optional[str] = None
+
+
+class ResolveLatestVideoRequest(BaseModel):
+    channel_id: str
+    channel_name: str = ""
+    lookback_hours: int = 24
+    exclude_shorts: bool = True
+
+
+class ResolveLatestVideoResponse(BaseModel):
+    status: str
+    found: bool = False
+    video_url: str = ""
+    title: str = ""
+    published_at: str = ""
+    resolver: str = ""
+    attempts: int = 0
+    errors: list[str] = []
     error: Optional[str] = None
 
 
@@ -452,6 +573,308 @@ def _get_notebook_state(channel_id: str) -> NotebookStateResponse:
     )
 
 
+def _fetch_rss_entries(channel_id: str) -> list[dict]:
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    req = urllib_request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        xml = resp.read().decode("utf-8", errors="replace")
+
+    entries: list[dict] = []
+    for block in re.findall(r"<entry>([\s\S]*?)</entry>", xml):
+        video_id = (re.search(r"<yt:videoId>([^<]+)</yt:videoId>", block) or [None, ""])[1]
+        if not video_id:
+            continue
+        title = (re.search(r"<title>([^<]+)</title>", block) or [None, ""])[1]
+        published_at = (re.search(r"<published>([^<]+)</published>", block) or [None, ""])[1]
+        link_match = re.search(r'<link rel="alternate" href="([^"]+)"', block)
+        video_url = link_match.group(1) if link_match else f"https://www.youtube.com/watch?v={video_id}"
+        entries.append(
+            {
+                "video_url": video_url,
+                "title": title,
+                "published_at": published_at,
+            }
+        )
+    return entries
+
+
+def _fetch_ytdlp_entries(channel_id: str) -> list[dict]:
+    channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    cmd = [
+        "yt-dlp",
+        "--ignore-errors",
+        "--skip-download",
+        "--playlist-end",
+        "15",
+        "--print-json",
+        channel_url,
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_cua_subprocess_env(),
+    )
+    if result.returncode != 0 and not (result.stdout or "").strip():
+        err = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(err[:500] or f"yt-dlp failed(code={result.returncode})")
+
+    entries: list[dict] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        video_id = str(item.get("id") or "").strip()
+        if not video_id:
+            continue
+        webpage_url = str(item.get("webpage_url") or "").strip()
+        url = webpage_url or f"https://www.youtube.com/watch?v={video_id}"
+        timestamp = item.get("timestamp")
+        upload_date = str(item.get("upload_date") or "").strip()
+        published_at = ""
+        if isinstance(timestamp, (int, float)):
+            published_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        elif len(upload_date) == 8 and upload_date.isdigit():
+            published_at = (
+                datetime.strptime(upload_date, "%Y%m%d")
+                .replace(tzinfo=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        entries.append(
+            {
+                "video_url": url,
+                "title": str(item.get("title") or "").strip(),
+                "published_at": published_at,
+            }
+        )
+    return entries
+
+
+def _parse_relative_published_text(raw: str) -> str:
+    text = (raw or "").strip().lower()
+    if not text:
+        return ""
+
+    now = datetime.now(timezone.utc)
+
+    def _to_iso(delta: timedelta) -> str:
+        return (now - delta).isoformat().replace("+00:00", "Z")
+
+    patterns: list[tuple[str, int]] = [
+        (r"(\d+)\s*seconds?\s+ago", 1),
+        (r"(\d+)\s*minutes?\s+ago", 60),
+        (r"(\d+)\s*hours?\s+ago", 3600),
+        (r"(\d+)\s*days?\s+ago", 86400),
+        (r"(\d+)\s*weeks?\s+ago", 7 * 86400),
+        (r"(\d+)\s*months?\s+ago", 30 * 86400),
+        (r"(\d+)\s*years?\s+ago", 365 * 86400),
+        (r"(\d+)\s*초\s*전", 1),
+        (r"(\d+)\s*분\s*전", 60),
+        (r"(\d+)\s*시간\s*전", 3600),
+        (r"(\d+)\s*일\s*전", 86400),
+        (r"(\d+)\s*주\s*전", 7 * 86400),
+        (r"(\d+)\s*개월\s*전", 30 * 86400),
+        (r"(\d+)\s*년\s*전", 365 * 86400),
+    ]
+    for pattern, unit_seconds in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _to_iso(timedelta(seconds=int(match.group(1)) * unit_seconds))
+
+    return ""
+
+
+def _flatten_runs_text(value: object) -> str:
+    if isinstance(value, dict):
+        simple = str(value.get("simpleText") or "").strip()
+        if simple:
+            return simple
+        runs = value.get("runs")
+        if isinstance(runs, list):
+            return "".join(str(run.get("text") or "") for run in runs if isinstance(run, dict)).strip()
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _iter_video_renderers(value: object):
+    if isinstance(value, dict):
+        if "videoRenderer" in value and isinstance(value["videoRenderer"], dict):
+            yield value["videoRenderer"]
+        for child in value.values():
+            yield from _iter_video_renderers(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_video_renderers(child)
+
+
+def _fetch_channel_page_entries(channel_id: str) -> list[dict]:
+    url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    req = urllib_request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+        },
+    )
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    match = re.search(r"var ytInitialData = (\{.*?\});", html)
+    if not match:
+        match = re.search(r"ytInitialData\s*=\s*(\{.*?\});", html)
+    if not match:
+        raise RuntimeError("ytInitialData not found")
+
+    data = json.loads(match.group(1))
+    entries: list[dict] = []
+    for renderer in _iter_video_renderers(data):
+        video_id = str(renderer.get("videoId") or "").strip()
+        if not video_id:
+            continue
+        entries.append(
+            {
+                "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                "title": _flatten_runs_text(renderer.get("title")),
+                "published_at": _parse_relative_published_text(
+                    _flatten_runs_text(renderer.get("publishedTimeText"))
+                ),
+            }
+        )
+    return entries
+
+
+def _filter_latest_recent_video(
+    entries: list[dict],
+    *,
+    lookback_hours: int,
+    exclude_shorts: bool,
+) -> Optional[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, lookback_hours))
+    candidates: list[tuple[datetime, dict]] = []
+    for entry in entries:
+        video_url = str(entry.get("video_url") or "").strip()
+        if not video_url:
+            continue
+        if exclude_shorts and "/shorts/" in video_url:
+            continue
+        published_at = str(entry.get("published_at") or "").strip()
+        if not published_at:
+            continue
+        try:
+            published_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if published_dt < cutoff:
+            continue
+        candidates.append((published_dt, entry))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _resolve_latest_video(
+    channel_id: str,
+    channel_name: str,
+    lookback_hours: int,
+    exclude_shorts: bool,
+) -> ResolveLatestVideoResponse:
+    errors: list[str] = []
+    attempts = 0
+
+    try:
+        attempts += 1
+        rss_entries = _fetch_rss_entries(channel_id)
+        selected = _filter_latest_recent_video(
+            rss_entries,
+            lookback_hours=lookback_hours,
+            exclude_shorts=exclude_shorts,
+        )
+        if selected:
+            return ResolveLatestVideoResponse(
+                status="success",
+                found=True,
+                video_url=str(selected.get("video_url") or ""),
+                title=str(selected.get("title") or ""),
+                published_at=str(selected.get("published_at") or ""),
+                resolver="rss",
+                attempts=attempts,
+                errors=errors,
+            )
+        errors.append("rss:no-recent-video-within-lookback")
+    except Exception as e:
+        errors.append(f"rss:{str(e)[:300]}")
+
+    try:
+        attempts += 1
+        ytdlp_entries = _fetch_ytdlp_entries(channel_id)
+        selected = _filter_latest_recent_video(
+            ytdlp_entries,
+            lookback_hours=lookback_hours,
+            exclude_shorts=exclude_shorts,
+        )
+        if selected:
+            return ResolveLatestVideoResponse(
+                status="success",
+                found=True,
+                video_url=str(selected.get("video_url") or ""),
+                title=str(selected.get("title") or ""),
+                published_at=str(selected.get("published_at") or ""),
+                resolver="yt_dlp",
+                attempts=attempts,
+                errors=errors,
+            )
+        errors.append("yt_dlp:no-recent-video-within-lookback")
+    except Exception as e:
+        errors.append(f"yt_dlp:{str(e)[:300]}")
+
+    try:
+        attempts += 1
+        html_entries = _fetch_channel_page_entries(channel_id)
+        selected = _filter_latest_recent_video(
+            html_entries,
+            lookback_hours=lookback_hours,
+            exclude_shorts=exclude_shorts,
+        )
+        if selected:
+            return ResolveLatestVideoResponse(
+                status="success",
+                found=True,
+                video_url=str(selected.get("video_url") or ""),
+                title=str(selected.get("title") or ""),
+                published_at=str(selected.get("published_at") or ""),
+                resolver="channel_html",
+                attempts=attempts,
+                errors=errors,
+            )
+        errors.append("channel_html:no-recent-video-within-lookback")
+    except Exception as e:
+        errors.append(f"channel_html:{str(e)[:300]}")
+
+    logger.warning(
+        "[resolve-latest-video] no candidate channel_id=%s channel_name=%s errors=%s",
+        channel_id,
+        channel_name,
+        errors,
+    )
+    return ResolveLatestVideoResponse(
+        status="success",
+        found=False,
+        resolver="",
+        attempts=attempts,
+        errors=errors,
+        error="no recent video found",
+    )
+
+
 # ─────────────────────────────────────────
 # subprocess 실행 (blocking)
 # ─────────────────────────────────────────
@@ -475,6 +898,7 @@ def _run_generate_report(
     )
 
     logger.info("[notebooklm] starting subprocess job_id=%s cmd=%s", job_id, cmd)
+    started_at = datetime.now(timezone.utc)
 
     try:
         result = subprocess.run(
@@ -493,6 +917,7 @@ def _run_generate_report(
 
     stdout = result.stdout or ""
     stderr = result.stderr or ""
+    cost_summary = _extract_cost_tracking_summary(stdout, stderr)
     logger.info("[notebooklm] subprocess done job_id=%s returncode=%d", job_id, result.returncode)
 
     # Playwright/CUA 디버깅이 가능하도록 stdout/stderr를 그대로 서비스 로그에 남긴다.
@@ -505,6 +930,18 @@ def _run_generate_report(
 
     if result.returncode != 0:
         error_msg = stderr.strip() or stdout.strip() or f"returncode={result.returncode}"
+        _record_cua_cost_event(
+            job_id=job_id,
+            process="cua_generate_report",
+            subject_type="job",
+            subject_key=job_id,
+            subject_label=job_id,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="failed",
+            summary=cost_summary,
+            error_message=error_msg,
+        )
         logger.error("[notebooklm] generate_report failed job_id=%s: %s", job_id, error_msg)
         return GenerateResponse(status="error", error=error_msg[:500])
 
@@ -516,6 +953,17 @@ def _run_generate_report(
     report_content = output_path.read_text(encoding="utf-8")
     file_bytes = output_path.read_bytes()
     file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+    _record_cua_cost_event(
+        job_id=job_id,
+        process="cua_generate_report",
+        subject_type="job",
+        subject_key=job_id,
+        subject_label=job_id,
+        started_at=started_at,
+        ended_at=datetime.now(timezone.utc),
+        status="success",
+        summary=cost_summary,
+    )
 
     logger.info("[notebooklm] report ready job_id=%s size=%d chars", job_id, len(report_content))
     _log_report_presence(notebook_url, source="generate", job_id=job_id)
@@ -817,6 +1265,9 @@ def _run_check_and_add_source(
     """소스 추가 + 슬라이딩 윈도우 정리를 subprocess로 실행."""
     scripts_dir = SCRIPTS_DIR
     manage_script = scripts_dir / "manage_sources_cua.py"
+    started_at = datetime.now(timezone.utc)
+    subject_key = f"notebook:source:{channel_id or notebook_url or 'unknown'}"
+    subject_label = channel_name or channel_id or notebook_url or "NotebookLM source management"
 
     # Step 0: notebook_url이 없으면 채널명 기반 CUA fallback으로 먼저 노트북을 찾는다.
     if not notebook_url:
@@ -850,14 +1301,36 @@ def _run_check_and_add_source(
         logger.info("[script] %s", line)
     for line in (result.stderr or "").strip().splitlines():
         logger.warning("[script:err] %s", line)
+    cost_summary = _extract_cost_tracking_summary(result.stdout or "", result.stderr or "")
 
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "").strip()[:400]
+        _record_cua_cost_event(
+            process="cua_manage_sources",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="failed",
+            summary=cost_summary,
+            error_message=err,
+        )
         return AddSourceResponse(status="error", error=err)
 
     stdout = result.stdout or ""
     if "Duplicate skipped:" in stdout:
         logger.info("[add-source] UI 기준 중복 건너뜀: %s", source_url)
+        _record_cua_cost_event(
+            process="cua_manage_sources",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="success",
+            summary=cost_summary,
+        )
         return AddSourceResponse(status="ok", duplicate=True)
 
     # Step 2: 최대 소스 수를 넘기면 cleanup 모드로 오래된 항목을 정리한다.
@@ -881,6 +1354,16 @@ def _run_check_and_add_source(
         logger.warning("[add-source] cleanup 실패 (무시): %s", e)
 
     logger.info("[add-source] 완료: %s (cleaned=%d)", source_url, cleaned_up)
+    _record_cua_cost_event(
+        process="cua_manage_sources",
+        subject_type="operation",
+        subject_key=subject_key,
+        subject_label=subject_label,
+        started_at=started_at,
+        ended_at=datetime.now(timezone.utc),
+        status="success",
+        summary=cost_summary,
+    )
     return AddSourceResponse(status="ok", added=True, cleaned_up=cleaned_up)
 
 
@@ -889,6 +1372,9 @@ def _run_create_notebook(name: str, channel_id: str, channel_name: str) -> Creat
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         output_path = tmp.name
+    started_at = datetime.now(timezone.utc)
+    subject_key = f"notebook:create:{channel_id or name}"
+    subject_label = channel_name or channel_id or name
 
     cmd = _cua_cmd(
         SCRIPTS_DIR / "create_notebook_cua.py",
@@ -910,13 +1396,35 @@ def _run_create_notebook(name: str, channel_id: str, channel_name: str) -> Creat
         logger.info("[script] %s", line)
     for line in (result.stderr or "").strip().splitlines():
         logger.warning("[script:err] %s", line)
+    cost_summary = _extract_cost_tracking_summary(result.stdout or "", result.stderr or "")
 
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "").strip()[:400]
+        _record_cua_cost_event(
+            process="cua_create_notebook",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="failed",
+            summary=cost_summary,
+            error_message=err,
+        )
         return CreateNotebookResponse(status="error", error=err)
 
     try:
         data = json.loads(Path(output_path).read_text(encoding="utf-8"))
+        _record_cua_cost_event(
+            process="cua_create_notebook",
+            subject_type="operation",
+            subject_key=subject_key,
+            subject_label=subject_label,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            status="success",
+            summary=cost_summary,
+        )
         return CreateNotebookResponse(
             status="success",
             notebook_url=data["notebook_url"],
@@ -985,6 +1493,25 @@ async def notebook_state_endpoint(
     """채널의 현재 active notebook과 source 개수를 반환한다."""
     verify_secret(x_internal_secret)
     return _get_notebook_state(body.channel_id)
+
+
+@app.post("/resolve-latest-video", response_model=ResolveLatestVideoResponse)
+async def resolve_latest_video_endpoint(
+    body: ResolveLatestVideoRequest,
+    x_internal_secret: Optional[str] = Header(default=None),
+) -> ResolveLatestVideoResponse:
+    verify_secret(x_internal_secret)
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor,
+        _resolve_latest_video,
+        body.channel_id,
+        body.channel_name,
+        body.lookback_hours,
+        body.exclude_shorts,
+    )
 
 
 @app.get("/all-channels", response_model=AllChannelsResponse)

@@ -34,9 +34,6 @@ class Settings(BaseSettings):
 
 
 config = Settings()
-ALLOWED_USER_IDS: set[str] = {
-    uid.strip() for uid in config.discord_allowed_user_ids.split(",") if uid.strip()
-}
 ALLOWED_CHANNEL_IDS: set[str] = {
     cid.strip() for cid in config.discord_allowed_channel_ids.split(",") if cid.strip()
 }
@@ -142,11 +139,64 @@ def _build_button_view(*buttons: tuple[str, str, discord.ButtonStyle]) -> discor
     return view
 
 
+def _is_channel_allowed(channel_id: Optional[int]) -> bool:
+    if not ALLOWED_CHANNEL_IDS:
+        return True
+    return str(channel_id or "") in ALLOWED_CHANNEL_IDS
+
+
+async def _reject_if_channel_disallowed(interaction: discord.Interaction) -> bool:
+    if _is_channel_allowed(interaction.channel_id):
+        return False
+    await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+    return True
+
+
 # ─────────────────────────────────────────
 # 인메모리 수정 대기 상태 (pending_store)
 # ─────────────────────────────────────────
 
 revision_pending: dict[str, str] = {}  # user_id -> job_id
+publish_title_pending: dict[str, dict[str, Any]] = {}  # token -> {user_id, job_id, targets, label, publish_title}
+
+
+class _YoutubeTitleModal(discord.ui.Modal, title="유튜브 업로드 제목"):
+    publish_title_input = discord.ui.TextInput(
+        label="유튜브 제목 (비우면 자동 제목 사용)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=95,
+    )
+
+    def __init__(self, token: str):
+        super().__init__(timeout=300)
+        self.token = token
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        intent = publish_title_pending.get(self.token)
+        if not intent:
+            await _safe_reply(interaction, "⏱️ 제목 입력 세션이 만료되었습니다. 다시 업로드 버튼을 눌러주세요.", ephemeral=True)
+            return
+
+        if str(intent.get("user_id", "")) != str(interaction.user.id):
+            await _safe_reply(interaction, "이 제목 입력 세션은 요청한 사용자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        publish_title = str(self.publish_title_input.value or "").strip()
+        intent["publish_title"] = publish_title
+
+        label = str(intent.get("label") or "유튜브")
+        view = _build_button_view(
+            (f"✅ {label} 최종 승인", f"video_publish_confirm_title:{self.token}", discord.ButtonStyle.danger),
+            ("취소", f"video_publish_cancel_title:{self.token}", discord.ButtonStyle.secondary),
+        )
+        title_preview = publish_title if publish_title else "(자동 제목 사용)"
+        await interaction.response.send_message(
+            f"⚠️ {label} 업로드를 시작합니다. 최종 승인하면 WF-08 SNS 업로드를 실행합니다.\n"
+            f"제목: `{_clip_text(title_preview, 95)}`",
+            ephemeral=True,
+            view=view,
+        )
 
 
 # ─────────────────────────────────────────
@@ -196,14 +246,10 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # 허용 채널 확인
-    if ALLOWED_CHANNEL_IDS and str(message.channel.id) not in ALLOWED_CHANNEL_IDS:
+    if not _is_channel_allowed(message.channel.id):
         return
 
     user_id = str(message.author.id)
-
-    # 허용 사용자 확인
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        return
 
     # 수정 지시 텍스트 대기 중인 경우에만 처리
     if user_id in revision_pending:
@@ -227,12 +273,7 @@ async def on_message(message: discord.Message) -> None:
 async def create_command(interaction: discord.Interaction, concept: str) -> None:
     user_id = str(interaction.user.id)
 
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
 
     await interaction.response.defer()
@@ -285,12 +326,7 @@ async def report_command(
 ) -> None:
     user_id = str(interaction.user.id)
 
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
 
     await interaction.response.defer()
@@ -348,12 +384,7 @@ async def tts_command(
     )
 
     try:
-        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-            return
-
-        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+        if await _reject_if_channel_disallowed(interaction):
             return
 
         if normalized_job_id and normalized_prompt:
@@ -402,18 +433,87 @@ async def tts_command(
         await _safe_reply(interaction, f"❌ /tts 실패: {_clip_text(str(e), 500)}", ephemeral=True)
 
 
+@bot.tree.command(name="seedlab", description="AWS Seed Lab run을 시작하고 웹 링크를 반환합니다")
+@app_commands.describe(
+    seeds="쉼표로 구분한 seed 목록. 비우면 랜덤으로 채웁니다.",
+    dup="켜면 seed당 3개씩(10 x 3), 끄면 30 x 1입니다.",
+)
+async def seedlab_command(
+    interaction: discord.Interaction,
+    seeds: str = "",
+    dup: bool = False,
+) -> None:
+    user_id = str(interaction.user.id)
+    logger.info("[/seedlab] invoked user=%s channel=%s dup=%s seeds=%s", user_id, interaction.channel_id, dup, (seeds or "").strip())
+
+    try:
+        if await _reject_if_channel_disallowed(interaction):
+            return
+
+        await _safe_defer(interaction, ephemeral=True)
+        result = await gateway_call(
+            "/internal/seedlab-start",
+            {
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+                "seeds": (seeds or "").strip(),
+                "dup": bool(dup),
+            },
+        )
+        await _safe_reply(
+            interaction,
+            _clip_text(
+                "🧪 Seed Lab run 생성 완료\n"
+                f"Run ID: `{str(result.get('run_id') or '')}`\n"
+                f"mode: {int(result.get('samples') or (10 if dup else 30))} x {int(result.get('takes_per_seed') or (3 if dup else 1))}\n"
+                f"link: {str(result.get('seedlab_url') or '')}\n"
+                "진행 상황은 채널 메시지에서 계속 갱신됩니다."
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.exception("[/seedlab] failed user=%s channel=%s", user_id, interaction.channel_id)
+        await _safe_reply(interaction, f"❌ /seedlab 실패: {_clip_text(str(e), 500)}", ephemeral=True)
+
+
+@bot.tree.command(name="cost", description="Cost Viewer signed 링크를 반환합니다")
+async def cost_command(interaction: discord.Interaction) -> None:
+    user_id = str(interaction.user.id)
+    logger.info("[/cost] invoked user=%s channel=%s", user_id, interaction.channel_id)
+
+    try:
+        if await _reject_if_channel_disallowed(interaction):
+            return
+
+        await _safe_defer(interaction, ephemeral=True)
+        result = await gateway_call(
+            "/internal/cost-viewer-link",
+            {
+                "messenger_user_id": user_id,
+                "messenger_channel_id": str(interaction.channel_id),
+            },
+        )
+        await _safe_reply(
+            interaction,
+            _clip_text(
+                "💰 Cost Viewer 링크 생성 완료\n"
+                f"link: {str(result.get('cost_viewer_url') or '')}\n"
+                f"expires_at: {str(result.get('expires_at') or '')}"
+            ),
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.exception("[/cost] failed user=%s channel=%s", user_id, interaction.channel_id)
+        await _safe_reply(interaction, f"❌ /cost 실패: {_clip_text(str(e), 500)}", ephemeral=True)
+
+
 @bot.tree.command(name="heygen", description="기존 job_id로 WF-12(HeyGen) 생성을 시작합니다")
 async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> None:
     user_id = str(interaction.user.id)
     logger.info("[/heygen] invoked user=%s channel=%s job_input=%s", user_id, interaction.channel_id, (job_id or "").strip())
 
     try:
-        if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-            await _safe_reply(interaction, "이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-            return
-
-        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-            await _safe_reply(interaction, "권한이 없습니다.", ephemeral=True)
+        if await _reject_if_channel_disallowed(interaction):
             return
 
         await _safe_reply(
@@ -436,12 +536,7 @@ async def heygen_command(interaction: discord.Interaction, job_id: str = "") -> 
 async def jobs_command(interaction: discord.Interaction, purpose: str = "all") -> None:
     user_id = str(interaction.user.id)
 
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
-        return
-
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
         return
 
     normalized_purpose = (purpose or "all").strip().lower()
@@ -530,6 +625,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     batch_id = ""
     variant_index = None
     avatar_index = None
+    publish_token = ""
     # 버튼 종류마다 인코딩된 파라미터 수가 달라서 여기서 먼저 분해한다.
     if action == "video_reject_step" and len(parts) >= 3:
         job_id = parts[1]
@@ -554,6 +650,10 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "tts_avatar_pick" and len(parts) >= 3:
         job_id = parts[1]
         avatar_index = int(parts[2])
+    elif action in {"video_publish_confirm_title", "video_publish_cancel_title"} and len(parts) >= 2:
+        publish_token = parts[1]
+        pending = publish_title_pending.get(publish_token) or {}
+        job_id = str(pending.get("job_id") or "")
     elif action in {
         "tts_approve_standard",
         "tts_approve_standard_confirm",
@@ -583,13 +683,51 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         job_id = ":".join(parts[1:])
     user_id = str(interaction.user.id)
 
-    # 허용 채널 확인
-    if ALLOWED_CHANNEL_IDS and str(interaction.channel_id) not in ALLOWED_CHANNEL_IDS:
-        await interaction.response.send_message("이 채널에서는 사용할 수 없습니다.", ephemeral=True)
+    if await _reject_if_channel_disallowed(interaction):
+        return
         return
 
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+    if action in {"video_publish_youtube", "video_publish_both"}:
+        try:
+            if action == "video_publish_youtube":
+                targets = ["youtube"]
+                label = "유튜브"
+            else:
+                targets = ["youtube", "instagram"]
+                label = "유튜브 + 인스타그램"
+            token = uuid.uuid4().hex[:12]
+            publish_title_pending[token] = {
+                "user_id": user_id,
+                "job_id": job_id,
+                "targets": targets,
+                "label": label,
+                "publish_title": "",
+            }
+            await interaction.response.send_modal(_YoutubeTitleModal(token))
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+        return
+
+    # 구형 확인 버튼(legacy custom_id)도 제목 모달 경로로 강제한다.
+    if action in {"video_publish_confirm_youtube", "video_publish_confirm_both"}:
+        try:
+            if action == "video_publish_confirm_youtube":
+                targets = ["youtube"]
+                label = "유튜브"
+            else:
+                targets = ["youtube", "instagram"]
+                label = "유튜브 + 인스타그램"
+            token = uuid.uuid4().hex[:12]
+            publish_title_pending[token] = {
+                "user_id": user_id,
+                "job_id": job_id,
+                "targets": targets,
+                "label": label,
+                "publish_title": "",
+            }
+            await interaction.response.send_modal(_YoutubeTitleModal(token))
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
         return
 
     # Discord 컴포넌트는 3초 안에 응답해야 하므로 먼저 defer하고 실제 처리는 뒤에서 한다.
@@ -646,17 +784,10 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
-    elif action in {"video_publish_youtube", "video_publish_instagram", "video_publish_both"}:
+    elif action in {"video_publish_instagram"}:
         try:
-            if action == "video_publish_youtube":
-                label = "유튜브"
-                confirm_action = "video_publish_confirm_youtube"
-            elif action == "video_publish_instagram":
-                label = "인스타그램"
-                confirm_action = "video_publish_confirm_instagram"
-            else:
-                label = "유튜브 + 인스타그램"
-                confirm_action = "video_publish_confirm_both"
+            label = "인스타그램"
+            confirm_action = "video_publish_confirm_instagram"
 
             view = _build_button_view(
                 (f"✅ {label} 최종 승인", f"{confirm_action}:{job_id}", discord.ButtonStyle.danger),
@@ -670,22 +801,78 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
-    elif action in {"video_publish_confirm_youtube", "video_publish_confirm_instagram", "video_publish_confirm_both"}:
+    elif action in {"video_publish_confirm_title", "video_publish_cancel_title"}:
+        intent = publish_title_pending.get(publish_token)
+        if not intent:
+            await interaction.followup.send("⏱️ 제목 입력 세션이 만료되었습니다. 다시 업로드 버튼을 눌러주세요.", ephemeral=True)
+            return
+        if str(intent.get("user_id", "")) != user_id:
+            await interaction.followup.send("이 제목 입력 세션은 요청한 사용자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        if action == "video_publish_cancel_title":
+            publish_title_pending.pop(publish_token, None)
+            await interaction.followup.send("SNS 업로드 요청을 취소했습니다.", ephemeral=True)
+            return
+
         try:
-            if action == "video_publish_confirm_youtube":
-                targets = ["youtube"]
-                label = "유튜브"
-            elif action == "video_publish_confirm_instagram":
+            targets = list(intent.get("targets") or [])
+            label = str(intent.get("label") or "유튜브")
+            publish_title = str(intent.get("publish_title") or "").strip()
+            result = await gateway_call(
+                "/internal/video-action",
+                {
+                    "job_id": str(intent.get("job_id") or job_id),
+                    "action": "approved",
+                    "targets": targets,
+                    "publish_title": publish_title,
+                },
+            )
+            publish_title_pending.pop(publish_token, None)
+            result_action = str(result.get("action") or "").strip()
+            if result_action == "already_published":
+                await interaction.followup.send(
+                    f"ℹ️ {label} 업로드는 이미 완료되어 있어 중복 실행하지 않았습니다.",
+                    ephemeral=True,
+                )
+            elif result_action == "already_publishing":
+                await interaction.followup.send(
+                    f"⏳ {label} 업로드가 이미 진행 중입니다. 완료 메시지를 기다려주세요.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"✅ {label} 업로드를 시작합니다. WF-08 실행 중...",
+                    ephemeral=True,
+                )
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+
+    elif action in {"video_publish_confirm_instagram"}:
+        try:
+            if action == "video_publish_confirm_instagram":
                 targets = ["instagram"]
                 label = "인스타그램"
-            else:
-                targets = ["youtube", "instagram"]
-                label = "유튜브 + 인스타그램"
-            await gateway_call(
+            result = await gateway_call(
                 "/internal/video-action",
                 {"job_id": job_id, "action": "approved", "targets": targets},
             )
-            await interaction.followup.send(f"✅ {label} 업로드를 시작합니다. WF-08 실행 중...", ephemeral=True)
+            result_action = str(result.get("action") or "").strip()
+            if result_action == "already_published":
+                await interaction.followup.send(
+                    f"ℹ️ {label} 업로드는 이미 완료되어 있어 중복 실행하지 않았습니다.",
+                    ephemeral=True,
+                )
+            elif result_action == "already_publishing":
+                await interaction.followup.send(
+                    f"⏳ {label} 업로드가 이미 진행 중입니다. 완료 메시지를 기다려주세요.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"✅ {label} 업로드를 시작합니다. WF-08 실행 중...",
+                    ephemeral=True,
+                )
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
 
@@ -782,7 +969,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
         try:
             if avatar_index is None:
                 raise RuntimeError("avatar_index is required")
-            await gateway_call(
+            result = await gateway_call(
                 "/internal/tts-action",
                 {
                     "job_id": job_id,
@@ -790,7 +977,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                     "avatar_index": avatar_index,
                 },
             )
-            avatar_label = {0: "정장", 1: "후드", 2: "셔츠"}.get(avatar_index, f"#{avatar_index}")
+            avatar_label = str(result.get("avatar_label") or f"#{avatar_index}")
             await interaction.followup.send(
                 f"👤 아바타를 `{avatar_label}`(으)로 선택했습니다. 이제 일반 승인 또는 고화질 승인을 진행하세요.",
                 ephemeral=True,

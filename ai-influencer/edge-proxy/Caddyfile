@@ -1,0 +1,7 @@
+{$EDGE_TTS_HOST} {
+	reverse_proxy {$EDGE_TTS_UPSTREAM:127.0.0.1:19880}
+}
+
+{$EDGE_SEEDLAB_EVAL_HOST} {
+	reverse_proxy {$EDGE_SEEDLAB_EVAL_UPSTREAM:127.0.0.1:18400}
+}

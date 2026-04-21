@@ -31,6 +31,16 @@ CHROMIUM_LAUNCH_ARGS = [
 ]
 DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
 _BROWSER_INSTALL_ATTEMPTED = False
+_COST_TRACKING_MARKER = "COST_TRACKING_JSON:"
+_COST_TRACKER_API_KEY_FAMILY = "cua_generate_report"
+_COST_TRACKER: dict[str, object] = {
+    "api_key_family": _COST_TRACKER_API_KEY_FAMILY,
+    "request_count": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "models": {},
+}
 
 SYSTEM_PROMPT = """You are a browser automation assistant controlling a Chromium browser via Playwright.
 Given a screenshot of the current browser state and a task, output a JSON action to perform.
@@ -77,6 +87,49 @@ Rules:
 - Prefer `collect` when titles are visible, `scroll` when more titles may exist.
 - Output only JSON and nothing else.
 """
+
+
+def reset_cost_tracker() -> None:
+    global _COST_TRACKER
+    _COST_TRACKER = {
+        "api_key_family": _COST_TRACKER_API_KEY_FAMILY,
+        "request_count": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "models": {},
+    }
+
+
+def set_cost_tracker_api_key_family(api_key_family: str) -> None:
+    global _COST_TRACKER_API_KEY_FAMILY
+    _COST_TRACKER_API_KEY_FAMILY = str(api_key_family or "").strip() or "cua_generate_report"
+    reset_cost_tracker()
+
+
+def _record_openai_usage(response: object, default_model: str) -> None:
+    usage = getattr(response, "usage", None)
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+        return
+    model_name = str(getattr(response, "model", "") or default_model or "")
+    _COST_TRACKER["request_count"] = int(_COST_TRACKER.get("request_count") or 0) + 1
+    _COST_TRACKER["prompt_tokens"] = int(_COST_TRACKER.get("prompt_tokens") or 0) + prompt_tokens
+    _COST_TRACKER["completion_tokens"] = int(_COST_TRACKER.get("completion_tokens") or 0) + completion_tokens
+    _COST_TRACKER["total_tokens"] = int(_COST_TRACKER.get("total_tokens") or 0) + total_tokens
+    models = _COST_TRACKER.get("models") if isinstance(_COST_TRACKER.get("models"), dict) else {}
+    model_bucket = models.setdefault(model_name, {"request_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    model_bucket["request_count"] = int(model_bucket.get("request_count") or 0) + 1
+    model_bucket["prompt_tokens"] = int(model_bucket.get("prompt_tokens") or 0) + prompt_tokens
+    model_bucket["completion_tokens"] = int(model_bucket.get("completion_tokens") or 0) + completion_tokens
+    model_bucket["total_tokens"] = int(model_bucket.get("total_tokens") or 0) + total_tokens
+    _COST_TRACKER["models"] = models
+
+
+def emit_cost_tracking_summary() -> None:
+    print(f"{_COST_TRACKING_MARKER}{json.dumps(_COST_TRACKER, ensure_ascii=False)}")
 
 LOGIN_SYSTEM_PROMPT = """You are a browser automation assistant controlling a Chromium browser via Playwright for Google sign-in.
 Given a screenshot of the current browser state and a task, output a JSON action to perform.
@@ -305,9 +358,16 @@ def _assert_allowed_url(current_url: str, phase: str) -> None:
 
 def _build_openai_client() -> OpenAI:
     """CUA는 전용 키 우선 사용. 없으면 일반 키를 fallback."""
-    api_key = os.environ.get("OPENAI_CUA_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = (
+        os.environ.get("OPENAI_API_KEY_CUA_GENERATE_REPORT", "").strip()
+        or os.environ.get("OPENAI_FALLBACK_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
     if not api_key:
-        raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+        raise RuntimeError(
+            "OPENAI_API_KEY_CUA_GENERATE_REPORT 또는 OPENAI_FALLBACK_API_KEY "
+            "(legacy OPENAI_API_KEY 포함)가 필요합니다."
+        )
     return OpenAI(api_key=api_key)
 
 
@@ -1175,6 +1235,7 @@ def _run_cua_loop(
             max_completion_tokens=256,
             temperature=0,
         )
+        _record_openai_usage(response, "gpt-5.4")
 
         raw = (response.choices[0].message.content or "").strip()
         logger.info("[CUA][%s] 모델 응답: %s", phase, raw[:200])
@@ -1275,6 +1336,7 @@ def _run_list_cua_loop(
                 max_completion_tokens=400,
                 temperature=0,
             )
+            _record_openai_usage(response, "gpt-5.4")
         except Exception as e:
             meta["model_errors"] = int(meta["model_errors"]) + 1
             no_new_rounds += 1
@@ -1822,6 +1884,7 @@ def generate_report(prompt: str, notebook_url: str, output_path: str, headless: 
 
 
 def main():
+    set_cost_tracker_api_key_family("cua_generate_report")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="generate", choices=["generate", "list", "get"])
     parser.add_argument("--prompt", default="")
@@ -1865,4 +1928,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error("[CUA][FATAL] %s", e)
         traceback.print_exc()
+        emit_cost_tracking_summary()
         raise
+    else:
+        emit_cost_tracking_summary()

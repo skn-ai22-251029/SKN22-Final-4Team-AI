@@ -26,6 +26,8 @@ from generate_report_cua import (
     _ensure_logged_in,
     _assert_allowed_url,
     _run_cua_loop,
+    emit_cost_tracking_summary,
+    set_cost_tracker_api_key_family,
 )
 from openai import OpenAI
 
@@ -42,9 +44,16 @@ NOTEBOOKLM_HOME = "https://notebooklm.google.com"
 
 
 def _build_openai_client() -> OpenAI:
-    api_key = os.environ.get("OPENAI_CUA_API_KEY", "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = (
+        os.environ.get("OPENAI_API_KEY_CUA_MANAGE_SOURCES", "").strip()
+        or os.environ.get("OPENAI_FALLBACK_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
     if not api_key:
-        raise RuntimeError("OPENAI_CUA_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+        raise RuntimeError(
+            "OPENAI_API_KEY_CUA_MANAGE_SOURCES 또는 OPENAI_FALLBACK_API_KEY "
+            "(legacy OPENAI_API_KEY 포함)가 필요합니다."
+        )
     return OpenAI(api_key=api_key)
 
 
@@ -363,6 +372,7 @@ def find_notebook_url_by_name_cua(page, client, channel_name: str) -> str:
 # ─────────────────────────────────────────
 
 def main():
+    set_cost_tracker_api_key_family("cua_manage_sources")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=["list", "add", "delete", "cleanup", "find"])
     parser.add_argument("--notebook-url", default="")
@@ -466,4 +476,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        emit_cost_tracking_summary()

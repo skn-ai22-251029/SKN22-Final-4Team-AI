@@ -105,11 +105,11 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE jobs SET status='PUBLISHED', final_url='{{ $('Send Report to Gateway').item.json.s3_uri || '' }}', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
+        "query": "UPDATE jobs SET status='REPORT_READY', final_url='{{ $('Send Report to Gateway').item.json.s3_uri || '' }}', updated_at=NOW() WHERE id='{{ $('Extract Fields').item.json.job_id }}'",
         "options": {}
       },
       "id": "wf06-pg-published",
-      "name": "Update to PUBLISHED",
+      "name": "Update to REPORT_READY",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [1340, 180],
@@ -222,7 +222,7 @@
       ]
     },
     "Send Report to Gateway": {
-      "main": [[{"node": "Update to PUBLISHED", "type": "main", "index": 0}]]
+      "main": [[{"node": "Update to REPORT_READY", "type": "main", "index": 0}]]
     },
     "Update to FAILED": {
       "main": [[{"node": "IF Auto Report Failure", "type": "main", "index": 0}]]

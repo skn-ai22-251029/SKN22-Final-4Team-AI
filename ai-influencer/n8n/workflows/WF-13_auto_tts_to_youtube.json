@@ -1,0 +1,70 @@
+{
+  "id": "WF13AutoTtsToYoutube0930",
+  "name": "WF-13: 자동 TTS → 영상 → YouTube 업로드",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "wf13-schedule",
+      "name": "매일 오전 9시 30분 실행",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://messenger-gateway:8080/internal/wf13-run-batch",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Internal-Secret",
+              "value": "={{ $env.GATEWAY_INTERNAL_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ seed: 1515076784, avatar_id: 'b903a1fd1ec846e0ba2e89620bc0aaae', use_avatar_iv_model: false, targets: ['youtube'] }) }}",
+        "options": {
+          "timeout": 3600000
+        }
+      },
+      "id": "wf13-http-run-batch",
+      "name": "WF-13 배치 실행",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    }
+  ],
+  "connections": {
+    "매일 오전 9시 30분 실행": {
+      "main": [
+        [
+          {
+            "node": "WF-13 배치 실행",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {}
+}

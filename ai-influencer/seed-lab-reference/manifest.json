@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "reference_set_id": "hari-global-v1",
+  "voice_id": "hari",
+  "files": [
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_01.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_01"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_02.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_02"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_03.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_03"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_04.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_04"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_05.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_05"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_06.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_06"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_07.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_07"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_08.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_08"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_09.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_09"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_10.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_10"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_11.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_11"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_12.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_12"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_13.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_13"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_14.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_14"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_15.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_15"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_16.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_16"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_17.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_17"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_18.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_18"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_19.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_19"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_20.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_20"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_21.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_21"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_22.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_22"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_23.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_23"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_24.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_24"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_25.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_25"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_26.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_26"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_27.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_27"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_28.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_28"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_29.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_29"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_30.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_30"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_31.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_31"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_32.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_32"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_33.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_33"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_34.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_34"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_35.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_35"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_36.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_36"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_37.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_37"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_38.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_38"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_39.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_39"
+    },
+    {
+      "key": "seed-lab-reference/hari-global-v1/audio/voice_40.wav",
+      "weight": 1.0,
+      "enabled": true,
+      "label": "voice_40"
+    }
+  ]
+}

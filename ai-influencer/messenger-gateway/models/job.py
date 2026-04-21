@@ -12,6 +12,7 @@ class JobStatus(str, Enum):
     WAITING_APPROVAL = "WAITING_APPROVAL"
     REVISION_REQUESTED = "REVISION_REQUESTED"
     APPROVED = "APPROVED"
+    REPORT_READY = "REPORT_READY"
     WAITING_VIDEO_APPROVAL = "WAITING_VIDEO_APPROVAL"
     PUBLISHING = "PUBLISHING"
     PUBLISHED = "PUBLISHED"
@@ -125,6 +126,7 @@ class VideoActionRequest(BaseModel):
     action: str  # "approved" | "reject_select" | "reject_step"
     step: Optional[str] = None  # "script" | "tts" | "draft"
     targets: list[str] = []
+    publish_title: str = ""
 
 
 class ReportToVideoRequest(BaseModel):
@@ -180,8 +182,66 @@ class AutoReportRequest(BaseModel):
     source_title: str = ""
 
 
-class CostEventIngestRequest(BaseModel):
+class Wf13RunJobRequest(BaseModel):
     job_id: str
+    seed: int = 1515076784
+    avatar_id: str = "b903a1fd1ec846e0ba2e89620bc0aaae"
+    use_avatar_iv_model: bool = False
+    targets: list[str] = ["youtube"]
+
+
+class Wf13PreflightRequest(BaseModel):
+    channel_ids: list[str] = []
+
+
+class Wf13RunBatchRequest(BaseModel):
+    seed: int = 1515076784
+    avatar_id: str = "b903a1fd1ec846e0ba2e89620bc0aaae"
+    use_avatar_iv_model: bool = False
+    targets: list[str] = ["youtube"]
+
+
+class SeedLabStartRequest(BaseModel):
+    messenger_user_id: str
+    messenger_channel_id: str
+    seeds: str = ""
+    dup: bool = False
+
+
+class SeedLabRefreshLinkRequest(BaseModel):
+    run_id: str
+    messenger_user_id: str = ""
+    messenger_channel_id: str = ""
+
+
+class SeedLabProgressRequest(BaseModel):
+    run_id: str
+    status: str = ""
+    stage: str = ""
+    eval_location: str = ""
+    generated_count: int = 0
+    evaluated_count: int = 0
+    ready_count: int = 0
+    failed_count: int = 0
+    eval_failed_count: int = 0
+    total_count: int = 0
+    runpod_job_count: int = 0
+    gpu_active_sample_count: int = 0
+    remote_eval_failed_count: int = 0
+    remote_eval_last_error: str = ""
+    eval_executor_counts: dict = {}
+    avg_stage_timings_ms: dict = {}
+    last_error: str = ""
+    finished_at: str = ""
+
+
+class CostViewerLinkRequest(BaseModel):
+    messenger_user_id: str
+    messenger_channel_id: str
+
+
+class CostEventIngestRequest(BaseModel):
+    job_id: str = ""
     topic_text: str = ""
     stage: str
     process: str
@@ -193,6 +253,12 @@ class CostEventIngestRequest(BaseModel):
     usage_json: dict = {}
     raw_response_json: dict = {}
     cost_usd: Optional[float] = None
+    pricing_kind: str = ""
+    pricing_source: str = ""
+    api_key_family: str = ""
+    subject_type: str = ""
+    subject_key: str = ""
+    subject_label: str = ""
     error_type: str = ""
     error_message: str = ""
     idempotency_key: str = ""

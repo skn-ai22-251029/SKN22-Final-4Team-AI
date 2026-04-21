@@ -7,5 +7,6 @@
   "WF-09-youtube-source.json",
   "WF-10-daily-notebook.json",
   "WF-11_tts_generate.json",
-  "WF-12_heygen_generate.json"
+  "WF-12_heygen_generate.json",
+  "WF-13_auto_tts_to_youtube.json"
 ]
