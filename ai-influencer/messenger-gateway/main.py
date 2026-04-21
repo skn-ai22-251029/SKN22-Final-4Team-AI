@@ -17,6 +17,7 @@ from typing import Annotated, Any, Awaitable, Callable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from openai import AsyncOpenAI
@@ -6853,7 +6854,7 @@ async def _costs_export_payload(
     )
     filename = f"cost-export-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
     return JSONResponse(
-        content=payload,
+        content=jsonable_encoder(payload),
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -7299,14 +7300,11 @@ def _cost_viewer_html(api_base_path: str) -> str:
       var data = await fetchJson(buildListUrl(offset));
       currentOffset = offset; currentTotal = num(data.total);
       var items = Array.isArray(data.items) ? data.items : [];
-      var mu = 0, mk = 0, ms = 0;
       q("rows").innerHTML = "";
       for (var i = 0; i < items.length; i++) {
         var rec = items[i]; var byP = rec.by_pricing_kind || {};
         var mainKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
         var estKrw  = num((byP.estimated||{}).cost_krw);
-        mu += num(rec.main_cost_usd); mk += mainKrw;
-        ms += num(rec.missing_cost_event_count);
         var shortKey = String(rec.subject_key || rec.job_id || "").slice(0, 8);
         var tr = document.createElement("tr");
         tr.innerHTML =
@@ -7330,7 +7328,11 @@ def _cost_viewer_html(api_base_path: str) -> str:
         })(rec, tr);
         q("rows").appendChild(tr);
       }
-      q("mainCostUsd").textContent = fmtUsd(mu); q("mainCostKrw").textContent = fmtKrw(mk);
+      var listSummary = data.summary || {};
+      var listByP = listSummary.by_pricing_kind || {};
+      var summaryMainKrw = num((listByP.actual||{}).cost_krw) + num((listByP.fixed||{}).cost_krw);
+      q("mainCostUsd").textContent = fmtUsd(listSummary.main_cost_usd);
+      q("mainCostKrw").textContent = fmtKrw(summaryMainKrw);
       var dailyEstimate = data.daily_estimate || {};
       if (num(dailyEstimate.sample_count) > 0) {
         q("estimatedCostUsd").textContent = fmtUsd(dailyEstimate.estimated_daily_cost_usd);
@@ -7340,7 +7342,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
         q("estimatedCostKrw").textContent = "\uD45C\uBCF8 \uC5C6\uC74C";
       }
       q("estimatedCostBasis").textContent = dailyEstimate.basis || "\uD45C\uBCF8 \uC5C6\uC74C";
-      q("missingCount").textContent = String(ms);
+      q("missingCount").textContent = String(num(listSummary.missing_cost_event_count));
       q("rowCount").textContent = items.length + "\uAC74";
       q("totalCount").textContent = "\uC804\uCCB4 " + currentTotal + "\uAC74";
       var ps = pageSize(), fr = currentOffset + 1, to2 = Math.min(currentOffset + items.length, currentTotal);

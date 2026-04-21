@@ -227,9 +227,9 @@ def _bucket_add(bucket: dict[str, dict[str, float | int]], key: str, cost_usd: O
     item["cost_krw"] = round(float(item.get("cost_krw") or 0.0) + float(cost_krw or 0.0), 3)
 
 
-def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
-    summary = {
-        "total_events": len(events),
+def _empty_cost_summary(*, total_events: int = 0) -> dict[str, Any]:
+    return {
+        "total_events": total_events,
         "total_cost_usd": 0.0,
         "total_cost_krw": 0.0,
         "actual_cost_usd": 0.0,
@@ -244,6 +244,20 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "by_subject_type": {},
         "by_pricing_kind": {},
     }
+
+
+def _bucket_merge(target: dict[str, dict[str, float | int]], source: dict[str, Any]) -> None:
+    for key, source_item in (source or {}).items():
+        if not isinstance(source_item, dict):
+            continue
+        item = target.setdefault(str(key or "(empty)"), {"cost_usd": 0.0, "cost_krw": 0.0, "count": 0})
+        item["count"] = int(item.get("count") or 0) + int(source_item.get("count") or 0)
+        item["cost_usd"] = round(float(item.get("cost_usd") or 0.0) + float(source_item.get("cost_usd") or 0.0), 6)
+        item["cost_krw"] = round(float(item.get("cost_krw") or 0.0) + float(source_item.get("cost_krw") or 0.0), 3)
+
+
+def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _empty_cost_summary(total_events=len(events))
     for event in events:
         cost_usd = _safe_float(event.get("cost_usd")) or 0.0
         cost_krw = _safe_float(event.get("cost_krw")) or 0.0
@@ -266,6 +280,26 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         _bucket_add(summary["by_subject_type"], str(event.get("subject_type") or "").strip(), cost_usd, cost_krw)
         if not ignored_missing:
             _bucket_add(summary["by_pricing_kind"], pricing_kind, cost_usd, cost_krw)
+    summary["main_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(summary["fixed_cost_usd"]), 6)
+    return summary
+
+
+def _summarize_subject_summaries(items: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _empty_cost_summary()
+    for item in items:
+        summary["total_events"] = int(summary["total_events"]) + int(item.get("total_events") or 0)
+        summary["total_cost_usd"] = round(float(summary["total_cost_usd"]) + float(item.get("total_cost_usd") or 0.0), 6)
+        summary["total_cost_krw"] = round(float(summary["total_cost_krw"]) + float(item.get("total_cost_krw") or 0.0), 3)
+        summary["actual_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(item.get("actual_cost_usd") or 0.0), 6)
+        summary["estimated_cost_usd"] = round(float(summary["estimated_cost_usd"]) + float(item.get("estimated_cost_usd") or 0.0), 6)
+        summary["fixed_cost_usd"] = round(float(summary["fixed_cost_usd"]) + float(item.get("fixed_cost_usd") or 0.0), 6)
+        summary["missing_cost_event_count"] = int(summary["missing_cost_event_count"]) + int(item.get("missing_cost_event_count") or 0)
+        _bucket_merge(summary["by_stage"], item.get("by_stage") or {})
+        _bucket_merge(summary["by_process"], item.get("by_process") or {})
+        _bucket_merge(summary["by_provider"], item.get("by_provider") or {})
+        _bucket_merge(summary["by_api_key_family"], item.get("by_api_key_family") or {})
+        _bucket_merge(summary["by_subject_type"], item.get("by_subject_type") or {})
+        _bucket_merge(summary["by_pricing_kind"], item.get("by_pricing_kind") or {})
     summary["main_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(summary["fixed_cost_usd"]), 6)
     return summary
 
@@ -761,6 +795,7 @@ async def list_jobs_summary(
                 **summary,
             }
         )
+    summary = _summarize_subject_summaries(enriched)
     sorted_items = _sort_job_summary_items(enriched, sort_by=normalized_sort_by, sort_dir=normalized_sort_dir)
     selected = sorted_items[offset_value : offset_value + limit_value]
 
@@ -771,6 +806,7 @@ async def list_jobs_summary(
         "subject_type": normalized_subject_type,
         "sort_by": normalized_sort_by,
         "sort_dir": normalized_sort_dir,
+        "summary": summary,
         "daily_estimate": daily_estimate,
         "items": selected,
     }
