@@ -12,6 +12,10 @@ SUBJECT_TYPES = {"job", "operation"}
 JOB_SUMMARY_SORT_FIELDS = {"updated_at", "created_at", "main_cost_usd", "estimated_cost_usd"}
 JOB_SUMMARY_SORT_DIRECTIONS = {"asc", "desc"}
 EPOCH_UTC = datetime.fromtimestamp(0, timezone.utc)
+FIXED_INFRA_PROCESS = "daily_fixed_allocation"
+FIXED_INFRA_PROVIDERS = {"aws_fixed", "runpod_fixed"}
+DAILY_ESTIMATE_TARGET_VIDEO_COUNT = 3
+DAILY_ESTIMATE_SAMPLE_LIMIT = 10
 
 
 def _to_json(value: Any) -> str:
@@ -72,6 +76,43 @@ def _sort_job_summary_items(items: list[dict[str, Any]], *, sort_by: str, sort_d
     else:
         sorted_items.sort(key=lambda item: _sort_datetime(item.get(sort_by)), reverse=reverse)
     return sorted_items
+
+
+def _is_fixed_infra_event(event: dict[str, Any]) -> bool:
+    process = str(event.get("process") or "").strip()
+    provider = str(event.get("provider") or "").strip()
+    return process == FIXED_INFRA_PROCESS or provider in FIXED_INFRA_PROVIDERS
+
+
+def _visible_cost_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [event for event in events if not _is_fixed_infra_event(event)]
+
+
+def _daily_estimate_payload(*, sample_count: int, average_variable_cost_usd: float) -> dict[str, Any]:
+    target_video_count = DAILY_ESTIMATE_TARGET_VIDEO_COUNT
+    aws_daily_fixed_usd = float(settings.aws_daily_fixed_usd or 0.0)
+    estimated_daily_cost_usd = (
+        round((average_variable_cost_usd * target_video_count) + aws_daily_fixed_usd, 6) if sample_count > 0 else 0.0
+    )
+    average_variable_cost_krw = _cost_krw(average_variable_cost_usd) or 0.0
+    aws_daily_fixed_krw = _cost_krw(aws_daily_fixed_usd) or 0.0
+    estimated_daily_cost_krw = _cost_krw(estimated_daily_cost_usd) or 0.0
+    return {
+        "sample_count": sample_count,
+        "sample_limit": DAILY_ESTIMATE_SAMPLE_LIMIT,
+        "target_video_count": target_video_count,
+        "average_variable_cost_usd": round(average_variable_cost_usd, 6),
+        "average_variable_cost_krw": round(average_variable_cost_krw, 3),
+        "aws_daily_fixed_usd": round(aws_daily_fixed_usd, 6),
+        "aws_daily_fixed_krw": round(aws_daily_fixed_krw, 3),
+        "estimated_daily_cost_usd": estimated_daily_cost_usd,
+        "estimated_daily_cost_krw": round(estimated_daily_cost_krw, 3),
+        "basis": (
+            f"최근 {sample_count}개 평균 × {target_video_count} + AWS 고정비"
+            if sample_count > 0
+            else "표본 없음"
+        ),
+    }
 
 
 def _normalize_pricing_kind(
@@ -483,6 +524,80 @@ async def _fetch_subject_events(
     return grouped
 
 
+async def _fetch_daily_estimate(
+    conn: Any,
+    *,
+    from_date: Optional[date],
+    to_date: Optional[date],
+    search: str,
+    status: str,
+) -> dict[str, Any]:
+    where = []
+    params: list[Any] = []
+    if from_date:
+        start_utc, _ = _kst_day_range(from_date)
+        params.append(start_utc)
+        where.append(f"j.created_at >= ${len(params)}")
+    if to_date:
+        _, end_utc = _kst_day_range(to_date)
+        params.append(end_utc)
+        where.append(f"j.created_at < ${len(params)}")
+    if search:
+        params.append(f"%{search}%")
+        where.append(f"(j.id::text ILIKE ${len(params)} OR COALESCE(j.concept_text,'') ILIKE ${len(params)})")
+    if status.strip():
+        params.append(status.strip())
+        where.append(f"j.status = ${len(params)}")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    params.append(DAILY_ESTIMATE_SAMPLE_LIMIT)
+    row = await conn.fetchrow(
+        f"""
+        WITH filtered_jobs AS (
+          SELECT j.id
+          FROM jobs j
+          {where_sql}
+        ),
+        heygen_success AS (
+          SELECT ce.job_id, MAX(ce.created_at) AS video_ready_at
+          FROM cost_events ce
+          JOIN filtered_jobs fj ON fj.id = ce.job_id
+          WHERE ce.stage = 'video'
+            AND ce.process = 'heygen_generate'
+            AND ce.status = 'success'
+            AND ce.job_id IS NOT NULL
+          GROUP BY ce.job_id
+        ),
+        picked AS (
+          SELECT job_id, video_ready_at
+          FROM heygen_success
+          ORDER BY video_ready_at DESC
+          LIMIT ${len(params)}
+        ),
+        per_job AS (
+          SELECT
+            p.job_id,
+            COALESCE(SUM(
+              CASE
+                WHEN ce.process = 'daily_fixed_allocation' OR ce.provider IN ('aws_fixed', 'runpod_fixed') THEN 0
+                ELSE COALESCE(ce.cost_usd, 0)
+              END
+            ), 0) AS variable_cost_usd
+          FROM picked p
+          LEFT JOIN cost_events ce ON ce.job_id = p.job_id
+          GROUP BY p.job_id
+        )
+        SELECT
+          COUNT(*)::int AS sample_count,
+          COALESCE(AVG(variable_cost_usd), 0)::float AS average_variable_cost_usd
+        FROM per_job
+        """,
+        *params,
+    )
+    sample_count = int(row["sample_count"] if row else 0)
+    average_variable_cost_usd = float(row["average_variable_cost_usd"] if row else 0.0)
+    return _daily_estimate_payload(sample_count=sample_count, average_variable_cost_usd=average_variable_cost_usd)
+
+
 async def list_jobs_summary(
     *,
     from_date: Optional[date],
@@ -507,8 +622,16 @@ async def list_jobs_summary(
     items: list[dict[str, Any]] = []
     total_jobs = 0
     total_operations = 0
+    daily_estimate: dict[str, Any] = _daily_estimate_payload(sample_count=0, average_variable_cost_usd=0.0)
 
     async with pool.acquire() as conn:
+        daily_estimate = await _fetch_daily_estimate(
+            conn,
+            from_date=from_date,
+            to_date=to_date,
+            search=search,
+            status=status,
+        )
         if include_jobs:
             where = []
             params: list[Any] = []
@@ -549,7 +672,10 @@ async def list_jobs_summary(
             items.extend(dict(row) for row in rows)
 
         if include_operations:
-            where = ["subject_type = 'operation'"]
+            where = [
+                "subject_type = 'operation'",
+                "NOT (process = 'daily_fixed_allocation' OR provider IN ('aws_fixed', 'runpod_fixed'))",
+            ]
             params = []
             if from_date:
                 start_utc, _ = _kst_day_range(from_date)
@@ -601,14 +727,15 @@ async def list_jobs_summary(
         subject_key = str(item.get("subject_key") or "")
         subject_type_value = str(item.get("subject_type") or "")
         events = event_map.get((subject_type_value, subject_key), [])
-        summary = _summarize_events(events)
+        visible_events = _visible_cost_events(events)
+        summary = _summarize_events(visible_events)
         stage_counts = {
-            "script_success": sum(1 for event in events if event.get("stage") == "script" and event.get("status") == "success"),
-            "script_failed": sum(1 for event in events if event.get("stage") == "script" and event.get("status") == "failed"),
-            "tts_success": sum(1 for event in events if event.get("stage") == "tts" and event.get("status") == "success"),
-            "tts_failed": sum(1 for event in events if event.get("stage") == "tts" and event.get("status") == "failed"),
-            "video_success": sum(1 for event in events if event.get("stage") == "video" and event.get("status") == "success"),
-            "video_failed": sum(1 for event in events if event.get("stage") == "video" and event.get("status") == "failed"),
+            "script_success": sum(1 for event in visible_events if event.get("stage") == "script" and event.get("status") == "success"),
+            "script_failed": sum(1 for event in visible_events if event.get("stage") == "script" and event.get("status") == "failed"),
+            "tts_success": sum(1 for event in visible_events if event.get("stage") == "tts" and event.get("status") == "success"),
+            "tts_failed": sum(1 for event in visible_events if event.get("stage") == "tts" and event.get("status") == "failed"),
+            "video_success": sum(1 for event in visible_events if event.get("stage") == "video" and event.get("status") == "success"),
+            "video_failed": sum(1 for event in visible_events if event.get("stage") == "video" and event.get("status") == "failed"),
         }
         enriched.append(
             {
@@ -627,6 +754,7 @@ async def list_jobs_summary(
         "subject_type": normalized_subject_type,
         "sort_by": normalized_sort_by,
         "sort_dir": normalized_sort_dir,
+        "daily_estimate": daily_estimate,
         "items": selected,
     }
 
@@ -708,7 +836,7 @@ async def get_job_detail(subject_key: str) -> dict[str, Any]:
             subject_type_value,
             subject_key,
         )
-    event_dicts = [dict(event) for event in events]
+    event_dicts = _visible_cost_events([dict(event) for event in events])
     return {
         "subject": subject_dict,
         "summary": _summarize_events(event_dicts),

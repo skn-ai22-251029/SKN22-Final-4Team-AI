@@ -6009,10 +6009,7 @@ async def wf13_run_job(_: AuthDep, body: Wf13RunJobRequest) -> dict:
             retryable=retryable,
             blocked_reason=blocked_reason,
         )
-        if failure_stage == "publish":
-            await job_service.transition_status(body.job_id, "PUBLISH_FAILED")
-        else:
-            await job_service.transition_status(body.job_id, "PUBLISHED")
+        await job_service.transition_status(body.job_id, "PUBLISH_FAILED")
         await job_service.update_job(body.job_id, script_json=failed_script, error_message=f"WF-13 failed: {e}")
         if blocked_reason == "heygen_insufficient_credit":
             await _wf13_notify(channel_id, "⚠️ WF-13 자동 영상 생성이 중단되었습니다. HeyGen API credit이 부족합니다. 충전 후 다시 실행해야 합니다.")
@@ -6883,9 +6880,10 @@ def _cost_viewer_html(api_base_path: str) -> str:
         <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
       </div>
       <div class="card">
-        <div class="clabel">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</div>
+        <div class="clabel">&#xC77C;&#xC77C; &#xBE44;&#xC6A9; &#xC608;&#xC0C1; (3&#xAC1C; &#xC601;&#xC0C1; &#xAE30;&#xC900;)</div>
         <div class="cusd" id="estimatedCostUsd">$0.000000</div>
         <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
+        <div class="ckrw" id="estimatedCostBasis">&#xD45C;&#xBCF8; &#xC5C6;&#xC74C;</div>
       </div>
       <div class="card">
         <div class="clabel">&#xBE44;&#xC6A9; &#xC815;&#xBCF4; &#xC5C6;&#xC74C;</div>
@@ -7023,7 +7021,8 @@ def _cost_viewer_html(api_base_path: str) -> str:
     PUBLISHED: "\uBC1C\uD589 \uC644\uB8CC",
     WAITING_VIDEO_APPROVAL: "\uC601\uC0C1 \uC2B9\uC778 \uB300\uAE30",
     APPROVED: "\uC2B9\uC778 \uC644\uB8CC",
-    FAILED: "\uC2E4\uD328"
+    FAILED: "\uC2E4\uD328",
+    PUBLISH_FAILED: "\uBC1C\uD589 \uC2E4\uD328"
   };
   var EVENT_STATUS_LABELS = {
     success: "\uC644\uB8CC",
@@ -7098,7 +7097,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
     if (u === "PUBLISHED") return badge(formatJobStatus(u), "published");
     if (u === "WAITING_VIDEO_APPROVAL") return badge(formatJobStatus(u), "waiting");
     if (u === "APPROVED") return badge(formatJobStatus(u), "approved");
-    if (u === "FAILED") return badge(formatJobStatus(u), "failed");
+    if (u === "FAILED" || u === "PUBLISH_FAILED") return badge(formatJobStatus(u), "failed");
     return badge(formatJobStatus(u), "default");
   }
   function pricingBadge(pk) {
@@ -7168,14 +7167,13 @@ def _cost_viewer_html(api_base_path: str) -> str:
       var data = await fetchJson(buildListUrl(offset));
       currentOffset = offset; currentTotal = num(data.total);
       var items = Array.isArray(data.items) ? data.items : [];
-      var mu = 0, mk = 0, eu = 0, ek = 0, ms = 0;
+      var mu = 0, mk = 0, ms = 0;
       q("rows").innerHTML = "";
       for (var i = 0; i < items.length; i++) {
         var rec = items[i]; var byP = rec.by_pricing_kind || {};
         var mainKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
         var estKrw  = num((byP.estimated||{}).cost_krw);
         mu += num(rec.main_cost_usd); mk += mainKrw;
-        eu += num(rec.estimated_cost_usd); ek += estKrw;
         ms += num(rec.missing_cost_event_count);
         var shortKey = String(rec.subject_key || rec.job_id || "").slice(0, 8);
         var tr = document.createElement("tr");
@@ -7201,7 +7199,15 @@ def _cost_viewer_html(api_base_path: str) -> str:
         q("rows").appendChild(tr);
       }
       q("mainCostUsd").textContent = fmtUsd(mu); q("mainCostKrw").textContent = fmtKrw(mk);
-      q("estimatedCostUsd").textContent = fmtUsd(eu); q("estimatedCostKrw").textContent = fmtKrw(ek);
+      var dailyEstimate = data.daily_estimate || {};
+      if (num(dailyEstimate.sample_count) > 0) {
+        q("estimatedCostUsd").textContent = fmtUsd(dailyEstimate.estimated_daily_cost_usd);
+        q("estimatedCostKrw").textContent = fmtKrw(dailyEstimate.estimated_daily_cost_krw);
+      } else {
+        q("estimatedCostUsd").textContent = "\u2013";
+        q("estimatedCostKrw").textContent = "\uD45C\uBCF8 \uC5C6\uC74C";
+      }
+      q("estimatedCostBasis").textContent = dailyEstimate.basis || "\uD45C\uBCF8 \uC5C6\uC74C";
       q("missingCount").textContent = String(ms);
       q("rowCount").textContent = items.length + "\uAC74";
       q("totalCount").textContent = "\uC804\uCCB4 " + currentTotal + "\uAC74";
