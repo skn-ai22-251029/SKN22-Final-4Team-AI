@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 GATEWAY_MAIN = ROOT / "messenger-gateway" / "main.py"
 DISCORD_BOT_MAIN = ROOT / "discord-bot" / "main.py"
+SEEDLAB_MAIN = ROOT / "seed-lab-service" / "main.py"
 
 
 def _load_source(path: Path) -> str:
@@ -32,6 +33,16 @@ class SeedLabRegressionSmokeTests(unittest.TestCase):
         self.assertIn("httpx.ConnectError", source)
         self.assertIn("httpx.TransportError", source)
         self.assertIn("Seed Lab start timed out while waiting for gateway response", source)
+
+    def test_seedlab_runpod_sample_s3_fallback_and_validation_exist(self) -> None:
+        source = _load_source(SEEDLAB_MAIN)
+        functions = _function_names(SEEDLAB_MAIN)
+        self.assertIn("media_s3_bucket", source)
+        self.assertIn("_sample_s3_bucket", functions)
+        self.assertIn("_sample_s3_bucket_source", functions)
+        self.assertIn("_assert_runpod_records_have_s3_audio", functions)
+        self.assertIn("RunPod eval requires sample S3 upload", source)
+        self.assertIn("sample_s3_upload_failed", source)
 
 
 if __name__ == "__main__":

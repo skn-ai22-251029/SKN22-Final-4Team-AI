@@ -34,6 +34,7 @@ from seed_lab import (  # type: ignore
     LIVE_AUTO_EVAL_JSON,
     LIVE_RECORDS_JSONL,
     _auto_eval_single_record,
+    _append_jsonl_object,
     _build_run_id,
     _expand_seed_list_with_random,
     _generate_review_html,
@@ -97,6 +98,7 @@ class Settings(BaseSettings):
     seedlab_sample_s3_bucket: str = ""
     seedlab_sample_s3_prefix: str = "seed-lab-samples"
     seedlab_sample_s3_region: str = "ap-northeast-2"
+    media_s3_bucket: str = ""
     seedlab_asr_cost_usd_per_minute: float = 0.0
     seedlab_judge_input_cost_usd_per_1m: float = 0.0
     seedlab_judge_output_cost_usd_per_1m: float = 0.0
@@ -456,8 +458,32 @@ def _s3_prefix() -> str:
     return str(settings.seedlab_sample_s3_prefix or "seed-lab-samples").strip().strip("/")
 
 
+def _sample_s3_bucket() -> str:
+    explicit_bucket = str(settings.seedlab_sample_s3_bucket or "").strip()
+    if explicit_bucket:
+        return explicit_bucket
+    return str(settings.media_s3_bucket or "").strip()
+
+
+def _sample_s3_bucket_source() -> str:
+    if str(settings.seedlab_sample_s3_bucket or "").strip():
+        return "seedlab"
+    if str(settings.media_s3_bucket or "").strip():
+        return "media"
+    return "none"
+
+
 def _sample_s3_enabled() -> bool:
-    return bool(str(settings.seedlab_sample_s3_bucket or "").strip())
+    return bool(_sample_s3_bucket())
+
+
+def _runpod_sample_s3_config_error_detail() -> str:
+    return "RunPod eval requires sample S3 upload; missing SEEDLAB_SAMPLE_S3_BUCKET or MEDIA_S3_BUCKET"
+
+
+def _ensure_runpod_sample_s3_configured() -> None:
+    if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod" and not _sample_s3_enabled():
+        raise RunpodEvalError("preflight_unhealthy", _runpod_sample_s3_config_error_detail())
 
 
 def _runpod_eval_enabled() -> bool:
@@ -588,7 +614,7 @@ def _record_audio_s3_key(run_id: str, rec: dict[str, Any]) -> str:
 
 def _upload_record_audio_to_s3(run_id: str, run_dir: Path, rec: dict[str, Any]) -> tuple[str, str]:
     if not _sample_s3_enabled():
-        raise RuntimeError("sample S3 upload is not configured")
+        raise RuntimeError(_runpod_sample_s3_config_error_detail())
     audio_rel = str(rec.get("audio_rel_path") or "").strip().replace("\\", "/").lstrip("/")
     if not audio_rel:
         raise RuntimeError("audio_rel_path missing")
@@ -596,7 +622,7 @@ def _upload_record_audio_to_s3(run_id: str, run_dir: Path, rec: dict[str, Any]) 
     if not audio_path.exists():
         raise RuntimeError(f"audio file missing: {audio_path}")
     key = _record_audio_s3_key(run_id, rec)
-    bucket = str(settings.seedlab_sample_s3_bucket or "").strip()
+    bucket = _sample_s3_bucket()
     extra_args = {"ContentType": "audio/wav"}
     _get_s3_client().upload_file(str(audio_path), bucket, key, ExtraArgs=extra_args)
     uri = f"s3://{bucket}/{key}"
@@ -626,6 +652,32 @@ def _populate_records_s3_audio(run_id: str, run_dir: Path, records: list[dict[st
                 fut.result()
             except Exception as e:
                 logger.warning("seedlab audio S3 upload failed run_id=%s sample_id=%s err=%s", run_id, rec.get("sample_id"), e)
+
+
+def _runpod_eval_records_missing_s3_audio(records: list[dict[str, Any]]) -> tuple[int, int, int]:
+    targets = [
+        rec
+        for rec in records
+        if rec.get("status") in ("ready", "skipped_existing") and str(rec.get("audio_rel_path") or "").strip()
+    ]
+    uploaded_count = sum(1 for rec in targets if str(rec.get("audio_s3_uri") or "").strip())
+    missing_count = len(targets) - uploaded_count
+    return len(targets), uploaded_count, missing_count
+
+
+def _assert_runpod_records_have_s3_audio(records: list[dict[str, Any]]) -> None:
+    if _normalize_eval_mode(settings.seedlab_eval_mode) != "runpod_pod":
+        return
+    _ensure_runpod_sample_s3_configured()
+    total_count, uploaded_count, missing_count = _runpod_eval_records_missing_s3_audio(records)
+    if missing_count:
+        raise RuntimeError(f"sample_s3_upload_failed: uploaded {uploaded_count}/{total_count}, missing {missing_count}")
+
+
+def _rewrite_live_records(path: Path, records: list[dict[str, Any]]) -> None:
+    path.unlink(missing_ok=True)
+    for rec in records:
+        _append_jsonl_object(path, rec)
 
 
 def _local_eval_kwargs() -> dict[str, Any]:
@@ -797,8 +849,8 @@ def _call_runpod_eval(run_id: str, rec: dict[str, Any]) -> tuple[str, dict[str, 
 
 def _evaluate_record_with_fallback(run_id: str, run_dir: Path, rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
     if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
-        if _sample_s3_enabled():
-            _ensure_record_audio_uploaded(run_id, run_dir, rec)
+        _ensure_runpod_sample_s3_configured()
+        _ensure_record_audio_uploaded(run_id, run_dir, rec)
         return _call_runpod_eval(run_id, rec)
     return _auto_eval_single_record(run_dir=run_dir, rec=rec, **_local_eval_kwargs())
 
@@ -863,6 +915,8 @@ def _seedlab_capabilities() -> dict[str, Any]:
         "runpod_eval_enabled": _runpod_eval_enabled(),
         "runpod_eval_missing_config_fields": _runpod_eval_missing_config_fields(),
         "sample_s3_enabled": _sample_s3_enabled(),
+        "sample_s3_bucket_configured": bool(_sample_s3_bucket()),
+        "sample_s3_bucket_source": _sample_s3_bucket_source(),
         "reference_audio_local_path_configured": bool((settings.seedlab_reference_audio_local_path or "").strip()),
         "reference_audio_s3_uri_configured": bool((settings.seedlab_reference_audio_s3_uri or "").strip()),
     }
@@ -930,8 +984,6 @@ async def _run_generation_pipeline(run_id: str) -> None:
             _save_state(state)
             await _notify_gateway_progress(state)
             try:
-                from seed_lab import _append_jsonl_object  # type: ignore
-
                 _append_jsonl_object(live_records_path, rec)
             except Exception:
                 pass
@@ -945,8 +997,23 @@ async def _run_generation_pipeline(run_id: str) -> None:
     )
     state["network_fail_count"] = network_fail_count
     state["http_502_count"] = http_502_count
-    _populate_records_s3_audio(run_id, run_dir, records, concurrency)
+    try:
+        _populate_records_s3_audio(run_id, run_dir, records, concurrency)
+        _assert_runpod_records_have_s3_audio(records)
+    except Exception as e:
+        _write_manifest(run_dir, _meta_from_state(state), records)
+        _rewrite_live_records(live_records_path, records)
+        state["remote_eval_failed_count"] = int(state.get("remote_eval_failed_count") or 0) + 1
+        state["remote_eval_last_error"] = str(e)
+        state["last_error"] = str(e)
+        state["status"] = "failed"
+        state["stage"] = "failed"
+        state["finished_at"] = _utcnow().isoformat()
+        _save_state(state)
+        await _notify_gateway_progress(state)
+        raise
     _write_manifest(run_dir, _meta_from_state(state), records)
+    _rewrite_live_records(live_records_path, records)
     _generate_review_html(run_id, records, run_dir / "index.html")
 
     if _openai_enabled() and records:
@@ -1180,6 +1247,7 @@ async def create_run(_: Any = AuthDep, body: RunCreateRequest | None = None) -> 
     }
     if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
         try:
+            _ensure_runpod_sample_s3_configured()
             preflight_snapshot = await asyncio.to_thread(_runpod_eval_preflight_snapshot)
             _record_eval_preflight_state(
                 state,
@@ -1337,8 +1405,6 @@ async def run_tts_generate(run_id: str, body: dict[str, Any]) -> dict[str, Any]:
         except Exception as e:
             logger.warning("seedlab live audio S3 upload failed run_id=%s sample_id=%s err=%s", run_id, rec.get("sample_id"), e)
     if _to_bool(body.get("add_to_review"), default=False):
-        from seed_lab import _append_jsonl_object  # type: ignore
-
         _append_jsonl_object(run_dir / LIVE_RECORDS_JSONL, rec)
     ai_eval_obj = None
     if _to_bool(body.get("add_to_review"), default=False) and _openai_enabled():
