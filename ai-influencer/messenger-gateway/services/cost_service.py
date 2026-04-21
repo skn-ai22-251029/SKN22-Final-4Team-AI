@@ -84,6 +84,19 @@ def _is_fixed_infra_event(event: dict[str, Any]) -> bool:
     return process == FIXED_INFRA_PROCESS or provider in FIXED_INFRA_PROVIDERS
 
 
+def _is_ignored_missing_event(event: dict[str, Any]) -> bool:
+    provider = str(event.get("provider") or "").strip().lower()
+    status = str(event.get("status") or "").strip().lower()
+    pricing_kind = str(event.get("pricing_kind") or "").strip().lower() or "missing"
+    pricing_source = str(event.get("pricing_source") or "").strip().lower() or "unavailable"
+    return (
+        provider == "runpod_tts"
+        and status == "failed"
+        and pricing_kind == "missing"
+        and pricing_source == "unavailable"
+    )
+
+
 def _visible_cost_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [event for event in events if not _is_fixed_infra_event(event)]
 
@@ -235,6 +248,7 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         cost_usd = _safe_float(event.get("cost_usd")) or 0.0
         cost_krw = _safe_float(event.get("cost_krw")) or 0.0
         pricing_kind = str(event.get("pricing_kind") or "").strip().lower() or "missing"
+        ignored_missing = _is_ignored_missing_event(event)
         summary["total_cost_usd"] = round(float(summary["total_cost_usd"]) + cost_usd, 6)
         summary["total_cost_krw"] = round(float(summary["total_cost_krw"]) + cost_krw, 3)
         if pricing_kind == "actual":
@@ -243,14 +257,15 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             summary["estimated_cost_usd"] = round(float(summary["estimated_cost_usd"]) + cost_usd, 6)
         elif pricing_kind == "fixed":
             summary["fixed_cost_usd"] = round(float(summary["fixed_cost_usd"]) + cost_usd, 6)
-        else:
+        elif not ignored_missing:
             summary["missing_cost_event_count"] = int(summary["missing_cost_event_count"]) + 1
         _bucket_add(summary["by_stage"], str(event.get("stage") or "").strip(), cost_usd, cost_krw)
         _bucket_add(summary["by_process"], str(event.get("process") or "").strip(), cost_usd, cost_krw)
         _bucket_add(summary["by_provider"], str(event.get("provider") or "").strip(), cost_usd, cost_krw)
         _bucket_add(summary["by_api_key_family"], str(event.get("api_key_family") or "").strip(), cost_usd, cost_krw)
         _bucket_add(summary["by_subject_type"], str(event.get("subject_type") or "").strip(), cost_usd, cost_krw)
-        _bucket_add(summary["by_pricing_kind"], pricing_kind, cost_usd, cost_krw)
+        if not ignored_missing:
+            _bucket_add(summary["by_pricing_kind"], pricing_kind, cost_usd, cost_krw)
     summary["main_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(summary["fixed_cost_usd"]), 6)
     return summary
 

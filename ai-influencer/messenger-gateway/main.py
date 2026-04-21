@@ -101,7 +101,7 @@ _HARDBURN_FORCE_STYLE = (
     "OutlineColour=&H00000000,"
     "BackColour=&H00000000,"
     "BorderStyle=1,"
-    "Outline=2,"
+    "Outline=0,"
     "Shadow=0,"
     "MarginV=30,"
     "Alignment=2"
@@ -7109,6 +7109,16 @@ def _cost_viewer_html(api_base_path: str) -> str:
     var p = String(pk || "").toLowerCase();
     return ["actual","estimated","fixed","missing"].indexOf(p) >= 0 ? badge(formatPricingKind(p), p) : badge(formatPricingKind(p), "default");
   }
+  function isIgnoredMissingEvent(ev) {
+    var provider = String(ev && ev.provider || "").trim().toLowerCase();
+    var status = String(ev && ev.status || "").trim().toLowerCase();
+    var pricingKind = String(ev && ev.pricing_kind || "").trim().toLowerCase() || "missing";
+    var pricingSource = String(ev && ev.pricing_source || "").trim().toLowerCase() || "unavailable";
+    return provider === "runpod_tts" && status === "failed" && pricingKind === "missing" && pricingSource === "unavailable";
+  }
+  function pricingCell(ev) {
+    return isIgnoredMissingEvent(ev) ? "\u2013" : pricingBadge(ev && ev.pricing_kind);
+  }
   function statusEvBadge(st) {
     var s = String(st || "").toLowerCase();
     if (s === "success") return badge(formatEventStatus(s), "success");
@@ -7286,7 +7296,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
             + '<td>' + formatProcess(ev.process) + '</td>'
             + '<td>' + formatProvider(ev.provider) + '</td>'
             + '<td>' + statusEvBadge(ev.status)  + '</td>'
-            + '<td>' + pricingBadge(ev.pricing_kind) + '</td>'
+            + '<td>' + pricingCell(ev) + '</td>'
             + '<td class="mono">' + (ev.cost_usd != null ? fmtUsd(ev.cost_usd) : "\u2013") + '</td>'
             + '<td class="mono">' + (ev.cost_krw != null ? fmtKrw(ev.cost_krw) : "\u2013") + '</td>'
             + '<td style="white-space:nowrap;">' + durFmt(ev.duration_ms) + '</td>'
