@@ -4,7 +4,8 @@ Discord 기반 AI 인플루언서 자동화 파이프라인.
 
 테스트 편의를 위해 https://github.com/DJAeun/SKN22-Final-4Team-AI/tree/develop 클론
 ---
-TTS test script="./scripts/seed_lab_quickstart.sh"
+TTS Server Run script=
+bash /workspace/runpod-stack/bin/start-all.sh
 ---
 
 ## 아키텍처 개요
