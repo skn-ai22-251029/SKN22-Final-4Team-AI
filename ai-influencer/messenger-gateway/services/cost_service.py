@@ -615,8 +615,9 @@ async def list_jobs_summary(
     normalized_subject_type = (subject_type or "all").strip().lower()
     normalized_sort_by = _normalize_job_summary_sort_by(sort_by)
     normalized_sort_dir = _normalize_job_summary_sort_dir(sort_dir)
+    has_status_filter = bool(status.strip())
     include_jobs = normalized_subject_type in {"all", "job"}
-    include_operations = normalized_subject_type in {"all", "operation"}
+    include_operations = normalized_subject_type in {"all", "operation"} and not has_status_filter
     search = (q or "").strip()
     limit_value = max(1, int(limit))
     offset_value = max(0, int(offset))
