@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GATEWAY_MAIN = ROOT / "messenger-gateway" / "main.py"
 DISCORD_BOT_MAIN = ROOT / "discord-bot" / "main.py"
 SEEDLAB_MAIN = ROOT / "seed-lab-service" / "main.py"
+SEEDLAB_SCRIPT = ROOT / "scripts" / "seed_lab.py"
 
 
 def _load_source(path: Path) -> str:
@@ -43,6 +44,11 @@ class SeedLabRegressionSmokeTests(unittest.TestCase):
         self.assertIn("_assert_runpod_records_have_s3_audio", functions)
         self.assertIn("RunPod eval requires sample S3 upload", source)
         self.assertIn("sample_s3_upload_failed", source)
+
+    def test_seedlab_pitch_estimator_downsamples_before_autocorrelation(self) -> None:
+        source = _load_source(SEEDLAB_SCRIPT)
+        self.assertIn("target_rate = 8000", source)
+        self.assertIn("frame = frame[::stride]", source)
 
 
 if __name__ == "__main__":

@@ -2461,6 +2461,11 @@ def _read_wav_mono_samples(path: Path) -> tuple[list[float], int]:
 def _estimate_pitch_hz(frame: list[float], sample_rate: int) -> float:
     if not frame or sample_rate <= 0:
         return 0.0
+    target_rate = 8000
+    stride = max(1, int(sample_rate / target_rate))
+    if stride > 1:
+        frame = frame[::stride]
+        sample_rate = max(1, int(sample_rate / stride))
     energy = math.sqrt(sum(v * v for v in frame) / len(frame))
     if energy < 0.015:
         return 0.0
