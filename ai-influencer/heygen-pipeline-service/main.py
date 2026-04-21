@@ -18,6 +18,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_CHAT_MODEL_RATES_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "gpt-5.4-mini": (0.75, 4.50),
+}
+DEFAULT_EMBEDDING_MODEL_RATES_USD_PER_1M: dict[str, float] = {
+    "text-embedding-3-small": 0.02,
+}
+
+
 class ContentMetadata(BaseModel):
     title: str = Field(description="Short Korean title under 50 chars")
     summary: str = Field(description="1-2 sentence Korean summary")
@@ -43,11 +51,35 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _estimate_chat_cost_usd(usage: dict[str, int]) -> float | None:
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = str(os.environ.get(name, default) or default).strip()
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _model_rate(model: str, table: dict[str, float] | dict[str, tuple[float, float]]) -> float | tuple[float, float] | None:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in table:
+        return table[normalized]
+    for key, value in table.items():
+        if normalized.startswith(key):
+            return value
+    return None
+
+
+def _estimate_chat_cost_usd(usage: dict[str, int | str]) -> float | None:
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
-    input_rate = float(os.environ.get("CONTENT_METADATA_INPUT_COST_USD_PER_1M", "0") or 0.0)
-    output_rate = float(os.environ.get("CONTENT_METADATA_OUTPUT_COST_USD_PER_1M", "0") or 0.0)
+    model = str(usage.get("model") or "").strip()
+    default_rates = _model_rate(model, DEFAULT_CHAT_MODEL_RATES_USD_PER_1M)
+    default_input_rate = float(default_rates[0]) if isinstance(default_rates, tuple) else 0.0
+    default_output_rate = float(default_rates[1]) if isinstance(default_rates, tuple) else 0.0
+    input_rate = _env_float("CONTENT_METADATA_INPUT_COST_USD_PER_1M", default_input_rate)
+    output_rate = _env_float("CONTENT_METADATA_OUTPUT_COST_USD_PER_1M", default_output_rate)
     if prompt_tokens <= 0 and completion_tokens <= 0:
         return None
     if input_rate <= 0 and output_rate <= 0:
@@ -55,8 +87,9 @@ def _estimate_chat_cost_usd(usage: dict[str, int]) -> float | None:
     return ((prompt_tokens / 1_000_000.0) * input_rate) + ((completion_tokens / 1_000_000.0) * output_rate)
 
 
-def _estimate_embedding_cost_usd(prompt_tokens: int) -> float | None:
-    rate = float(os.environ.get("CONTENT_EMBEDDING_COST_USD_PER_1M_TOKENS", "0") or 0.0)
+def _estimate_embedding_cost_usd(prompt_tokens: int, *, embedding_model: str = "") -> float | None:
+    default_rate = _model_rate(embedding_model, DEFAULT_EMBEDDING_MODEL_RATES_USD_PER_1M)
+    rate = _env_float("CONTENT_EMBEDDING_COST_USD_PER_1M_TOKENS", float(default_rate or 0.0))
     if prompt_tokens <= 0 or rate <= 0:
         return None
     return (prompt_tokens / 1_000_000.0) * rate
@@ -184,7 +217,10 @@ def _build_content_vector(summary: str, script_text: str) -> tuple[str, dict[str
         "embedding_model": str(getattr(embed_resp, "model", "") or "text-embedding-3-small"),
         "input_chars": len(embed_input),
     }
-    return "[" + ",".join(str(v) for v in vector) + "]", usage, _estimate_embedding_cost_usd(prompt_tokens)
+    return "[" + ",".join(str(v) for v in vector) + "]", usage, _estimate_embedding_cost_usd(
+        prompt_tokens,
+        embedding_model=usage["embedding_model"],
+    )
 
 
 def _register_content_sync(

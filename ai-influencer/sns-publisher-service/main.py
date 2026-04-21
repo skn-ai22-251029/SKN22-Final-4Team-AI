@@ -78,8 +78,33 @@ def _require_env(name: str) -> str:
     return value
 
 
+DEFAULT_TRANSCRIPTION_COST_USD_PER_MINUTE: dict[str, float] = {
+    "gpt-4o-transcribe": 0.006,
+}
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = str(os.environ.get(name, default) or default).strip()
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _default_transcription_rate(model: str) -> float:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return 0.0
+    if normalized in DEFAULT_TRANSCRIPTION_COST_USD_PER_MINUTE:
+        return DEFAULT_TRANSCRIPTION_COST_USD_PER_MINUTE[normalized]
+    for key, value in DEFAULT_TRANSCRIPTION_COST_USD_PER_MINUTE.items():
+        if normalized.startswith(key):
+            return value
+    return 0.0
+
+
 def _estimate_youtube_asr_cost_usd(duration_sec: float) -> float | None:
-    rate = float(os.environ.get("YOUTUBE_ASR_COST_USD_PER_MINUTE", "0") or 0.0)
+    rate = _env_float("YOUTUBE_ASR_COST_USD_PER_MINUTE", _default_transcription_rate(_asr_primary_model()))
     if duration_sec <= 0 or rate <= 0:
         return None
     return (duration_sec / 60.0) * rate
