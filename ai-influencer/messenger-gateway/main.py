@@ -6699,6 +6699,8 @@ async def _costs_jobs_payload(
     limit: int = 50,
     offset: int = 0,
     subject_type: str = "all",
+    sort_by: str = "updated_at",
+    sort_dir: str = "desc",
 ) -> dict:
     resolved_limit = max(1, min(int(limit), int(settings.cost_max_list_limit)))
     return await cost_service.list_jobs_summary(
@@ -6709,6 +6711,8 @@ async def _costs_jobs_payload(
         limit=resolved_limit,
         offset=offset,
         subject_type=subject_type,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
     )
 
 
@@ -6852,6 +6856,17 @@ def _cost_viewer_html(api_base_path: str) -> str:
         <option value="APPROVED">&#xC2B9;&#xC778; &#xC644;&#xB8CC;</option>
         <option value="FAILED">&#xC2E4;&#xD328;</option>
       </select>
+      <label>&#xC815;&#xB82C;</label>
+      <select id="sortBySelect">
+        <option value="updated_at" selected>&#xC218;&#xC815; &#xC2DC;&#xAC01;</option>
+        <option value="created_at">&#xC0DD;&#xC131; &#xC2DC;&#xAC01;</option>
+        <option value="main_cost_usd">&#xCD1D; &#xBE44;&#xC6A9;</option>
+        <option value="estimated_cost_usd">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</option>
+      </select>
+      <select id="sortDirSelect">
+        <option value="desc" selected>&#xB0B4;&#xB9BC;&#xCC28;&#xC21C;</option>
+        <option value="asc">&#xC624;&#xB984;&#xCC28;&#xC21C;</option>
+      </select>
       <select id="pageSizeSelect">
         <option value="25">25&#xAC1C;</option>
         <option value="50" selected>50&#xAC1C;</option>
@@ -6898,6 +6913,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
             <th style="width:130px;">&#xCD1D; &#xBE44;&#xC6A9;</th>
             <th style="width:130px;">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</th>
             <th style="width:108px;">&#xC0DD;&#xC131; &#xC2DC;&#xAC01; (KST)</th>
+            <th style="width:108px;">&#xC218;&#xC815; &#xC2DC;&#xAC01; (KST)</th>
             <th style="width:88px;">&#xBCF4;&#xAE30;</th>
           </tr>
         </thead>
@@ -7125,11 +7141,15 @@ def _cost_viewer_html(api_base_path: str) -> str:
     var from = q("fromDate").value, to = q("toDate").value;
     var qs = q("queryText").value.trim(), st = q("statusFilter").value.trim();
     var stype = q("subjectTypeFilter").value.trim();
+    var sortBy = q("sortBySelect").value.trim();
+    var sortDir = q("sortDirSelect").value.trim();
     if (from)  p.set("from", from);
     if (to)    p.set("to", to);
     if (qs)    p.set("q", qs);
     if (st)    p.set("status", st);
     if (stype) p.set("subject_type", stype);
+    if (sortBy) p.set("sort_by", sortBy);
+    if (sortDir) p.set("sort_dir", sortDir);
     p.set("limit", pageSize()); p.set("offset", offset);
     return apiBase + "/api/jobs?" + p.toString();
   }
@@ -7143,7 +7163,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
 
   async function loadRows(offset) {
     q("statusBar").textContent = "\uC870\uD68C \uC911\u2026";
-    q("rows").innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
+    q("rows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
     try {
       var data = await fetchJson(buildListUrl(offset));
       currentOffset = offset; currentTotal = num(data.total);
@@ -7168,9 +7188,10 @@ def _cost_viewer_html(api_base_path: str) -> str:
           + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.main_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(mainKrw) + '</div></td>'
           + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.estimated_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(estKrw) + '</div></td>'
           + '<td style="color:var(--muted);">' + toKST(rec.created_at) + '</td>'
+          + '<td style="color:var(--muted);">' + toKST(rec.updated_at) + '</td>'
           + '<td></td>';
         (function(r, row) {
-          var td = row.cells[8];
+          var td = row.cells[9];
           var db = document.createElement("button"); db.className = "sm primary"; db.textContent = "\uC0C1\uC138";
           db.onclick = function() { loadDetail(String(r.subject_key || r.job_id || "")); };
           var eb = document.createElement("button"); eb.className = "sm"; eb.textContent = "\uC6D0\uBCF8"; eb.style.marginLeft = "4px";
@@ -7191,7 +7212,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("statusBar").textContent = "\uB9C8\uC9C0\uB9C9 \uC870\uD68C: " + new Date().toLocaleTimeString("ko-KR");
     } catch(e) {
       q("statusBar").textContent = "\uC624\uB958: " + e.message;
-      q("rows").innerHTML = '<tr><td colspan="9" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
+      q("rows").innerHTML = '<tr><td colspan="10" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
     }
   }
 
@@ -7268,6 +7289,8 @@ def _cost_viewer_html(api_base_path: str) -> str:
   }
 
   q("searchBtn").addEventListener("click",    function() { currentOffset = 0; loadRows(0).catch(function(e){ q("statusBar").textContent = String(e); }); });
+  q("sortBySelect").addEventListener("change", function() { currentOffset = 0; loadRows(0).catch(function(e){ q("statusBar").textContent = String(e); }); });
+  q("sortDirSelect").addEventListener("change", function() { currentOffset = 0; loadRows(0).catch(function(e){ q("statusBar").textContent = String(e); }); });
   q("prevBtn").addEventListener("click",      function() { loadRows(Math.max(0, currentOffset - pageSize())).catch(function(e){ q("statusBar").textContent = String(e); }); });
   q("nextBtn").addEventListener("click",      function() { loadRows(currentOffset + pageSize()).catch(function(e){ q("statusBar").textContent = String(e); }); });
   q("exportRangeBtn").addEventListener("click", function() { window.open(buildExportUrl(), "_blank"); });
@@ -7295,6 +7318,8 @@ async def costs_jobs(
     q: str = Query("", alias="q"),
     status_filter: str = Query("", alias="status"),
     subject_type: str = Query("all", alias="subject_type"),
+    sort_by: str = Query("updated_at", alias="sort_by"),
+    sort_dir: str = Query("desc", alias="sort_dir"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict:
@@ -7304,6 +7329,8 @@ async def costs_jobs(
         q=q,
         status_filter=status_filter,
         subject_type=subject_type,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         limit=limit,
         offset=offset,
     )
@@ -7344,6 +7371,8 @@ async def costs_signed_jobs(
     q: str = Query("", alias="q"),
     status_filter: str = Query("", alias="status"),
     subject_type: str = Query("all", alias="subject_type"),
+    sort_by: str = Query("updated_at", alias="sort_by"),
+    sort_dir: str = Query("desc", alias="sort_dir"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict:
@@ -7354,6 +7383,8 @@ async def costs_signed_jobs(
         q=q,
         status_filter=status_filter,
         subject_type=subject_type,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         limit=limit,
         offset=offset,
     )

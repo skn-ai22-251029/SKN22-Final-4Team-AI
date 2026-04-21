@@ -9,6 +9,9 @@ from services import job_service
 KST = timezone(timedelta(hours=9))
 PRICING_KINDS = {"actual", "estimated", "fixed", "missing"}
 SUBJECT_TYPES = {"job", "operation"}
+JOB_SUMMARY_SORT_FIELDS = {"updated_at", "created_at", "main_cost_usd", "estimated_cost_usd"}
+JOB_SUMMARY_SORT_DIRECTIONS = {"asc", "desc"}
+EPOCH_UTC = datetime.fromtimestamp(0, timezone.utc)
 
 
 def _to_json(value: Any) -> str:
@@ -35,6 +38,40 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _normalize_job_summary_sort_by(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in JOB_SUMMARY_SORT_FIELDS else "updated_at"
+
+
+def _normalize_job_summary_sort_dir(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in JOB_SUMMARY_SORT_DIRECTIONS else "desc"
+
+
+def _sort_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return EPOCH_UTC
+
+
+def _sort_number(value: Any) -> float:
+    coerced = _safe_float(value)
+    return coerced if coerced is not None else 0.0
+
+
+def _sort_job_summary_items(items: list[dict[str, Any]], *, sort_by: str, sort_dir: str) -> list[dict[str, Any]]:
+    sorted_items = list(items)
+    sorted_items.sort(key=lambda item: str(item.get("subject_key") or ""))
+    sorted_items.sort(key=lambda item: _sort_datetime(item.get("created_at")), reverse=True)
+    sorted_items.sort(key=lambda item: _sort_datetime(item.get("updated_at")), reverse=True)
+    reverse = sort_dir == "desc"
+    if sort_by in {"main_cost_usd", "estimated_cost_usd"}:
+        sorted_items.sort(key=lambda item: _sort_number(item.get(sort_by)), reverse=reverse)
+    else:
+        sorted_items.sort(key=lambda item: _sort_datetime(item.get(sort_by)), reverse=reverse)
+    return sorted_items
 
 
 def _normalize_pricing_kind(
@@ -455,13 +492,18 @@ async def list_jobs_summary(
     limit: int,
     offset: int,
     subject_type: str = "all",
+    sort_by: str = "updated_at",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     pool = await job_service.get_db_pool()
     normalized_subject_type = (subject_type or "all").strip().lower()
+    normalized_sort_by = _normalize_job_summary_sort_by(sort_by)
+    normalized_sort_dir = _normalize_job_summary_sort_dir(sort_dir)
     include_jobs = normalized_subject_type in {"all", "job"}
     include_operations = normalized_subject_type in {"all", "operation"}
     search = (q or "").strip()
-    max_fetch = max(1, int(limit)) + max(0, int(offset))
+    limit_value = max(1, int(limit))
+    offset_value = max(0, int(offset))
     items: list[dict[str, Any]] = []
     total_jobs = 0
     total_operations = 0
@@ -487,7 +529,6 @@ async def list_jobs_summary(
             where_sql = ("WHERE " + " AND ".join(where)) if where else ""
             count_row = await conn.fetchrow(f"SELECT COUNT(*)::int AS cnt FROM jobs j {where_sql}", *params)
             total_jobs = int(count_row["cnt"] if count_row else 0)
-            params.append(max_fetch)
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -502,7 +543,6 @@ async def list_jobs_summary(
                 FROM jobs j
                 {where_sql}
                 ORDER BY j.created_at DESC
-                LIMIT ${len(params)}
                 """,
                 *params,
             )
@@ -530,7 +570,6 @@ async def list_jobs_summary(
                 *params,
             )
             total_operations = int(count_row["cnt"] if count_row else 0)
-            params.append(max_fetch)
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -546,22 +585,19 @@ async def list_jobs_summary(
                 {where_sql}
                 GROUP BY subject_key
                 ORDER BY MAX(created_at) DESC
-                LIMIT ${len(params)}
                 """,
                 *params,
             )
             items.extend(dict(row) for row in rows)
 
-        items.sort(key=lambda item: item.get("created_at") or datetime.fromtimestamp(0, timezone.utc), reverse=True)
-        selected = items[offset : offset + max(1, int(limit))]
-        job_keys = [str(item["subject_key"]) for item in selected if item.get("subject_type") == "job"]
-        operation_keys = [str(item["subject_key"]) for item in selected if item.get("subject_type") == "operation"]
+        job_keys = [str(item["subject_key"]) for item in items if item.get("subject_type") == "job"]
+        operation_keys = [str(item["subject_key"]) for item in items if item.get("subject_type") == "operation"]
         event_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
         event_map.update(await _fetch_subject_events(conn, subject_type="job", subject_keys=job_keys))
         event_map.update(await _fetch_subject_events(conn, subject_type="operation", subject_keys=operation_keys))
 
     enriched: list[dict[str, Any]] = []
-    for item in selected:
+    for item in items:
         subject_key = str(item.get("subject_key") or "")
         subject_type_value = str(item.get("subject_type") or "")
         events = event_map.get((subject_type_value, subject_key), [])
@@ -581,13 +617,17 @@ async def list_jobs_summary(
                 **summary,
             }
         )
+    sorted_items = _sort_job_summary_items(enriched, sort_by=normalized_sort_by, sort_dir=normalized_sort_dir)
+    selected = sorted_items[offset_value : offset_value + limit_value]
 
     return {
         "total": total_jobs + total_operations,
-        "limit": max(1, int(limit)),
-        "offset": max(0, int(offset)),
+        "limit": limit_value,
+        "offset": offset_value,
         "subject_type": normalized_subject_type,
-        "items": enriched,
+        "sort_by": normalized_sort_by,
+        "sort_dir": normalized_sort_dir,
+        "items": selected,
     }
 
 
