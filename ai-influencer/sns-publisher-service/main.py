@@ -79,7 +79,10 @@ def _require_env(name: str) -> str:
 
 
 DEFAULT_TRANSCRIPTION_COST_USD_PER_MINUTE: dict[str, float] = {
+    "whisper-1": 0.006,
     "gpt-4o-transcribe": 0.006,
+    "gpt-4o-transcribe-diarize": 0.006,
+    "gpt-4o-mini-transcribe": 0.003,
 }
 
 
@@ -103,8 +106,8 @@ def _default_transcription_rate(model: str) -> float:
     return 0.0
 
 
-def _estimate_youtube_asr_cost_usd(duration_sec: float) -> float | None:
-    rate = _env_float("YOUTUBE_ASR_COST_USD_PER_MINUTE", _default_transcription_rate(_asr_primary_model()))
+def _estimate_youtube_asr_cost_usd(duration_sec: float, *, model: str = "") -> float | None:
+    rate = _env_float("YOUTUBE_ASR_COST_USD_PER_MINUTE", _default_transcription_rate(model or _asr_primary_model()))
     if duration_sec <= 0 or rate <= 0:
         return None
     return (duration_sec / 60.0) * rate
@@ -144,7 +147,10 @@ def _record_youtube_asr_cost_event(
         "fallback_reason": artifacts.get("fallback_reason"),
         "context": context_label,
     }
-    cost_usd = _estimate_youtube_asr_cost_usd(float(artifacts.get("audio_duration_sec") or 0.0))
+    cost_usd = _estimate_youtube_asr_cost_usd(
+        float(artifacts.get("audio_duration_sec") or 0.0),
+        model=str(artifacts.get("asr_model") or ""),
+    )
     payload = {
         "job_id": job_id,
         "stage": "publish",
