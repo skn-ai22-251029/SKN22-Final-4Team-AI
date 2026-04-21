@@ -6746,7 +6746,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Hari Cost Viewer</title>
+  <title>Hari 비용 보기</title>
   <style>
     :root {
       --bg:#f5f7fa; --panel:#ffffff; --border:#d1d9e0;
@@ -6787,6 +6787,8 @@ def _cost_viewer_html(api_base_path: str) -> str:
     .badge.job{background:#dbeafe;color:#1d4ed8;}
     .badge.operation{background:#d1fae5;color:#065f46;}
     .badge.published,.badge.success{background:var(--success-soft);color:var(--success);}
+    .badge.approved{background:var(--info-soft);color:var(--info);}
+    .badge.waiting{background:var(--warn-soft);color:var(--warn);}
     .badge.failed{background:var(--danger-soft);color:var(--danger);}
     .badge.actual{background:var(--success-soft);color:var(--success);}
     .badge.estimated{background:var(--warn-soft);color:var(--warn);}
@@ -6829,26 +6831,26 @@ def _cost_viewer_html(api_base_path: str) -> str:
 </head>
 <body>
 <div class="container">
-  <h1>&#x1F4B0; Cost Viewer</h1>
+  <h1>&#x1F4B0; 비용 보기</h1>
 
   <div class="panel">
     <div class="filter-row">
-      <label>시작일(From)</label>
+      <label>시작일</label>
       <input type="date" id="fromDate" />
-      <label>종료일(To)</label>
+      <label>종료일</label>
       <input type="date" id="toDate" />
-      <input type="text" id="queryText" placeholder="&#xC8FC;&#xC81C; / Job ID &#xAC80;&#xC0C9;" />
+      <input type="text" id="queryText" placeholder="&#xC81C;&#xBAA9; / ID &#xAC80;&#xC0C9;" />
       <select id="subjectTypeFilter">
-        <option value="all">&#xC804;&#xCCB4; &#xC720;&#xD615;</option>
-        <option value="job">Jobs</option>
-        <option value="operation">Operations</option>
+        <option value="all">&#xC804;&#xCCB4; &#xAD6C;&#xBD84;</option>
+        <option value="job">&#xC791;&#xC5C5;</option>
+        <option value="operation">&#xC6B4;&#xC601; &#xC791;&#xC5C5;</option>
       </select>
       <select id="statusFilter">
         <option value="">&#xC0C1;&#xD0DC; &#xC804;&#xCCB4;</option>
-        <option value="PUBLISHED">PUBLISHED</option>
-        <option value="WAITING_VIDEO_APPROVAL">WAITING_VIDEO_APPROVAL</option>
-        <option value="APPROVED">APPROVED</option>
-        <option value="FAILED">FAILED</option>
+        <option value="PUBLISHED">&#xBC1C;&#xD589; &#xC644;&#xB8CC;</option>
+        <option value="WAITING_VIDEO_APPROVAL">&#xC601;&#xC0C1; &#xC2B9;&#xC778; &#xB300;&#xAE30;</option>
+        <option value="APPROVED">&#xC2B9;&#xC778; &#xC644;&#xB8CC;</option>
+        <option value="FAILED">&#xC2E4;&#xD328;</option>
       </select>
       <select id="pageSizeSelect">
         <option value="25">25&#xAC1C;</option>
@@ -6856,27 +6858,27 @@ def _cost_viewer_html(api_base_path: str) -> str:
         <option value="100">100&#xAC1C;</option>
       </select>
       <button class="primary" id="searchBtn">&#x1F50D; &#xC870;&#xD68C;</button>
-      <button id="exportRangeBtn">&#x2B07; JSON Export</button>
+      <button id="exportRangeBtn">&#x2B07; &#xC6D0;&#xBCF8; &#xB370;&#xC774;&#xD130; &#xB0B4;&#xBCF4;&#xB0B4;&#xAE30;</button>
     </div>
     <div id="statusBar"></div>
     <div class="summary-row">
       <div class="card">
-        <div class="clabel">Main (&#xC2E4;&#xC81C;+&#xACE0;&#xC815;)</div>
+        <div class="clabel">&#xCD1D; &#xBE44;&#xC6A9;</div>
         <div class="cusd" id="mainCostUsd">$0.000000</div>
         <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
       </div>
       <div class="card">
-        <div class="clabel">추정 (Estimated)</div>
+        <div class="clabel">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</div>
         <div class="cusd" id="estimatedCostUsd">$0.000000</div>
         <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
       </div>
       <div class="card">
-        <div class="clabel">비용 누락 이벤트</div>
+        <div class="clabel">&#xBE44;&#xC6A9; &#xC815;&#xBCF4; &#xC5C6;&#xC74C;</div>
         <div class="cusd" id="missingCount" style="color:var(--danger);">0</div>
-        <div class="ckrw">&#xBE44;&#xC6A9; &#xB204;&#xB77D; &#xAC74;</div>
+        <div class="ckrw">&#xC9D1;&#xACC4; &#xC548; &#xB41C; &#xD56D;&#xBAA9; &#xC218;</div>
       </div>
       <div class="card">
-        <div class="clabel">&#xC870;&#xD68C; &#xACB0;&#xACFC;</div>
+        <div class="clabel">&#xC870;&#xD68C;&#xB41C; &#xD56D;&#xBAA9;</div>
         <div class="cusd" id="rowCount">0&#xAC74;</div>
         <div class="ckrw" id="totalCount">&#xC804;&#xCCB4; 0&#xAC74;</div>
       </div>
@@ -6888,15 +6890,15 @@ def _cost_viewer_html(api_base_path: str) -> str:
       <table>
         <thead>
           <tr>
-            <th style="width:70px;">&#xC720;&#xD615;</th>
-            <th style="width:88px;">Job ID</th>
-            <th>&#xC8FC;&#xC81C;</th>
+            <th style="width:70px;">&#xAD6C;&#xBD84;</th>
+            <th style="width:88px;">ID</th>
+            <th>&#xC81C;&#xBAA9;</th>
             <th style="width:120px;">&#xB2E8;&#xACC4;</th>
             <th style="width:110px;">&#xC0C1;&#xD0DC;</th>
-            <th style="width:130px;">&#xBE44;&#xC6A9; Main</th>
-            <th style="width:130px;">Estimated</th>
-            <th style="width:108px;">&#xC0DD;&#xC131;&#xC77C; (KST)</th>
-            <th style="width:88px;">&#xC561;&#xC158;</th>
+            <th style="width:130px;">&#xCD1D; &#xBE44;&#xC6A9;</th>
+            <th style="width:130px;">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</th>
+            <th style="width:108px;">&#xC0DD;&#xC131; &#xC2DC;&#xAC01; (KST)</th>
+            <th style="width:88px;">&#xBCF4;&#xAE30;</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -6919,23 +6921,23 @@ def _cost_viewer_html(api_base_path: str) -> str:
       <span style="color:var(--muted);font-size:11px;" id="detailDate"></span>
     </div>
     <div class="cost-summary" id="detailCostSummary"></div>
-    <div class="section-title">&#xBE0C;&#xB808;&#xC774;&#xD06C;&#xB2E4;&#xC6B4;</div>
+    <div class="section-title">&#xBE44;&#xC6A9; &#xC138;&#xBD80; &#xB0B4;&#xC5ED;</div>
     <div class="breakdown-grid" id="detailBreakdown"></div>
     <div id="eventsSection">
-      <h3>&#xC774;&#xBCA4;&#xD2B8; &#xD0C0;&#xC784;&#xB77C;&#xC778;</h3>
+      <h3>&#xC791;&#xC5C5; &#xC9C4;&#xD589; &#xB0B4;&#xC5ED;</h3>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th style="width:110px;">&#xC2DC;&#xAC01; (KST)</th>
-              <th style="width:70px;">단계(Stage)</th>
-              <th style="width:130px;">프로세스(Process)</th>
-              <th style="width:100px;">제공자(Provider)</th>
-              <th style="width:80px;">상태</th>
-              <th style="width:80px;">과금방식</th>
-              <th style="width:100px;">USD</th>
-              <th style="width:90px;">KRW</th>
-              <th style="width:75px;">&#xC2DC;&#xAC04;</th>
+              <th style="width:70px;">&#xB2E8;&#xACC4;</th>
+              <th style="width:130px;">&#xC791;&#xC5C5;</th>
+              <th style="width:100px;">&#xC11C;&#xBE44;&#xC2A4;</th>
+              <th style="width:80px;">&#xCC98;&#xB9AC; &#xACB0;&#xACFC;</th>
+              <th style="width:80px;">&#xBE44;&#xC6A9; &#xBC29;&#xC2DD;</th>
+              <th style="width:100px;">&#xB2EC;&#xB7EC;</th>
+              <th style="width:90px;">&#xC6D0;&#xD654;</th>
+              <th style="width:75px;">&#xAC78;&#xB9B0; &#xC2DC;&#xAC04;</th>
               <th>&#xC624;&#xB958;</th>
             </tr>
           </thead>
@@ -6943,7 +6945,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
         </table>
       </div>
     </div>
-    <button class="sm toggle-btn" id="toggleRawBtn">{ } Raw JSON &#xBCF4;&#xAE30;</button>
+    <button class="sm toggle-btn" id="toggleRawBtn">{ } &#xC6D0;&#xBCF8; &#xB370;&#xC774;&#xD130; &#xBCF4;&#xAE30;</button>
     <pre id="rawJson"></pre>
   </div>
 </div>
@@ -6952,6 +6954,69 @@ def _cost_viewer_html(api_base_path: str) -> str:
   var apiBase = __API_BASE_PATH__;
   var currentOffset = 0;
   var currentTotal  = 0;
+  var STAGE_LABELS = {
+    video: "\uC601\uC0C1 \uC0DD\uC131",
+    infra: "\uC778\uD504\uB77C",
+    script: "\uB300\uBCF8 \uC791\uC131",
+    notebook: "\uB9AC\uD3EC\uD2B8 \uC0DD\uC131",
+    tts: "\uC74C\uC131 \uC0DD\uC131",
+    publish: "\uBC30\uD3EC \uC900\uBE44",
+    content: "\uCF58\uD150\uCE20 \uC815\uB9AC"
+  };
+  var PROCESS_LABELS = {
+    heygen_generate: "\uC544\uBC14\uD0C0 \uC601\uC0C1 \uC0DD\uC131",
+    daily_fixed_allocation: "\uC77C\uC77C \uACE0\uC815\uBE44 \uBC30\uBD84",
+    cua_generate_report: "\uBE44\uC6A9 \uB9AC\uD3EC\uD2B8 \uC0DD\uC131",
+    tts_script_rewrite: "\uC74C\uC131\uC6A9 \uB300\uBCF8 \uB2E4\uB4EC\uAE30",
+    subtitle_script_rewrite: "\uC790\uB9C9\uC6A9 \uB300\uBCF8 \uB2E4\uB4EC\uAE30",
+    generate_tts_audio: "\uC74C\uC131 \uD30C\uC77C \uC0DD\uC131",
+    youtube_caption_asr: "\uC720\uD29C\uBE0C \uC790\uB9C9 \uCD94\uCD9C",
+    content_metadata_generate: "\uCF58\uD150\uCE20 \uC815\uBCF4 \uC815\uB9AC",
+    content_embedding_generate: "\uCF58\uD150\uCE20 \uAC80\uC0C9\uC6A9 \uB370\uC774\uD130 \uC0DD\uC131",
+    hardburn_subtitle: "\uC790\uB9C9 \uC785\uD788\uAE30"
+  };
+  var PROVIDER_LABELS = {
+    heygen: "HeyGen",
+    aws_fixed: "AWS",
+    openai: "OpenAI",
+    runpod_tts: "Runpod",
+    runpod_fixed: "Runpod",
+    ffmpeg: "FFmpeg"
+  };
+  var API_KEY_FAMILY_LABELS = {
+    heygen: "HeyGen",
+    infra_fixed: "\uC778\uD504\uB77C \uACE0\uC815\uBE44",
+    rewrite: "\uB300\uBCF8 \uB2E4\uB4EC\uAE30",
+    cua_generate_report: "\uBE44\uC6A9 \uB9AC\uD3EC\uD2B8 \uC0DD\uC131",
+    tts_generation: "\uC74C\uC131 \uC0DD\uC131",
+    youtube_asr: "\uC720\uD29C\uBE0C \uC790\uB9C9 \uCD94\uCD9C",
+    youtube_caption_asr: "\uC720\uD29C\uBE0C \uC790\uB9C9 \uCD94\uCD9C",
+    content_metadata: "\uCF58\uD150\uCE20 \uC815\uBCF4 \uC815\uB9AC",
+    content_metadata_generate: "\uCF58\uD150\uCE20 \uC815\uBCF4 \uC815\uB9AC",
+    content_embedding: "\uCF58\uD150\uCE20 \uAC80\uC0C9\uC6A9 \uB370\uC774\uD130 \uC0DD\uC131",
+    content_embedding_generate: "\uCF58\uD150\uCE20 \uAC80\uC0C9\uC6A9 \uB370\uC774\uD130 \uC0DD\uC131",
+    hardburn_subtitle: "\uC790\uB9C9 \uC785\uD788\uAE30"
+  };
+  var PRICING_KIND_LABELS = {
+    actual: "\uC2E4\uCE21",
+    estimated: "\uC608\uC0C1",
+    fixed: "\uACE0\uC815",
+    missing: "\uC9D1\uACC4 \uC548 \uB428"
+  };
+  var JOB_STATUS_LABELS = {
+    PUBLISHED: "\uBC1C\uD589 \uC644\uB8CC",
+    WAITING_VIDEO_APPROVAL: "\uC601\uC0C1 \uC2B9\uC778 \uB300\uAE30",
+    APPROVED: "\uC2B9\uC778 \uC644\uB8CC",
+    FAILED: "\uC2E4\uD328"
+  };
+  var EVENT_STATUS_LABELS = {
+    success: "\uC644\uB8CC",
+    failed: "\uC2E4\uD328"
+  };
+  var SUBJECT_TYPE_LABELS = {
+    job: "\uC791\uC5C5",
+    operation: "\uC6B4\uC601 \uC791\uC5C5"
+  };
 
   function pageSize() { return parseInt(document.getElementById("pageSizeSelect").value) || 50; }
   function q(id) { return document.getElementById(id); }
@@ -6959,6 +7024,52 @@ def _cost_viewer_html(api_base_path: str) -> str:
   function fmtUsd(v) { return "$" + num(v).toFixed(6); }
   function fmtKrw(v) { return "\u20A9" + Math.round(num(v)).toLocaleString("ko-KR"); }
   function shortText(v, max) { var s = String(v || ""); return s.length <= max ? s : s.slice(0, max - 1) + "\u2026"; }
+  function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
+  function humanizeCode(code) {
+    var text = String(code || "").trim();
+    if (!text) return "\u2013";
+    var normalized = text.replace(/[_-]+/g, " ");
+    normalized = normalized.replace(/\bapi\b/gi, "API");
+    normalized = normalized.replace(/\btts\b/gi, "TTS");
+    normalized = normalized.replace(/\basr\b/gi, "ASR");
+    normalized = normalized.replace(/\bcua\b/gi, "CUA");
+    normalized = normalized.replace(/\bffmpeg\b/gi, "FFmpeg");
+    normalized = normalized.replace(/\bopenai\b/gi, "OpenAI");
+    normalized = normalized.replace(/\bheygen\b/gi, "HeyGen");
+    normalized = normalized.replace(/\baws\b/gi, "AWS");
+    normalized = normalized.replace(/\brunpod\b/gi, "Runpod");
+    return normalized;
+  }
+  function labelFor(code, labels) {
+    var key = String(code || "").trim();
+    if (!key) return "\u2013";
+    return hasOwn(labels, key) ? labels[key] : humanizeCode(key);
+  }
+  function formatStage(code) { return labelFor(code, STAGE_LABELS); }
+  function formatProcess(code) { return labelFor(code, PROCESS_LABELS); }
+  function formatProvider(code) { return labelFor(code, PROVIDER_LABELS); }
+  function formatApiKeyFamily(code) { return labelFor(code, API_KEY_FAMILY_LABELS); }
+  function formatPricingKind(code) { return labelFor(String(code || "").toLowerCase(), PRICING_KIND_LABELS); }
+  function formatSubjectType(code) { return labelFor(String(code || "").toLowerCase(), SUBJECT_TYPE_LABELS); }
+  function formatJobStatus(code) { return labelFor(String(code || "").toUpperCase(), JOB_STATUS_LABELS); }
+  function formatEventStatus(code) { return labelFor(String(code || "").toLowerCase(), EVENT_STATUS_LABELS); }
+  function parseOperationLabel(subject) {
+    var key = String(subject.subject_key || "").trim();
+    if (/^(operation|legacy):/.test(key)) {
+      var parts = key.split(":");
+      if (parts.length >= 3) return formatProcess(parts[1]) + " / " + formatProvider(parts[2]);
+    }
+    var label = String(subject.subject_label || subject.topic_text || "").trim();
+    var labelParts = label.split(/\s*\/\s*/);
+    if (labelParts.length === 2) return formatProcess(labelParts[0]) + " / " + formatProvider(labelParts[1]);
+    return label ? humanizeCode(label) : "";
+  }
+  function displaySubjectLabel(subject) {
+    if (String(subject.subject_type || "").toLowerCase() === "operation") {
+      return parseOperationLabel(subject) || "\uC6B4\uC601 \uC791\uC5C5";
+    }
+    return String(subject.subject_label || subject.topic_text || subject.subject_key || "");
+  }
   function toKST(iso) {
     if (!iso) return "\u2013";
     try { return new Date(iso).toLocaleString("ko-KR", { timeZone:"Asia/Seoul", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false }); }
@@ -6968,19 +7079,21 @@ def _cost_viewer_html(api_base_path: str) -> str:
   function statusBadge(s) {
     var u = String(s || "").toUpperCase();
     if (!u) return "\u2013";
-    if (u === "PUBLISHED") return badge(u, "published");
-    if (u === "FAILED")    return badge(u, "failed");
-    return badge(u, "default");
+    if (u === "PUBLISHED") return badge(formatJobStatus(u), "published");
+    if (u === "WAITING_VIDEO_APPROVAL") return badge(formatJobStatus(u), "waiting");
+    if (u === "APPROVED") return badge(formatJobStatus(u), "approved");
+    if (u === "FAILED") return badge(formatJobStatus(u), "failed");
+    return badge(formatJobStatus(u), "default");
   }
   function pricingBadge(pk) {
     var p = String(pk || "").toLowerCase();
-    return ["actual","estimated","fixed","missing"].indexOf(p) >= 0 ? badge(p, p) : badge(p || "\u2013", "default");
+    return ["actual","estimated","fixed","missing"].indexOf(p) >= 0 ? badge(formatPricingKind(p), p) : badge(formatPricingKind(p), "default");
   }
   function statusEvBadge(st) {
     var s = String(st || "").toLowerCase();
-    if (s === "success") return badge("success", "success");
-    if (s === "failed")  return badge("failed",  "failed");
-    return badge(st || "\u2013", "default");
+    if (s === "success") return badge(formatEventStatus(s), "success");
+    if (s === "failed")  return badge(formatEventStatus(s), "failed");
+    return badge(formatEventStatus(s), "default");
   }
   function durFmt(ms) {
     var n = Number(ms);
@@ -7047,9 +7160,9 @@ def _cost_viewer_html(api_base_path: str) -> str:
         var shortKey = String(rec.subject_key || rec.job_id || "").slice(0, 8);
         var tr = document.createElement("tr");
         tr.innerHTML =
-          '<td>' + badge(rec.subject_type || "job", rec.subject_type || "job") + '</td>'
+          '<td>' + badge(formatSubjectType(rec.subject_type || "job"), rec.subject_type || "job") + '</td>'
           + '<td><span class="mono" title="' + (rec.subject_key||"") + '">' + shortKey + '</span></td>'
-          + '<td>' + shortText(rec.subject_label || rec.topic_text || "", 60) + '</td>'
+          + '<td>' + shortText(displaySubjectLabel(rec), 60) + '</td>'
           + '<td>' + stageIcons(rec) + '</td>'
           + '<td>' + statusBadge(rec.status) + '</td>'
           + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.main_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(mainKrw) + '</div></td>'
@@ -7060,7 +7173,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
           var td = row.cells[8];
           var db = document.createElement("button"); db.className = "sm primary"; db.textContent = "\uC0C1\uC138";
           db.onclick = function() { loadDetail(String(r.subject_key || r.job_id || "")); };
-          var eb = document.createElement("button"); eb.className = "sm"; eb.textContent = "JSON"; eb.style.marginLeft = "4px";
+          var eb = document.createElement("button"); eb.className = "sm"; eb.textContent = "\uC6D0\uBCF8"; eb.style.marginLeft = "4px";
           eb.onclick = function() { window.open(apiBase + "/api/export?job_id=" + encodeURIComponent(r.subject_key || r.job_id || ""), "_blank"); };
           td.appendChild(db); td.appendChild(eb);
         })(rec, tr);
@@ -7082,10 +7195,18 @@ def _cost_viewer_html(api_base_path: str) -> str:
     }
   }
 
-  function renderBreakdown(title, obj) {
+  function formatBreakdownKey(kind, key) {
+    if (kind === "stage") return formatStage(key);
+    if (kind === "process") return formatProcess(key);
+    if (kind === "provider") return formatProvider(key);
+    if (kind === "api_key_family") return formatApiKeyFamily(key);
+    if (kind === "pricing_kind") return formatPricingKind(key);
+    return humanizeCode(key);
+  }
+  function renderBreakdown(title, obj, kind) {
     var entries = Object.entries(obj || {}).sort(function(a,b){ return num(b[1].cost_usd)-num(a[1].cost_usd); });
     var rows = entries.length
-      ? entries.map(function(p){ return '<div class="bd-row"><span class="bd-key">' + shortText(p[0],30) + '</span><span class="bd-val">' + fmtUsd(p[1].cost_usd) + ' \u00B7 ' + p[1].count + '\uAC74</span></div>'; }).join("")
+      ? entries.map(function(p){ return '<div class="bd-row"><span class="bd-key">' + shortText(formatBreakdownKey(kind, p[0]),30) + '</span><span class="bd-val">' + fmtUsd(p[1].cost_usd) + ' \u00B7 ' + p[1].count + '\uAC74</span></div>'; }).join("")
       : '<div class="bd-row"><span class="bd-key" style="color:var(--muted);">\uC5C6\uC74C</span></div>';
     return '<div class="bd-box"><h4>' + title + '</h4>' + rows + '</div>';
   }
@@ -7098,29 +7219,29 @@ def _cost_viewer_html(api_base_path: str) -> str:
     q("detailStatus").innerHTML  = ""; q("detailDate").textContent = "";
     q("detailCostSummary").innerHTML = ""; q("detailBreakdown").innerHTML = "";
     q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:16px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
-    q("rawJson").style.display = "none"; q("toggleRawBtn").textContent = "{ } Raw JSON \uBCF4\uAE30";
+    q("rawJson").style.display = "none"; q("toggleRawBtn").textContent = "{ } \uC6D0\uBCF8 \uB370\uC774\uD130 \uBCF4\uAE30";
     try {
       var det = await fetchJson(apiBase + "/api/jobs/" + encodeURIComponent(subjectKey));
       var sub = det.subject || {}, sum = det.summary || {};
       var events = Array.isArray(det.events) ? det.events : [];
-      q("detailTitle").textContent = shortText(sub.subject_label || sub.topic_text || subjectKey, 70);
+      q("detailTitle").textContent = shortText(displaySubjectLabel(sub) || subjectKey, 70);
       q("detailId").textContent    = subjectKey;
       q("detailStatus").innerHTML  = statusBadge(sub.status);
       q("detailDate").textContent  = toKST(sub.created_at);
       var byP = sum.by_pricing_kind || {};
       var mKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
       q("detailCostSummary").innerHTML =
-          '<div class="cs-card"><div class="cs-label">Main (\uC2E4\uC81C+\uACE0\uC815)</div><div class="cs-val">'    + fmtUsd(sum.main_cost_usd)      + '</div><div class="cs-krw">' + fmtKrw(mKrw)                               + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">실제 비용 (Actual)</div><div class="cs-val">'                               + fmtUsd(sum.actual_cost_usd)    + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw)    + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">인프라 유지 (\uC778\uD504\uB77C)</div><div class="cs-val">'          + fmtUsd(sum.fixed_cost_usd)     + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw)     + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">추정치 (Estimated)</div><div class="cs-val">'                            + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">비용 누락 \uC774\uBCA4\uD2B8</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
+          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.main_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(mKrw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uACE0\uC815 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.fixed_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uC608\uC0C1 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uBE44\uC6A9 \uC815\uBCF4 \uC5C6\uC74C</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
       q("detailBreakdown").innerHTML =
-          renderBreakdown("단계별 (Stage)",          sum.by_stage)
-        + renderBreakdown("프로세스별 (Process)",    sum.by_process)
-        + renderBreakdown("제공자별 (Provider)",     sum.by_provider)
-        + renderBreakdown("API 키별",               sum.by_api_key_family)
-        + renderBreakdown("과금 방식별 (Pricing)",   sum.by_pricing_kind);
+          renderBreakdown("\uB2E8\uACC4\uBCC4 \uBE44\uC6A9", sum.by_stage, "stage")
+        + renderBreakdown("\uC791\uC5C5\uBCC4 \uBE44\uC6A9", sum.by_process, "process")
+        + renderBreakdown("\uC11C\uBE44\uC2A4\uBCC4 \uBE44\uC6A9", sum.by_provider, "provider")
+        + renderBreakdown("\uBE44\uC6A9 \uBD84\uB958\uBCC4", sum.by_api_key_family, "api_key_family")
+        + renderBreakdown("\uBE44\uC6A9 \uACC4\uC0B0 \uBC29\uC2DD", sum.by_pricing_kind, "pricing_kind");
       if (!events.length) {
         q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:12px;">\uC774\uBCA4\uD2B8 \uC5C6\uC74C</td></tr>';
       } else {
@@ -7129,9 +7250,9 @@ def _cost_viewer_html(api_base_path: str) -> str:
           var ev = events[j];
           html += '<tr>'
             + '<td style="white-space:nowrap;">' + toKST(ev.created_at)                    + '</td>'
-            + '<td>' + String(ev.stage    || "") + '</td>'
-            + '<td>' + String(ev.process  || "") + '</td>'
-            + '<td>' + String(ev.provider || "") + '</td>'
+            + '<td>' + formatStage(ev.stage) + '</td>'
+            + '<td>' + formatProcess(ev.process) + '</td>'
+            + '<td>' + formatProvider(ev.provider) + '</td>'
             + '<td>' + statusEvBadge(ev.status)  + '</td>'
             + '<td>' + pricingBadge(ev.pricing_kind) + '</td>'
             + '<td class="mono">' + (ev.cost_usd != null ? fmtUsd(ev.cost_usd) : "\u2013") + '</td>'
@@ -7153,7 +7274,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
   q("toggleRawBtn").addEventListener("click", function() {
     var el = q("rawJson"), vis = el.style.display !== "none";
     el.style.display = vis ? "none" : "block";
-    q("toggleRawBtn").textContent = vis ? "{ } Raw JSON \uBCF4\uAE30" : "{ } Raw JSON \uC228\uAE30\uAE30";
+    q("toggleRawBtn").textContent = vis ? "{ } \uC6D0\uBCF8 \uB370\uC774\uD130 \uBCF4\uAE30" : "{ } \uC6D0\uBCF8 \uB370\uC774\uD130 \uC228\uAE30\uAE30";
   });
   loadRows(0).catch(function(e){ q("statusBar").textContent = String(e); });
 </script>
