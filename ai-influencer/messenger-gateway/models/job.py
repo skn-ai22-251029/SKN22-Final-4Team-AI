@@ -231,6 +231,9 @@ class SeedLabProgressRequest(BaseModel):
     remote_eval_last_error: str = ""
     eval_executor_counts: dict = {}
     avg_stage_timings_ms: dict = {}
+    eval_preflight_status: str = ""
+    eval_preflight_detail: str = ""
+    eval_preflight_checked_at: str = ""
     last_error: str = ""
     finished_at: str = ""
 

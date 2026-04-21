@@ -8,6 +8,7 @@ import json
 import logging
 import secrets
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.error
@@ -34,7 +35,6 @@ from seed_lab import (  # type: ignore
     LIVE_RECORDS_JSONL,
     _auto_eval_single_record,
     _build_run_id,
-    _empty_eval,
     _expand_seed_list_with_random,
     _generate_review_html,
     _load_human_eval_map,
@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     seedlab_eval_runpod_shared_secret: str = ""
     seedlab_eval_runpod_timeout: int = 180
     seedlab_eval_runpod_poll_interval: float = 2.0
+    seedlab_eval_runpod_preflight_timeout: float = 5.0
+    seedlab_eval_runpod_http_timeout: float = 20.0
     seedlab_sample_s3_bucket: str = ""
     seedlab_sample_s3_prefix: str = "seed-lab-samples"
     seedlab_sample_s3_region: str = "ap-northeast-2"
@@ -115,6 +117,36 @@ class RunCreateRequest(BaseModel):
 
 
 _s3_client: Any | None = None
+_state_progress_lock = threading.Lock()
+
+
+class RunpodEvalError(RuntimeError):
+    def __init__(
+        self,
+        error_code: str,
+        detail: str,
+        *,
+        endpoint: str = "",
+        remote_job_id: str = "",
+        health_snapshot: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.error_code = str(error_code or "").strip() or "runpod_eval_error"
+        self.detail = str(detail or "").strip() or "unknown error"
+        self.endpoint = str(endpoint or "").strip()
+        self.remote_job_id = str(remote_job_id or "").strip()
+        self.health_snapshot = health_snapshot if isinstance(health_snapshot, dict) else {}
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
+        parts = [self.error_code, self.detail]
+        if self.remote_job_id:
+            parts.append(f"job_id={self.remote_job_id}")
+        if self.endpoint:
+            parts.append(f"endpoint={self.endpoint}")
+        summary = _runpod_health_summary_text(self.health_snapshot)
+        if summary:
+            parts.append(f"health={summary}")
+        return " | ".join(parts)
 
 
 def _utcnow() -> dt.datetime:
@@ -179,6 +211,9 @@ def _meta_from_state(state: dict[str, Any]) -> dict[str, Any]:
         "gpu_active_sample_count": int(state.get("gpu_active_sample_count") or 0),
         "remote_eval_failed_count": int(state.get("remote_eval_failed_count") or 0),
         "remote_eval_last_error": str(state.get("remote_eval_last_error") or ""),
+        "eval_preflight_status": str(state.get("eval_preflight_status") or ""),
+        "eval_preflight_detail": str(state.get("eval_preflight_detail") or ""),
+        "eval_preflight_checked_at": str(state.get("eval_preflight_checked_at") or ""),
         "eval_executor_counts": dict(state.get("eval_executor_counts") or {}),
         "avg_stage_timings_ms": dict(state.get("avg_stage_timings_ms") or {}),
     }
@@ -204,12 +239,8 @@ def _save_state(state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-async def _notify_gateway_progress(state: dict[str, Any]) -> None:
-    gateway_url = (settings.seedlab_gateway_url or "").strip().rstrip("/")
-    secret = (settings.gateway_internal_secret or "").strip()
-    if not gateway_url or not secret:
-        return
-    payload = {
+def _build_gateway_progress_payload(state: dict[str, Any]) -> dict[str, Any]:
+    return {
         "run_id": str(state.get("run_id") or ""),
         "status": str(state.get("status") or ""),
         "stage": str(state.get("stage") or ""),
@@ -226,24 +257,43 @@ async def _notify_gateway_progress(state: dict[str, Any]) -> None:
         "remote_eval_last_error": str(state.get("remote_eval_last_error") or ""),
         "eval_executor_counts": dict(state.get("eval_executor_counts") or {}),
         "avg_stage_timings_ms": dict(state.get("avg_stage_timings_ms") or {}),
+        "eval_preflight_status": str(state.get("eval_preflight_status") or ""),
+        "eval_preflight_detail": str(state.get("eval_preflight_detail") or ""),
+        "eval_preflight_checked_at": str(state.get("eval_preflight_checked_at") or ""),
         "last_error": str(state.get("last_error") or ""),
         "finished_at": str(state.get("finished_at") or ""),
     }
 
-    def _post() -> None:
-        req = urllib.request.Request(
-            f"{gateway_url}/internal/seedlab-progress",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "X-Internal-Secret": secret},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
 
+def _post_gateway_progress_payload(payload: dict[str, Any]) -> None:
+    gateway_url = (settings.seedlab_gateway_url or "").strip().rstrip("/")
+    secret = (settings.gateway_internal_secret or "").strip()
+    if not gateway_url or not secret:
+        return
+    req = urllib.request.Request(
+        f"{gateway_url}/internal/seedlab-progress",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Internal-Secret": secret},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+async def _notify_gateway_progress(state: dict[str, Any]) -> None:
+    payload = _build_gateway_progress_payload(state)
     try:
-        await asyncio.to_thread(_post)
+        await asyncio.to_thread(_post_gateway_progress_payload, payload)
     except Exception as e:
         logger.warning("seedlab progress notify failed run_id=%s err=%s", payload["run_id"], e)
+
+
+def _notify_gateway_progress_sync(state: dict[str, Any]) -> None:
+    payload = _build_gateway_progress_payload(state)
+    try:
+        _post_gateway_progress_payload(payload)
+    except Exception as e:
+        logger.warning("seedlab sync progress notify failed run_id=%s err=%s", payload["run_id"], e)
 
 
 def _update_state(run_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -374,8 +424,6 @@ def _record_eval_progress(state: dict[str, Any], eval_obj: dict[str, Any], debug
     executor_counts = state.get("eval_executor_counts") if isinstance(state.get("eval_executor_counts"), dict) else {}
     executor_counts[executor] = int(executor_counts.get(executor) or 0) + 1
     state["eval_executor_counts"] = executor_counts
-    if executor == "runpod_gpu":
-        state["runpod_job_count"] = int(state.get("runpod_job_count") or 0) + 1
     if bool(debug_obj.get("gpu_acceleration_active")):
         state["gpu_active_sample_count"] = int(state.get("gpu_active_sample_count") or 0) + 1
     if str(eval_obj.get("auto_eval_status") or "").strip().lower() != "ready":
@@ -418,6 +466,91 @@ def _runpod_eval_enabled() -> bool:
         and str(settings.seedlab_eval_runpod_url or "").strip()
         and str(settings.seedlab_eval_runpod_shared_secret or "").strip()
     )
+
+
+def _runpod_eval_base_url() -> str:
+    return str(settings.seedlab_eval_runpod_url or "").strip().rstrip("/")
+
+
+def _runpod_eval_preflight_timeout_seconds() -> float:
+    return max(1.0, float(settings.seedlab_eval_runpod_preflight_timeout or 5.0))
+
+
+def _runpod_eval_request_timeout_seconds(overall_timeout_seconds: float) -> float:
+    configured = max(5.0, float(settings.seedlab_eval_runpod_http_timeout or 20.0))
+    return min(max(5.0, float(overall_timeout_seconds)), configured)
+
+
+def _runpod_health_summary_text(snapshot: dict[str, Any] | None) -> str:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return ""
+    capabilities = snapshot.get("capabilities") if isinstance(snapshot.get("capabilities"), dict) else {}
+    chunks = [
+        f"ok={snapshot.get('ok')}",
+        f"warmup={snapshot.get('warmup_status') or ''}",
+        f"job_api={snapshot.get('job_api_enabled')}",
+        f"gpu_ready={snapshot.get('gpu_ready')}",
+    ]
+    if capabilities:
+        chunks.append(f"resolved_device={capabilities.get('resolved_device') or ''}")
+        chunks.append(f"gpu_active={capabilities.get('gpu_acceleration_active')}")
+    warmup_error = str(snapshot.get("warmup_error") or "").strip()
+    if warmup_error:
+        chunks.append(f"warmup_error={warmup_error[:120]}")
+    return ", ".join(chunk for chunk in chunks if chunk and not chunk.endswith("="))
+
+
+def _runpod_eval_preflight_snapshot() -> dict[str, Any]:
+    if not _runpod_eval_enabled():
+        raise RunpodEvalError("preflight_unhealthy", "Runpod evaluation is not configured")
+    url = _runpod_eval_base_url()
+    timeout_seconds = _runpod_eval_preflight_timeout_seconds()
+    req = urllib.request.Request(
+        f"{url}/health",
+        headers={"X-Seedlab-Secret": str(settings.seedlab_eval_runpod_shared_secret or "").strip()},
+        method="GET",
+    )
+    try:
+        payload = _request_json(req, timeout_seconds)
+    except Exception as e:
+        raise RunpodEvalError("preflight_unhealthy", str(e), endpoint=f"{url}/health") from e
+    ok = bool(payload.get("ok"))
+    warmup_status = str(payload.get("warmup_status") or "").strip().lower()
+    job_api_enabled = bool(payload.get("job_api_enabled"))
+    if not ok or warmup_status != "ready" or not job_api_enabled:
+        raise RunpodEvalError(
+            "preflight_unhealthy",
+            "RunPod eval health check failed",
+            endpoint=f"{url}/health",
+            health_snapshot=payload,
+        )
+    return payload
+
+
+def _record_eval_preflight_state(
+    state: dict[str, Any],
+    *,
+    status_value: str,
+    detail: str,
+    checked_at: str | None = None,
+) -> dict[str, Any]:
+    state["eval_preflight_status"] = status_value
+    state["eval_preflight_detail"] = detail
+    state["eval_preflight_checked_at"] = checked_at or _utcnow().isoformat()
+    return state
+
+
+def _record_remote_submit_progress(run_id: str, *, job_id: str, preflight_snapshot: dict[str, Any]) -> None:
+    with _state_progress_lock:
+        state = _load_state(run_id)
+        state["runpod_job_count"] = int(state.get("runpod_job_count") or 0) + 1
+        detail = (
+            f"remote jobs submitted={int(state.get('runpod_job_count') or 0)}; "
+            f"latest_job_id={job_id}; {_runpod_health_summary_text(preflight_snapshot)}"
+        )
+        _record_eval_preflight_state(state, status_value="ready", detail=detail)
+        _save_state(state)
+    _notify_gateway_progress_sync(state)
 
 
 def _get_s3_client():
@@ -541,12 +674,14 @@ def _request_json(req: urllib.request.Request, timeout_seconds: float) -> dict[s
     return parsed
 
 
-def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+def _call_runpod_eval(run_id: str, rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
     if not _runpod_eval_enabled():
-        raise RuntimeError("Runpod evaluation is not configured")
-    url = str(settings.seedlab_eval_runpod_url or "").strip().rstrip("/")
+        raise RunpodEvalError("preflight_unhealthy", "Runpod evaluation is not configured")
+    url = _runpod_eval_base_url()
     timeout_seconds = max(10, int(settings.seedlab_eval_runpod_timeout))
     poll_interval = max(0.5, float(settings.seedlab_eval_runpod_poll_interval))
+    request_timeout = _runpod_eval_request_timeout_seconds(timeout_seconds)
+    preflight_snapshot = _runpod_eval_preflight_snapshot()
     payload = _remote_eval_request(rec)
     submit_req = urllib.request.Request(
         f"{url}/evaluate/jobs",
@@ -554,11 +689,25 @@ def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[st
         headers=_runpod_eval_headers(),
         method="POST",
     )
-    submitted = _request_json(submit_req, min(timeout_seconds, 30))
+    try:
+        submitted = _request_json(submit_req, request_timeout)
+    except Exception as e:
+        raise RunpodEvalError(
+            "submit_failed",
+            str(e),
+            endpoint=f"{url}/evaluate/jobs",
+            health_snapshot=preflight_snapshot,
+        ) from e
     job_id = str(submitted.get("job_id") or "").strip()
     if not job_id:
-        raise RuntimeError("runpod eval submit did not return job_id")
+        raise RunpodEvalError(
+            "invalid_remote_payload",
+            "runpod eval submit did not return job_id",
+            endpoint=f"{url}/evaluate/jobs",
+            health_snapshot=preflight_snapshot,
+        )
     submitted_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    _record_remote_submit_progress(run_id, job_id=job_id, preflight_snapshot=preflight_snapshot)
     deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
     parsed = submitted
     while True:
@@ -566,42 +715,49 @@ def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[st
         if status_value in {"completed", "succeeded"}:
             break
         if status_value in {"failed", "error"}:
-            sample_id = str(parsed.get("sample_id") or payload["sample_id"]).strip()
             detail = str(parsed.get("error") or "unknown error")
-            evaluation = _empty_eval(f"RUNPOD-EVAL FAILED: {detail}", status="failed")
-            evaluation["executor"] = "runpod_gpu"
-            debug = {
-                "sample_id": sample_id,
-                "seed": int(rec.get("seed") or 0),
-                "script_id": str(rec.get("script_id") or ""),
-                "status": "failed",
-                "executor": "runpod_gpu",
-                "error": detail,
-                "remote_eval": {
-                    "executor": "runpod_gpu",
-                    "job_id": job_id,
-                    "submitted_at": submitted_at,
-                    "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                    "status": status_value,
-                    "error": detail,
-                    "gpu_acceleration_active": False,
-                },
-            }
-            return sample_id, evaluation, debug
+            raise RunpodEvalError(
+                "remote_job_failed",
+                detail,
+                endpoint=f"{url}/evaluate/jobs/{job_id}",
+                remote_job_id=job_id,
+                health_snapshot=preflight_snapshot,
+            )
         if dt.datetime.now(dt.timezone.utc).timestamp() >= deadline:
-            raise RuntimeError(f"runpod eval polling timeout job_id={job_id}")
+            raise RunpodEvalError(
+                "poll_timeout",
+                f"runpod eval polling timeout job_id={job_id}",
+                endpoint=f"{url}/evaluate/jobs/{job_id}",
+                remote_job_id=job_id,
+                health_snapshot=preflight_snapshot,
+            )
         time.sleep(poll_interval)
         poll_req = urllib.request.Request(
             f"{url}/evaluate/jobs/{urllib.parse.quote(job_id, safe='')}",
             headers=_runpod_eval_headers(),
             method="GET",
         )
-        parsed = _request_json(poll_req, min(timeout_seconds, 30))
+        try:
+            parsed = _request_json(poll_req, request_timeout)
+        except Exception as e:
+            raise RunpodEvalError(
+                "poll_timeout",
+                str(e),
+                endpoint=f"{url}/evaluate/jobs/{job_id}",
+                remote_job_id=job_id,
+                health_snapshot=preflight_snapshot,
+            ) from e
     sample_id = str(parsed.get("sample_id") or payload["sample_id"]).strip()
     evaluation = parsed.get("evaluation")
     debug = parsed.get("debug")
     if not sample_id or not isinstance(evaluation, dict) or not isinstance(debug, dict):
-        raise RuntimeError("runpod eval returned invalid payload")
+        raise RunpodEvalError(
+            "invalid_remote_payload",
+            "runpod eval returned invalid payload",
+            endpoint=f"{url}/evaluate/jobs/{job_id}",
+            remote_job_id=job_id,
+            health_snapshot=preflight_snapshot,
+        )
     evaluation["executor"] = str(evaluation.get("executor") or "runpod_gpu")
     debug["executor"] = str(debug.get("executor") or "runpod_gpu")
     remote_eval = debug.get("remote_eval") if isinstance(debug.get("remote_eval"), dict) else {}
@@ -613,9 +769,11 @@ def _call_runpod_eval(rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[st
             "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "status": "completed",
             "gpu_acceleration_active": bool(debug.get("gpu_acceleration_active")),
+            "health_summary": _runpod_health_summary_text(preflight_snapshot),
         }
     )
     debug["remote_eval"] = remote_eval
+    debug["runpod_health"] = preflight_snapshot
     return sample_id, evaluation, debug
 
 
@@ -623,7 +781,7 @@ def _evaluate_record_with_fallback(run_id: str, run_dir: Path, rec: dict[str, An
     if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
         if _sample_s3_enabled():
             _ensure_record_audio_uploaded(run_id, run_dir, rec)
-        return _call_runpod_eval(rec)
+        return _call_runpod_eval(run_id, rec)
     return _auto_eval_single_record(run_dir=run_dir, rec=rec, **_local_eval_kwargs())
 
 
@@ -644,6 +802,9 @@ def _run_status_payload(run_id: str) -> dict[str, Any]:
         "remote_eval_last_error": str(state.get("remote_eval_last_error") or ""),
         "eval_executor_counts": dict(state.get("eval_executor_counts") or {}),
         "avg_stage_timings_ms": dict(state.get("avg_stage_timings_ms") or {}),
+        "eval_preflight_status": str(state.get("eval_preflight_status") or ""),
+        "eval_preflight_detail": str(state.get("eval_preflight_detail") or ""),
+        "eval_preflight_checked_at": str(state.get("eval_preflight_checked_at") or ""),
         "last_error": str(state.get("last_error") or ""),
         "started_at": str(state.get("started_at") or ""),
         "finished_at": str(state.get("finished_at") or ""),
@@ -780,12 +941,35 @@ async def _run_generation_pipeline(run_id: str) -> None:
             gpu_active_sample_count=0,
             remote_eval_failed_count=0,
             remote_eval_last_error="",
+            eval_preflight_status="pending",
+            eval_preflight_detail="",
+            eval_preflight_checked_at="",
             eval_executor_counts={},
             stage_timing_totals_ms={},
             stage_timing_sample_count=0,
             avg_stage_timings_ms={},
         )
         await _notify_gateway_progress(state)
+        if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
+            try:
+                preflight_snapshot = await asyncio.to_thread(_runpod_eval_preflight_snapshot)
+                state = _load_state(run_id)
+                _record_eval_preflight_state(
+                    state,
+                    status_value="ready",
+                    detail=f"remote eval ready; {_runpod_health_summary_text(preflight_snapshot)}",
+                )
+                _save_state(state)
+                await _notify_gateway_progress(state)
+            except RunpodEvalError as e:
+                state = _load_state(run_id)
+                _record_eval_preflight_state(state, status_value="failed", detail=str(e))
+                state["remote_eval_failed_count"] = int(state.get("remote_eval_failed_count") or 0) + 1
+                state["remote_eval_last_error"] = str(e)
+                state["last_error"] = str(e)
+                _save_state(state)
+                await _notify_gateway_progress(state)
+                raise
         asr_model_resolved, _asr_warning = _resolve_asr_model_for_transcription(settings.seedlab_asr_model)
         eval_out = run_dir / "auto_eval.json"
         eval_out.unlink(missing_ok=True)
@@ -806,6 +990,7 @@ async def _run_generation_pipeline(run_id: str) -> None:
                 try:
                     sample_id, eval_obj, debug_obj = fut.result()
                 except Exception as e:
+                    state = _load_state(run_id)
                     state["remote_eval_failed_count"] = int(state.get("remote_eval_failed_count") or 0) + 1
                     state["remote_eval_last_error"] = str(e)
                     state["last_error"] = str(e)
@@ -825,6 +1010,7 @@ async def _run_generation_pipeline(run_id: str) -> None:
                 with debug_path.open("a", encoding="utf-8") as fp:
                     fp.write(json.dumps(debug_obj, ensure_ascii=False) + "\n")
                 eval_done += 1
+                state = _load_state(run_id)
                 state["evaluated_count"] = eval_done
                 _record_eval_progress(state, eval_obj, debug_obj)
                 await _record_seedlab_cost_events(run_id, sample_id, debug_obj)
@@ -953,6 +1139,9 @@ async def create_run(_: Any = AuthDep, body: RunCreateRequest | None = None) -> 
         "gpu_active_sample_count": 0,
         "remote_eval_failed_count": 0,
         "remote_eval_last_error": "",
+        "eval_preflight_status": "pending" if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod" else "",
+        "eval_preflight_detail": "",
+        "eval_preflight_checked_at": "",
         "eval_executor_counts": {},
         "stage_timing_totals_ms": {},
         "stage_timing_sample_count": 0,
@@ -963,6 +1152,17 @@ async def create_run(_: Any = AuthDep, body: RunCreateRequest | None = None) -> 
         "started_at": "",
         "finished_at": "",
     }
+    if _normalize_eval_mode(settings.seedlab_eval_mode) == "runpod_pod":
+        try:
+            preflight_snapshot = await asyncio.to_thread(_runpod_eval_preflight_snapshot)
+            _record_eval_preflight_state(
+                state,
+                status_value="ready",
+                detail=f"remote eval ready; {_runpod_health_summary_text(preflight_snapshot)}",
+            )
+        except RunpodEvalError as e:
+            _record_eval_preflight_state(state, status_value="failed", detail=str(e))
+            raise HTTPException(status_code=503, detail=str(e)) from e
     try:
         _write_initial_run_files(state)
         _save_state(state)

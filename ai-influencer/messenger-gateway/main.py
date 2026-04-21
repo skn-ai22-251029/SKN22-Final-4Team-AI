@@ -4169,6 +4169,8 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
     runpod_job_count = max(0, int(body.runpod_job_count or 0))
     gpu_active_sample_count = max(0, int(body.gpu_active_sample_count or 0))
     remote_eval_failed_count = max(0, int(body.remote_eval_failed_count or 0))
+    eval_preflight_status = str(body.eval_preflight_status or "").strip().lower()
+    eval_preflight_detail = str(body.eval_preflight_detail or "").strip()
     avg_stage_timings = body.avg_stage_timings_ms if isinstance(body.avg_stage_timings_ms, dict) else {}
     executor_counts = body.eval_executor_counts if isinstance(body.eval_executor_counts, dict) else {}
     if stage == "queued":
@@ -4212,6 +4214,16 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
             f"RunPod {runpod_job_count} / GPU {gpu_active_sample_count} / "
             f"AI 실패 {eval_failed_count} / 원격 실패 {remote_eval_failed_count}"
         )
+    if eval_preflight_status or eval_preflight_detail:
+        preflight_label = {
+            "pending": "대기",
+            "ready": "정상",
+            "failed": "실패",
+        }.get(eval_preflight_status, eval_preflight_status or "미확인")
+        line = f"원격 준비: {preflight_label}"
+        if eval_preflight_detail:
+            line = f"{line} / {_clip_text(eval_preflight_detail, 220)}"
+        lines.append(line)
     if executor_counts:
         executor_chunks = [f"{str(key)}={int(value or 0)}" for key, value in executor_counts.items()]
         if executor_chunks:
@@ -6510,7 +6522,11 @@ async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
         except Exception:
             pass
         await job_service.update_seed_lab_run(run_id, status="failed", last_error=response_detail[:800])
-        raise HTTPException(status_code=502, detail=f"seedlab create failed: {response_detail[:300]}")
+        upstream_status = 503 if response.status_code == 503 else 502
+        raise HTTPException(
+            status_code=upstream_status,
+            detail=f"seedlab create failed: {response_detail[:500]}",
+        )
     token = _build_seedlab_signed_token(run_id=run_id, user_id=body.messenger_user_id, expires_at=expires_at)
     base_url = (settings.seedlab_public_base_url or "").strip().rstrip("/")
     link = f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
@@ -6565,12 +6581,26 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
     incoming_evaluated = int(body.evaluated_count or 0)
     incoming_failed = int(body.failed_count or 0)
     incoming_total = int(body.total_count or 0)
+    incoming_runpod_jobs = int(body.runpod_job_count or 0)
+    incoming_gpu_active = int(body.gpu_active_sample_count or 0)
+    incoming_remote_failed = int(body.remote_eval_failed_count or 0)
+    incoming_remote_error = str(body.remote_eval_last_error or "")
+    incoming_preflight_status = str(body.eval_preflight_status or "")
+    incoming_preflight_detail = str(body.eval_preflight_detail or "")
+    incoming_last_error = str(body.last_error or "")
 
     current_stage = str(run.get("progress_last_stage") or "")
     current_generated = int(run.get("progress_last_generated_count") or 0)
     current_evaluated = int(run.get("progress_last_evaluated_count") or 0)
     current_failed = int(run.get("progress_last_failed_count") or 0)
     current_total = int(run.get("progress_last_total_count") or 0)
+    current_runpod_jobs = int(run.get("progress_last_runpod_job_count") or 0)
+    current_gpu_active = int(run.get("progress_last_gpu_active_sample_count") or 0)
+    current_remote_failed = int(run.get("progress_last_remote_eval_failed_count") or 0)
+    current_remote_error = str(run.get("progress_last_remote_eval_last_error") or "")
+    current_preflight_status = str(run.get("progress_last_eval_preflight_status") or "")
+    current_preflight_detail = str(run.get("progress_last_eval_preflight_detail") or "")
+    current_last_error = str(run.get("progress_last_last_error") or run.get("last_error") or "")
 
     should_update_message = (
         incoming_stage != current_stage
@@ -6578,6 +6608,13 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
         or incoming_evaluated != current_evaluated
         or incoming_failed != current_failed
         or incoming_total != current_total
+        or incoming_runpod_jobs != current_runpod_jobs
+        or incoming_gpu_active != current_gpu_active
+        or incoming_remote_failed != current_remote_failed
+        or incoming_remote_error != current_remote_error
+        or incoming_preflight_status != current_preflight_status
+        or incoming_preflight_detail != current_preflight_detail
+        or incoming_last_error != current_last_error
         or str(run.get("progress_message_id") or "").strip() == ""
     )
 
@@ -6590,6 +6627,13 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
         progress_last_evaluated_count=incoming_evaluated,
         progress_last_failed_count=incoming_failed,
         progress_last_total_count=incoming_total,
+        progress_last_runpod_job_count=incoming_runpod_jobs,
+        progress_last_gpu_active_sample_count=incoming_gpu_active,
+        progress_last_remote_eval_failed_count=incoming_remote_failed,
+        progress_last_remote_eval_last_error=incoming_remote_error,
+        progress_last_eval_preflight_status=incoming_preflight_status,
+        progress_last_eval_preflight_detail=incoming_preflight_detail,
+        progress_last_last_error=incoming_last_error,
     )
     run_for_message = updated_run or run
     if should_update_message and _discord_adapter is not None:

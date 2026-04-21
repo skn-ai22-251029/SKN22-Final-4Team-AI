@@ -225,6 +225,13 @@ async def _ensure_schema(pool: asyncpg.Pool) -> None:
         await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_evaluated_count INT NOT NULL DEFAULT 0")
         await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_failed_count INT NOT NULL DEFAULT 0")
         await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_total_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_runpod_job_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_gpu_active_sample_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_remote_eval_failed_count INT NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_remote_eval_last_error TEXT")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_eval_preflight_status TEXT")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_eval_preflight_detail TEXT")
+        await conn.execute("ALTER TABLE seed_lab_runs ADD COLUMN IF NOT EXISTS progress_last_last_error TEXT")
         await conn.execute("CREATE INDEX IF NOT EXISTS seed_lab_runs_user_created_idx ON seed_lab_runs(discord_user_id, created_at DESC)")
 
 
