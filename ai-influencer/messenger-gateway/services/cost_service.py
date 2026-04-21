@@ -556,6 +556,7 @@ async def _fetch_daily_estimate(
           SELECT j.id
           FROM jobs j
           {where_sql}
+          {"AND" if where_sql else "WHERE"} j.status IN ('WAITING_VIDEO_APPROVAL', 'PUBLISHED')
         ),
         heygen_success AS (
           SELECT ce.job_id, MAX(ce.created_at) AS video_ready_at

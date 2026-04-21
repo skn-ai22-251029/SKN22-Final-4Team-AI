@@ -182,7 +182,7 @@ async def _ensure_schema(pool: asyncpg.Pool) -> None:
                 status IN (
                     'DRAFT','SCRIPTING','GENERATING',
                     'WAITING_APPROVAL','REVISION_REQUESTED',
-                    'APPROVED','PUBLISHING','PUBLISHED',
+                    'APPROVED','REPORT_READY','PUBLISHING','PUBLISHED',
                     'PARTIALLY_PUBLISHED','PUBLISH_FAILED',
                     'ANALYTICS_COLLECTED','FAILED',
                     'WAITING_VIDEO_APPROVAL'

@@ -1211,7 +1211,7 @@ async def _list_wf13_candidate_jobs() -> list[dict[str, Any]]:
             j.created_at
         FROM jobs j
         WHERE j.messenger_user_id = 'system:auto-report'
-          AND COALESCE(j.status, '') IN ('PUBLISHED', 'PUBLISH_FAILED')
+          AND COALESCE(j.status, '') IN ('REPORT_READY', 'PUBLISH_FAILED')
           AND COALESCE(j.script_json->>'subtitle_script_text', '') <> ''
           AND COALESCE(j.script_json->>'tts_script_text', '') <> ''
           AND j.created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Seoul') AT TIME ZONE 'Asia/Seoul')
@@ -4321,7 +4321,7 @@ async def confirm_action(_: AuthDep, body: ConfirmActionRequest) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job["status"] in ("APPROVED", "PUBLISHED", "PUBLISHING"):
+    if job["status"] in ("APPROVED", "REPORT_READY", "PUBLISHED", "PUBLISHING"):
         raise HTTPException(status_code=409, detail=f"Job already in status: {job['status']}")
 
     channel_id = job["messenger_channel_id"]
@@ -4433,6 +4433,7 @@ async def auto_report(_: AuthDep, body: AutoReportRequest) -> dict:
         "WAITING_APPROVAL",
         "REVISION_REQUESTED",
         "APPROVED",
+        "REPORT_READY",
         "WAITING_VIDEO_APPROVAL",
         "PUBLISHING",
     }
@@ -4906,7 +4907,7 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             logger.error("[report-select] send_file_message failed job_id=%s: %s", body.job_id, e)
             return
 
-        await job_service.transition_status(body.job_id, "PUBLISHED")
+        await job_service.transition_status(body.job_id, "REPORT_READY")
         logger.info("[report-select] action=select done job_id=%s index=%d", body.job_id, body.report_index)
 
     elif body.action == "new":
@@ -6849,8 +6850,10 @@ def _cost_viewer_html(api_base_path: str) -> str:
       <select id="statusFilter">
         <option value="">&#xC0C1;&#xD0DC; &#xC804;&#xCCB4;</option>
         <option value="PUBLISHED">&#xBC1C;&#xD589; &#xC644;&#xB8CC;</option>
+        <option value="REPORT_READY">&#xB9AC;&#xD3EC;&#xD2B8; &#xC900;&#xBE44; &#xC644;&#xB8CC;</option>
         <option value="WAITING_VIDEO_APPROVAL">&#xC601;&#xC0C1; &#xC2B9;&#xC778; &#xB300;&#xAE30;</option>
         <option value="APPROVED">&#xC2B9;&#xC778; &#xC644;&#xB8CC;</option>
+        <option value="PUBLISH_FAILED">&#xBC1C;&#xD589; &#xC2E4;&#xD328;</option>
         <option value="FAILED">&#xC2E4;&#xD328;</option>
       </select>
       <label>&#xC815;&#xB82C;</label>
@@ -7019,6 +7022,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
   };
   var JOB_STATUS_LABELS = {
     PUBLISHED: "\uBC1C\uD589 \uC644\uB8CC",
+    REPORT_READY: "\uB9AC\uD3EC\uD2B8 \uC900\uBE44 \uC644\uB8CC",
     WAITING_VIDEO_APPROVAL: "\uC601\uC0C1 \uC2B9\uC778 \uB300\uAE30",
     APPROVED: "\uC2B9\uC778 \uC644\uB8CC",
     FAILED: "\uC2E4\uD328",
@@ -7095,6 +7099,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
     var u = String(s || "").toUpperCase();
     if (!u) return "\u2013";
     if (u === "PUBLISHED") return badge(formatJobStatus(u), "published");
+    if (u === "REPORT_READY") return badge(formatJobStatus(u), "approved");
     if (u === "WAITING_VIDEO_APPROVAL") return badge(formatJobStatus(u), "waiting");
     if (u === "APPROVED") return badge(formatJobStatus(u), "approved");
     if (u === "FAILED" || u === "PUBLISH_FAILED") return badge(formatJobStatus(u), "failed");
