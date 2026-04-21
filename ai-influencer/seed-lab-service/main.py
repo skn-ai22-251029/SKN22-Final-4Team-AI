@@ -468,6 +468,24 @@ def _runpod_eval_enabled() -> bool:
     )
 
 
+def _runpod_eval_missing_config_fields() -> list[str]:
+    missing: list[str] = []
+    if _normalize_eval_mode(settings.seedlab_eval_mode) != "runpod_pod":
+        return missing
+    if not str(settings.seedlab_eval_runpod_url or "").strip():
+        missing.append("SEEDLAB_EVAL_RUNPOD_URL")
+    if not str(settings.seedlab_eval_runpod_shared_secret or "").strip():
+        missing.append("SEEDLAB_EVAL_RUNPOD_SHARED_SECRET")
+    return missing
+
+
+def _runpod_eval_config_error_detail() -> str:
+    missing = _runpod_eval_missing_config_fields()
+    if not missing:
+        return "RunPod evaluation config missing"
+    return f"RunPod evaluation config missing: {', '.join(missing)}"
+
+
 def _runpod_eval_base_url() -> str:
     return str(settings.seedlab_eval_runpod_url or "").strip().rstrip("/")
 
@@ -502,7 +520,7 @@ def _runpod_health_summary_text(snapshot: dict[str, Any] | None) -> str:
 
 def _runpod_eval_preflight_snapshot() -> dict[str, Any]:
     if not _runpod_eval_enabled():
-        raise RunpodEvalError("preflight_unhealthy", "Runpod evaluation is not configured")
+        raise RunpodEvalError("preflight_unhealthy", _runpod_eval_config_error_detail())
     url = _runpod_eval_base_url()
     timeout_seconds = _runpod_eval_preflight_timeout_seconds()
     req = urllib.request.Request(
@@ -676,7 +694,7 @@ def _request_json(req: urllib.request.Request, timeout_seconds: float) -> dict[s
 
 def _call_runpod_eval(run_id: str, rec: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
     if not _runpod_eval_enabled():
-        raise RunpodEvalError("preflight_unhealthy", "Runpod evaluation is not configured")
+        raise RunpodEvalError("preflight_unhealthy", _runpod_eval_config_error_detail())
     url = _runpod_eval_base_url()
     timeout_seconds = max(10, int(settings.seedlab_eval_runpod_timeout))
     poll_interval = max(0.5, float(settings.seedlab_eval_runpod_poll_interval))
@@ -843,6 +861,7 @@ def _seedlab_capabilities() -> dict[str, Any]:
         ),
         "eval_mode": _normalize_eval_mode(settings.seedlab_eval_mode),
         "runpod_eval_enabled": _runpod_eval_enabled(),
+        "runpod_eval_missing_config_fields": _runpod_eval_missing_config_fields(),
         "sample_s3_enabled": _sample_s3_enabled(),
         "reference_audio_local_path_configured": bool((settings.seedlab_reference_audio_local_path or "").strip()),
         "reference_audio_s3_uri_configured": bool((settings.seedlab_reference_audio_s3_uri or "").strip()),
@@ -1057,6 +1076,13 @@ async def lifespan(app: FastAPI):
     run_root, run_root_writable, run_root_error = _ensure_run_root_writable()
     if not run_root_writable:
         raise RuntimeError(f"seedlab run root is not writable: {run_root} ({run_root_error})")
+    missing_runpod_config = _runpod_eval_missing_config_fields()
+    if missing_runpod_config:
+        logger.warning(
+            "seed-lab-service runpod eval config incomplete eval_mode=%s missing=%s",
+            _normalize_eval_mode(settings.seedlab_eval_mode),
+            ",".join(missing_runpod_config),
+        )
     for _ in range(max(1, int(settings.seedlab_queue_concurrency))):
         _worker_tasks.append(asyncio.create_task(_queue_worker()))
     logger.info("seed-lab-service started")

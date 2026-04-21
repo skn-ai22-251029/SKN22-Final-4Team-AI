@@ -1338,10 +1338,15 @@ Discord 명령:
 | `SEEDLAB_ASR_MODEL` | seed-lab-service | 자동평가 전사 모델 |
 | `SEEDLAB_JUDGE_MODEL` | seed-lab-service | 자동평가 note 생성 모델 |
 | `SEEDLAB_EVALUATION_PROFILE` | seed-lab-service | 현재 `hybrid` |
+| `SEEDLAB_EVAL_RUNPOD_URL` | seed-lab-service | RunPod 평가 API base URL. `SEEDLAB_EVAL_MODE=runpod_pod`면 필수 |
+| `SEEDLAB_EVAL_RUNPOD_SHARED_SECRET` | seed-lab-service | RunPod 평가 API `X-Seedlab-Secret`. `SEEDLAB_EVAL_MODE=runpod_pod`면 필수 |
 | `SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH` | seed-lab-service | 톤 비교용 기준 음성 로컬 경로 |
 | `SEEDLAB_REFERENCE_AUDIO_S3_URI` | seed-lab-service | 톤 비교용 기준 음성 S3 URI |
 | `SEEDLAB_REFERENCE_AUDIO_CACHE_DIR` | seed-lab-service | 기준 음성 캐시 경로 |
 | `SEEDLAB_DISABLE_LLM_NOTE` | seed-lab-service | LLM note 생성 비활성 |
+
+`SEEDLAB_EVAL_MODE=runpod_pod`인데 `SEEDLAB_EVAL_RUNPOD_URL` 또는 `SEEDLAB_EVAL_RUNPOD_SHARED_SECRET`가 비어 있으면,
+`seed-lab-service`는 startup warning을 남기고 `/seedlab` 생성 시 `preflight_unhealthy`로 즉시 실패합니다.
 
 #### 서버 기준 TTS 생성 구조
 
