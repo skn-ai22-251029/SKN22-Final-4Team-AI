@@ -9,6 +9,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -4156,6 +4157,13 @@ def _build_cost_viewer_link(*, user_id: str, expires_at: datetime) -> str:
     return f"{_resolve_cost_viewer_base_url()}/cost/r/{token}/"
 
 
+def _clip_text(text: str, max_len: int = 1500) -> str:
+    normalized = (text or "").strip()
+    if len(normalized) <= max_len:
+        return normalized
+    return normalized[: max_len - 3] + "..."
+
+
 def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequest) -> str:
     run_id = str(run.get("run_id") or body.run_id)
     stage = (body.stage or body.status or "queued").strip().lower()
@@ -6487,10 +6495,20 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
 
 @app.post("/internal/seedlab-start")
 async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
+    started_at = time.perf_counter()
     run_id = f"seedlab-{uuid.uuid4().hex[:12]}"
     samples = _SEEDLAB_DUP_SAMPLES if body.dup else _SEEDLAB_DEFAULT_SAMPLES
     takes_per_seed = _SEEDLAB_DUP_TAKES if body.dup else _SEEDLAB_DEFAULT_TAKES
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, int(settings.seedlab_link_ttl_seconds)))
+    logger.info(
+        "seedlab_start begin run_id=%s user=%s channel=%s dup=%s seeds=%s",
+        run_id,
+        body.messenger_user_id,
+        body.messenger_channel_id,
+        bool(body.dup),
+        bool((body.seeds or "").strip()),
+    )
+    db_started_at = time.perf_counter()
     created = await job_service.create_seed_lab_run(
         run_id=run_id,
         discord_user_id=body.messenger_user_id,
@@ -6504,14 +6522,47 @@ async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
         run_dir=f"/app/runtime/seed-lab/runs/{run_id}",
         signed_link_expires_at=expires_at,
     )
-    response = await _seedlab_service_request(
-        "POST",
+    logger.info(
+        "seedlab_start db_create_done run_id=%s elapsed_ms=%.1f total_ms=%.1f",
+        run_id,
+        (time.perf_counter() - db_started_at) * 1000.0,
+        (time.perf_counter() - started_at) * 1000.0,
+    )
+    logger.info(
+        "seedlab_start upstream_request_begin run_id=%s path=%s total_ms=%.1f",
+        run_id,
         "/internal/runs",
-        json_body={
-            "run_id": run_id,
-            "seeds": (body.seeds or "").strip(),
-            "dup": bool(body.dup),
-        },
+        (time.perf_counter() - started_at) * 1000.0,
+    )
+    upstream_started_at = time.perf_counter()
+    try:
+        response = await _seedlab_service_request(
+            "POST",
+            "/internal/runs",
+            json_body={
+                "run_id": run_id,
+                "seeds": (body.seeds or "").strip(),
+                "dup": bool(body.dup),
+            },
+        )
+    except HTTPException as e:
+        logger.warning(
+            "seedlab_start upstream_request_error run_id=%s path=%s status=%s elapsed_ms=%.1f total_ms=%.1f detail=%s",
+            run_id,
+            "/internal/runs",
+            e.status_code,
+            (time.perf_counter() - upstream_started_at) * 1000.0,
+            (time.perf_counter() - started_at) * 1000.0,
+            _clip_text(str(e.detail), 300),
+        )
+        raise
+    logger.info(
+        "seedlab_start upstream_request_done run_id=%s path=%s status=%s elapsed_ms=%.1f total_ms=%.1f",
+        run_id,
+        "/internal/runs",
+        response.status_code,
+        (time.perf_counter() - upstream_started_at) * 1000.0,
+        (time.perf_counter() - started_at) * 1000.0,
     )
     if response.status_code >= 400:
         response_detail = response.text
@@ -6523,6 +6574,13 @@ async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
             pass
         await job_service.update_seed_lab_run(run_id, status="failed", last_error=response_detail[:800])
         upstream_status = 503 if response.status_code == 503 else 502
+        logger.warning(
+            "seedlab_start failed run_id=%s status=%s total_ms=%.1f detail=%s",
+            run_id,
+            upstream_status,
+            (time.perf_counter() - started_at) * 1000.0,
+            _clip_text(response_detail, 300),
+        )
         raise HTTPException(
             status_code=upstream_status,
             detail=f"seedlab create failed: {response_detail[:500]}",
@@ -6531,6 +6589,11 @@ async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
     base_url = (settings.seedlab_public_base_url or "").strip().rstrip("/")
     link = f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
     created = await job_service.update_seed_lab_run(run_id, status="queued")
+    logger.info(
+        "seedlab_start success run_id=%s total_ms=%.1f",
+        run_id,
+        (time.perf_counter() - started_at) * 1000.0,
+    )
     return {
         "run_id": run_id,
         "status": str((created or {}).get("status") or "queued"),
@@ -6637,8 +6700,18 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
     )
     run_for_message = updated_run or run
     if should_update_message and _discord_adapter is not None:
-        progress_text = _format_seedlab_progress_text(run_for_message, body)
-        await _ensure_seedlab_progress_message(run_for_message, progress_text)
+        try:
+            progress_text = _format_seedlab_progress_text(run_for_message, body)
+            await _ensure_seedlab_progress_message(run_for_message, progress_text)
+        except Exception as e:
+            logger.warning(
+                "seedlab progress message update failed run_id=%s stage=%s preflight=%s err_type=%s err=%s",
+                body.run_id,
+                incoming_stage or str(body.status or ""),
+                incoming_preflight_status or "unknown",
+                type(e).__name__,
+                str(e),
+            )
     return {"ok": True, "updated": should_update_message}
 
 
