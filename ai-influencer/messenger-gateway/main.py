@@ -6978,8 +6978,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
       <select id="sortBySelect">
         <option value="updated_at" selected>&#xC218;&#xC815; &#xC2DC;&#xAC01;</option>
         <option value="created_at">&#xC0DD;&#xC131; &#xC2DC;&#xAC01;</option>
-        <option value="main_cost_usd">&#xCD1D; &#xBE44;&#xC6A9;</option>
-        <option value="estimated_cost_usd">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</option>
+        <option value="total_cost_usd">&#xCD1D; &#xBE44;&#xC6A9;</option>
       </select>
       <select id="sortDirSelect">
         <option value="desc" selected>&#xB0B4;&#xB9BC;&#xCC28;&#xC21C;</option>
@@ -7026,7 +7025,6 @@ def _cost_viewer_html(api_base_path: str) -> str:
             <th style="width:120px;">&#xB2E8;&#xACC4;</th>
             <th style="width:110px;">&#xC0C1;&#xD0DC;</th>
             <th style="width:130px;">&#xCD1D; &#xBE44;&#xC6A9;</th>
-            <th style="width:130px;">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</th>
             <th style="width:108px;">&#xC0DD;&#xC131; &#xC2DC;&#xAC01; (KST)</th>
             <th style="width:108px;">&#xC218;&#xC815; &#xC2DC;&#xAC01; (KST)</th>
             <th style="width:88px;">&#xBCF4;&#xAE30;</th>
@@ -7291,16 +7289,14 @@ def _cost_viewer_html(api_base_path: str) -> str:
 
   async function loadRows(offset) {
     q("statusBar").textContent = "\uC870\uD68C \uC911\u2026";
-    q("rows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
+    q("rows").innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
     try {
       var data = await fetchJson(buildListUrl(offset));
       currentOffset = offset; currentTotal = num(data.total);
       var items = Array.isArray(data.items) ? data.items : [];
       q("rows").innerHTML = "";
       for (var i = 0; i < items.length; i++) {
-        var rec = items[i]; var byP = rec.by_pricing_kind || {};
-        var mainKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
-        var estKrw  = num((byP.estimated||{}).cost_krw);
+        var rec = items[i];
         var shortKey = String(rec.subject_key || rec.job_id || "").slice(0, 8);
         var tr = document.createElement("tr");
         tr.innerHTML =
@@ -7309,13 +7305,12 @@ def _cost_viewer_html(api_base_path: str) -> str:
           + '<td>' + shortText(displaySubjectLabel(rec), 60) + '</td>'
           + '<td>' + stageIcons(rec) + '</td>'
           + '<td>' + statusBadge(rec.status) + '</td>'
-          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.main_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(mainKrw) + '</div></td>'
-          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.estimated_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(estKrw) + '</div></td>'
+          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.total_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(rec.total_cost_krw) + '</div></td>'
           + '<td style="color:var(--muted);">' + toKST(rec.created_at) + '</td>'
           + '<td style="color:var(--muted);">' + toKST(rec.updated_at) + '</td>'
           + '<td></td>';
         (function(r, row) {
-          var td = row.cells[9];
+          var td = row.cells[8];
           var db = document.createElement("button"); db.className = "sm primary"; db.textContent = "\uC0C1\uC138";
           db.onclick = function() { loadDetail(String(r.subject_key || r.job_id || "")); };
           var eb = document.createElement("button"); eb.className = "sm"; eb.textContent = "\uC6D0\uBCF8"; eb.style.marginLeft = "4px";
@@ -7350,7 +7345,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("statusBar").textContent = "\uB9C8\uC9C0\uB9C9 \uC870\uD68C: " + new Date().toLocaleTimeString("ko-KR");
     } catch(e) {
       q("statusBar").textContent = "\uC624\uB958: " + e.message;
-      q("rows").innerHTML = '<tr><td colspan="10" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
+      q("rows").innerHTML = '<tr><td colspan="9" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
     }
   }
 
@@ -7388,9 +7383,8 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("detailStatus").innerHTML  = statusBadge(sub.status);
       q("detailDate").textContent  = toKST(sub.created_at);
       var byP = sum.by_pricing_kind || {};
-      var mKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
       q("detailCostSummary").innerHTML =
-          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.main_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(mKrw) + '</div></div>'
+          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.total_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.total_cost_krw) + '</div></div>'
         + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw) + '</div></div>'
         + '<div class="cs-card"><div class="cs-label">\uACE0\uC815 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.fixed_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw) + '</div></div>'
         + '<div class="cs-card"><div class="cs-label">\uC608\uC0C1 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'

@@ -9,7 +9,7 @@ from services import job_service
 KST = timezone(timedelta(hours=9))
 PRICING_KINDS = {"actual", "estimated", "fixed", "missing"}
 SUBJECT_TYPES = {"job", "operation"}
-JOB_SUMMARY_SORT_FIELDS = {"updated_at", "created_at", "main_cost_usd", "estimated_cost_usd"}
+JOB_SUMMARY_SORT_FIELDS = {"updated_at", "created_at", "main_cost_usd", "estimated_cost_usd", "total_cost_usd"}
 JOB_SUMMARY_SORT_DIRECTIONS = {"asc", "desc"}
 EPOCH_UTC = datetime.fromtimestamp(0, timezone.utc)
 FIXED_INFRA_PROCESS = "daily_fixed_allocation"
@@ -71,7 +71,7 @@ def _sort_job_summary_items(items: list[dict[str, Any]], *, sort_by: str, sort_d
     sorted_items.sort(key=lambda item: _sort_datetime(item.get("created_at")), reverse=True)
     sorted_items.sort(key=lambda item: _sort_datetime(item.get("updated_at")), reverse=True)
     reverse = sort_dir == "desc"
-    if sort_by in {"main_cost_usd", "estimated_cost_usd"}:
+    if sort_by in {"main_cost_usd", "estimated_cost_usd", "total_cost_usd"}:
         sorted_items.sort(key=lambda item: _sort_number(item.get(sort_by)), reverse=reverse)
     else:
         sorted_items.sort(key=lambda item: _sort_datetime(item.get(sort_by)), reverse=reverse)
