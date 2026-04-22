@@ -6999,17 +6999,13 @@ def _cost_viewer_html(api_base_path: str) -> str:
         <div class="clabel">&#xCD1D; &#xBE44;&#xC6A9;</div>
         <div class="cusd" id="mainCostUsd">$0.000000</div>
         <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
+        <div class="ckrw" id="mainCostAverage">&#xC870;&#xD68C;&#xB41C; &#xD56D;&#xBAA9; &#xC5C6;&#xC74C;</div>
       </div>
       <div class="card">
         <div class="clabel">&#xC77C;&#xC77C; &#xBE44;&#xC6A9; &#xC608;&#xC0C1; (3&#xAC1C; &#xC601;&#xC0C1; &#xAE30;&#xC900;)</div>
         <div class="cusd" id="estimatedCostUsd">$0.000000</div>
         <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
         <div class="ckrw" id="estimatedCostBasis">&#xD45C;&#xBCF8; &#xC5C6;&#xC74C;</div>
-      </div>
-      <div class="card">
-        <div class="clabel">&#xBE44;&#xC6A9; &#xC815;&#xBCF4; &#xC5C6;&#xC74C;</div>
-        <div class="cusd" id="missingCount" style="color:var(--danger);">0</div>
-        <div class="ckrw">&#xC9D1;&#xACC4; &#xC548; &#xB41C; &#xD56D;&#xBAA9; &#xC218;</div>
       </div>
       <div class="card">
         <div class="clabel">&#xC870;&#xD68C;&#xB41C; &#xD56D;&#xBAA9;</div>
@@ -7329,10 +7325,13 @@ def _cost_viewer_html(api_base_path: str) -> str:
         q("rows").appendChild(tr);
       }
       var listSummary = data.summary || {};
-      var listByP = listSummary.by_pricing_kind || {};
-      var summaryMainKrw = num((listByP.actual||{}).cost_krw) + num((listByP.fixed||{}).cost_krw);
-      q("mainCostUsd").textContent = fmtUsd(listSummary.main_cost_usd);
-      q("mainCostKrw").textContent = fmtKrw(summaryMainKrw);
+      var totalCostUsd = num(listSummary.total_cost_usd);
+      var totalCostKrw = num(listSummary.total_cost_krw);
+      q("mainCostUsd").textContent = fmtUsd(totalCostUsd);
+      q("mainCostKrw").textContent = fmtKrw(totalCostKrw);
+      q("mainCostAverage").textContent = currentTotal > 0
+        ? "\uC870\uD68C \uD56D\uBAA9 " + currentTotal + "\uAC74 \uAE30\uC900 \u00B7 1\uAC74\uB2F9 " + fmtUsd(totalCostUsd / currentTotal) + " / " + fmtKrw(totalCostKrw / currentTotal)
+        : "\uC870\uD68C\uB41C \uD56D\uBAA9 \uC5C6\uC74C";
       var dailyEstimate = data.daily_estimate || {};
       if (num(dailyEstimate.sample_count) > 0) {
         q("estimatedCostUsd").textContent = fmtUsd(dailyEstimate.estimated_daily_cost_usd);
@@ -7342,7 +7341,6 @@ def _cost_viewer_html(api_base_path: str) -> str:
         q("estimatedCostKrw").textContent = "\uD45C\uBCF8 \uC5C6\uC74C";
       }
       q("estimatedCostBasis").textContent = dailyEstimate.basis || "\uD45C\uBCF8 \uC5C6\uC74C";
-      q("missingCount").textContent = String(num(listSummary.missing_cost_event_count));
       q("rowCount").textContent = items.length + "\uAC74";
       q("totalCount").textContent = "\uC804\uCCB4 " + currentTotal + "\uAC74";
       var ps = pageSize(), fr = currentOffset + 1, to2 = Math.min(currentOffset + items.length, currentTotal);
