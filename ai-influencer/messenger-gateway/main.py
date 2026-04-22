@@ -6997,13 +6997,13 @@ def _cost_viewer_html(api_base_path: str) -> str:
     <div class="summary-row">
       <div class="card">
         <div class="clabel">&#xCD1D; &#xBE44;&#xC6A9;</div>
-        <div class="cusd" id="mainCostUsd">$0.000000</div>
+        <div class="cusd" id="mainCostUsd">$0.00</div>
         <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
         <div class="ckrw" id="mainCostAverage">&#xC870;&#xD68C;&#xB41C; &#xD56D;&#xBAA9; &#xC5C6;&#xC74C;</div>
       </div>
       <div class="card">
         <div class="clabel">&#xC77C;&#xC77C; &#xBE44;&#xC6A9; &#xC608;&#xC0C1; (3&#xAC1C; &#xC601;&#xC0C1; &#xAE30;&#xC900;)</div>
-        <div class="cusd" id="estimatedCostUsd">$0.000000</div>
+        <div class="cusd" id="estimatedCostUsd">$0.00</div>
         <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
         <div class="ckrw" id="estimatedCostBasis">&#xD45C;&#xBCF8; &#xC5C6;&#xC74C;</div>
       </div>
@@ -7154,7 +7154,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
   function pageSize() { return parseInt(document.getElementById("pageSizeSelect").value) || 50; }
   function q(id) { return document.getElementById(id); }
   function num(v) { var n = Number(v); return isNaN(n) ? 0 : n; }
-  function fmtUsd(v) { return "$" + num(v).toFixed(6); }
+  function fmtUsd(v) { return "$" + num(v).toFixed(2); }
   function fmtKrw(v) { return "\u20A9" + Math.round(num(v)).toLocaleString("ko-KR"); }
   function shortText(v, max) { var s = String(v || ""); return s.length <= max ? s : s.slice(0, max - 1) + "\u2026"; }
   function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
