@@ -7106,7 +7106,6 @@ def _cost_viewer_html(api_base_path: str) -> str:
   };
   var PROVIDER_LABELS = {
     heygen: "HeyGen",
-    aws_fixed: "AWS",
     openai: "OpenAI",
     runpod_tts: "Runpod",
     runpod_fixed: "Runpod",

@@ -103,12 +103,10 @@ def _visible_cost_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _daily_estimate_payload(*, sample_count: int, average_variable_cost_usd: float) -> dict[str, Any]:
     target_video_count = DAILY_ESTIMATE_TARGET_VIDEO_COUNT
-    aws_daily_fixed_usd = float(settings.aws_daily_fixed_usd or 0.0)
     estimated_daily_cost_usd = (
-        round((average_variable_cost_usd * target_video_count) + aws_daily_fixed_usd, 6) if sample_count > 0 else 0.0
+        round(average_variable_cost_usd * target_video_count, 6) if sample_count > 0 else 0.0
     )
     average_variable_cost_krw = _cost_krw(average_variable_cost_usd) or 0.0
-    aws_daily_fixed_krw = _cost_krw(aws_daily_fixed_usd) or 0.0
     estimated_daily_cost_krw = _cost_krw(estimated_daily_cost_usd) or 0.0
     return {
         "sample_count": sample_count,
@@ -116,12 +114,10 @@ def _daily_estimate_payload(*, sample_count: int, average_variable_cost_usd: flo
         "target_video_count": target_video_count,
         "average_variable_cost_usd": round(average_variable_cost_usd, 6),
         "average_variable_cost_krw": round(average_variable_cost_krw, 3),
-        "aws_daily_fixed_usd": round(aws_daily_fixed_usd, 6),
-        "aws_daily_fixed_krw": round(aws_daily_fixed_krw, 3),
         "estimated_daily_cost_usd": estimated_daily_cost_usd,
         "estimated_daily_cost_krw": round(estimated_daily_cost_krw, 3),
         "basis": (
-            f"최근 {sample_count}개 평균 × {target_video_count} + AWS 고정비"
+            f"최근 {sample_count}개 평균 × {target_video_count}"
             if sample_count > 0
             else "표본 없음"
         ),
@@ -141,8 +137,8 @@ def _add_detail_cost_fields(summary: dict[str, Any], subject: dict[str, Any]) ->
     duration_seconds = _elapsed_seconds(subject.get("created_at"), subject.get("updated_at"))
     detail_actual_usd = float(enriched.get("total_cost_usd") or 0.0)
     detail_actual_krw = float(enriched.get("total_cost_krw") or (_cost_krw(detail_actual_usd) or 0.0))
-    detail_fixed_usd = round(float(settings.aws_daily_fixed_usd or 0.0) * duration_seconds / 86400, 6)
-    detail_fixed_krw = _cost_krw(detail_fixed_usd) or 0.0
+    detail_fixed_usd = 0.0
+    detail_fixed_krw = 0.0
     detail_total_usd = round(detail_actual_usd + detail_fixed_usd, 6)
     detail_total_krw = detail_actual_krw + detail_fixed_krw
     enriched.update(
@@ -154,7 +150,7 @@ def _add_detail_cost_fields(summary: dict[str, Any], subject: dict[str, Any]) ->
             "detail_total_cost_usd": detail_total_usd,
             "detail_total_cost_krw": round(detail_total_krw, 3),
             "detail_duration_seconds": round(duration_seconds, 3),
-            "detail_fixed_basis": "AWS 일일 고정비 × 작업 지속 시간 / 24시간",
+            "detail_fixed_basis": "고정 비용 없음",
         }
     )
     return enriched
@@ -473,7 +469,6 @@ async def ingest_event(payload: dict[str, Any]) -> bool:
 async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
     pool = await job_service.get_db_pool()
     start_utc, end_utc = _kst_day_range(target_date)
-    aws_fixed = float(settings.aws_daily_fixed_usd)
     runpod_fixed = float(settings.runpod_daily_fixed_usd)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -492,8 +487,7 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
         )
         job_ids = [str(row["job_id"]) for row in rows]
         eligible_count = len(job_ids)
-        total_fixed = aws_fixed + runpod_fixed
-        allocated_per_job = (total_fixed / eligible_count) if eligible_count > 0 else 0.0
+        allocated_per_job = (runpod_fixed / eligible_count) if eligible_count > 0 else 0.0
         await conn.execute(
             """
             INSERT INTO daily_fixed_cost_pool (
@@ -510,28 +504,13 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
               updated_at = NOW()
             """,
             target_date,
-            aws_fixed,
+            0.0,
             runpod_fixed,
             float(settings.cost_usd_krw_rate),
             eligible_count,
             allocated_per_job,
         )
     for job_id in job_ids:
-        if aws_fixed > 0:
-            await record_event(
-                job_id=job_id,
-                stage="infra",
-                process="daily_fixed_allocation",
-                provider="aws_fixed",
-                status="success",
-                cost_usd=(aws_fixed / eligible_count) if eligible_count > 0 else 0.0,
-                pricing_kind="fixed",
-                pricing_source="fixed_allocation",
-                api_key_family="infra_fixed",
-                usage_json={"cost_date_kst": target_date.isoformat()},
-                raw_response_json={"allocation_method": "daily_even_split"},
-                idempotency_key=f"infra:aws:{target_date.isoformat()}:{job_id}",
-            )
         if runpod_fixed > 0:
             await record_event(
                 job_id=job_id,
@@ -550,7 +529,6 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
     return {
         "cost_date_kst": target_date.isoformat(),
         "eligible_job_count": eligible_count,
-        "aws_fixed_usd": aws_fixed,
         "runpod_fixed_usd": runpod_fixed,
         "allocated_per_job_usd": allocated_per_job,
     }
