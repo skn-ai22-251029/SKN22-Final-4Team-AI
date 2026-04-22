@@ -7383,12 +7383,10 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("detailDate").textContent  = toKST(sub.created_at);
       q("detailCostSummary").innerHTML =
           '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_total_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_total_cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_actual_cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uACE0\uC815 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_fixed_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_fixed_cost_krw) + '</div></div>';
+        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_actual_cost_krw) + '</div></div>';
       q("detailBreakdown").innerHTML =
           renderBreakdown("\uB2E8\uACC4\uBCC4 \uBE44\uC6A9", sum.by_stage, "stage")
-        + renderBreakdown("\uC791\uC5C5\uBCC4 \uBE44\uC6A9", sum.by_process, "process")
-        + renderBreakdown("\uBE44\uC6A9 \uBD84\uB958\uBCC4", sum.by_api_key_family, "api_key_family");
+        + renderBreakdown("\uC791\uC5C5\uBCC4 \uBE44\uC6A9", sum.by_process, "process");
       if (!events.length) {
         q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:12px;">\uC774\uBCA4\uD2B8 \uC5C6\uC74C</td></tr>';
       } else {
