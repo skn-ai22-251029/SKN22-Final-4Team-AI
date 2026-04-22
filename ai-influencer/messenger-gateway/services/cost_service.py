@@ -128,6 +128,38 @@ def _daily_estimate_payload(*, sample_count: int, average_variable_cost_usd: flo
     }
 
 
+def _elapsed_seconds(started_at: Any, ended_at: Any) -> float:
+    if not isinstance(started_at, datetime) or not isinstance(ended_at, datetime):
+        return 0.0
+    start = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+    end = ended_at if ended_at.tzinfo else ended_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (end - start).total_seconds())
+
+
+def _add_detail_cost_fields(summary: dict[str, Any], subject: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(summary)
+    duration_seconds = _elapsed_seconds(subject.get("created_at"), subject.get("updated_at"))
+    detail_actual_usd = float(enriched.get("total_cost_usd") or 0.0)
+    detail_actual_krw = float(enriched.get("total_cost_krw") or (_cost_krw(detail_actual_usd) or 0.0))
+    detail_fixed_usd = round(float(settings.aws_daily_fixed_usd or 0.0) * duration_seconds / 86400, 6)
+    detail_fixed_krw = _cost_krw(detail_fixed_usd) or 0.0
+    detail_total_usd = round(detail_actual_usd + detail_fixed_usd, 6)
+    detail_total_krw = detail_actual_krw + detail_fixed_krw
+    enriched.update(
+        {
+            "detail_actual_cost_usd": round(detail_actual_usd, 6),
+            "detail_actual_cost_krw": round(detail_actual_krw, 3),
+            "detail_fixed_cost_usd": detail_fixed_usd,
+            "detail_fixed_cost_krw": round(detail_fixed_krw, 3),
+            "detail_total_cost_usd": detail_total_usd,
+            "detail_total_cost_krw": round(detail_total_krw, 3),
+            "detail_duration_seconds": round(duration_seconds, 3),
+            "detail_fixed_basis": "AWS 일일 고정비 × 작업 지속 시간 / 24시간",
+        }
+    )
+    return enriched
+
+
 def _normalize_pricing_kind(
     pricing_kind: str,
     *,
@@ -890,9 +922,10 @@ async def get_job_detail(subject_key: str) -> dict[str, Any]:
             subject_key,
         )
     event_dicts = _visible_cost_events([dict(event) for event in events])
+    summary = _add_detail_cost_fields(_summarize_events(event_dicts), subject_dict)
     return {
         "subject": subject_dict,
-        "summary": _summarize_events(event_dicts),
+        "summary": summary,
         "events": event_dicts,
     }
 

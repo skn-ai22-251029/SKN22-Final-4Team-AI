@@ -7382,19 +7382,14 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("detailId").textContent    = subjectKey;
       q("detailStatus").innerHTML  = statusBadge(sub.status);
       q("detailDate").textContent  = toKST(sub.created_at);
-      var byP = sum.by_pricing_kind || {};
       q("detailCostSummary").innerHTML =
-          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.total_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.total_cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uACE0\uC815 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.fixed_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uC608\uC0C1 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uBE44\uC6A9 \uC815\uBCF4 \uC5C6\uC74C</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
+          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_total_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_total_cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_actual_cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uACE0\uC815 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_fixed_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_fixed_cost_krw) + '</div></div>';
       q("detailBreakdown").innerHTML =
           renderBreakdown("\uB2E8\uACC4\uBCC4 \uBE44\uC6A9", sum.by_stage, "stage")
         + renderBreakdown("\uC791\uC5C5\uBCC4 \uBE44\uC6A9", sum.by_process, "process")
-        + renderBreakdown("\uC11C\uBE44\uC2A4\uBCC4 \uBE44\uC6A9", sum.by_provider, "provider")
-        + renderBreakdown("\uBE44\uC6A9 \uBD84\uB958\uBCC4", sum.by_api_key_family, "api_key_family")
-        + renderBreakdown("\uBE44\uC6A9 \uACC4\uC0B0 \uBC29\uC2DD", sum.by_pricing_kind, "pricing_kind");
+        + renderBreakdown("\uBE44\uC6A9 \uBD84\uB958\uBCC4", sum.by_api_key_family, "api_key_family");
       if (!events.length) {
         q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:12px;">\uC774\uBCA4\uD2B8 \uC5C6\uC74C</td></tr>';
       } else {
