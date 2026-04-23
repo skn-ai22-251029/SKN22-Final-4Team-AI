@@ -89,7 +89,7 @@ _WF13_PUBLISH_RETRY_BACKOFF_SECONDS = (10, 30)
 _HEYGEN_AVATAR_OPTION_COUNT = 6
 _HEYGEN_AVATAR_LABEL_PREFIX_LEN = 6
 _http_basic = HTTPBasic()
-_HARDBURN_FONT_NAME = "Noto Sans CJK KR"
+_HARDBURN_FONT_NAME = "GangwonEduAll OTF Bold"
 _HARDBURN_FONT_DIRS = (
     "/usr/share/fonts/opentype/noto",
     "/usr/share/fonts/truetype/noto",
@@ -97,13 +97,13 @@ _HARDBURN_FONT_DIRS = (
     "/usr/share/fonts",
 )
 _HARDBURN_FORCE_STYLE = (
-    "FontName=Jua,"
+    "FontName=GangwonEduAll OTF Bold,"
     "FontSize=13,"
-    "PrimaryColour=&H00FFFFFF,"
+    "PrimaryColour=&H002AC4F7,"
     "OutlineColour=&H00000000,"
     "BackColour=&H00000000,"
     "BorderStyle=1,"
-    "Outline=0,"
+    "Outline=1.0,"
     "Shadow=0,"
     "MarginV=30,"
     "Alignment=2"
