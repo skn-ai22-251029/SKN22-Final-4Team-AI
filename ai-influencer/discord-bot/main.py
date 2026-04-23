@@ -224,6 +224,43 @@ class _YoutubeTitleModal(discord.ui.Modal, title="유튜브 업로드 제목"):
         )
 
 
+class _TtsAvatarIdModal(discord.ui.Modal, title="HeyGen 아바타 ID 입력"):
+    avatar_id_input = discord.ui.TextInput(
+        label="avatar_id",
+        placeholder="예: b903a1fd1ec846e0ba2e89620bc0aaae",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=160,
+    )
+
+    def __init__(self, job_id: str):
+        super().__init__(timeout=300)
+        self.job_id = job_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        avatar_id = str(self.avatar_id_input.value or "").strip()
+        if not avatar_id:
+            await _safe_reply(interaction, "avatar_id를 입력해주세요.", ephemeral=True)
+            return
+        await _safe_defer(interaction, ephemeral=True)
+        try:
+            result = await gateway_call(
+                "/internal/tts-action",
+                {
+                    "job_id": self.job_id,
+                    "action": "select_avatar_custom",
+                    "avatar_id": avatar_id,
+                },
+            )
+            avatar_label = str(result.get("avatar_label") or f"직접입력:{avatar_id[:8]}")
+            await interaction.followup.send(
+                f"👤 아바타ID `{avatar_label}`을 선택했습니다. 이제 일반 승인 또는 고화질 승인을 진행하세요.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.followup.send(f"오류가 발생했습니다: {e}", ephemeral=True)
+
+
 # ─────────────────────────────────────────
 # Discord Bot
 # ─────────────────────────────────────────
@@ -634,6 +671,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     # tts_approve_hd_confirm:       tts_approve_hd_confirm:{job_id}
     # tts_approve_hd_cancel:        tts_approve_hd_cancel:{job_id}
     # tts_avatar_pick:              tts_avatar_pick:{job_id}:{avatar_index}
+    # tts_avatar_custom:            tts_avatar_custom:{job_id}
     # tts_select:                   tts_select:{job_id}:{batch_id}:{variant_index}
     # tts_regenerate:               tts_regenerate:{job_id}:{batch_id}
     # tts_reject:        tts_reject:{job_id}
@@ -675,6 +713,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "tts_avatar_pick" and len(parts) >= 3:
         job_id = parts[1]
         avatar_index = int(parts[2])
+    elif action == "tts_avatar_custom" and len(parts) >= 2:
+        job_id = parts[1]
     elif action in {"video_publish_confirm_title", "video_publish_cancel_title"} and len(parts) >= 2:
         publish_token = parts[1]
         pending = publish_title_pending.get(publish_token) or {}
@@ -751,6 +791,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 "publish_title": "",
             }
             await interaction.response.send_modal(_YoutubeTitleModal(token))
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+        return
+
+    if action == "tts_avatar_custom":
+        try:
+            await interaction.response.send_modal(_TtsAvatarIdModal(job_id))
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
         return

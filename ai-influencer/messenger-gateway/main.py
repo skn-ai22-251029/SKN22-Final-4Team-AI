@@ -31,11 +31,10 @@ from prompts import (
     SUBTITLE_SCRIPT_OPENING_LINE,
     TTS_SCRIPT_REWRITE_PROMPT_BASE,
     TTS_SCRIPT_OPENING_LINE,
-    build_subtitle_retry_prompt,
     build_tts_retry_prompt,
     build_tts_script_rewrite_instruction,
     build_tts_script_prompt,
-    build_subtitle_from_tts_prompt,
+    sanitize_legacy_tts_custom_prompt,
 )
 from utils.file_naming import build_filename
 from services.storage_service import presign_s3_uri, put_bytes_and_presign
@@ -105,7 +104,7 @@ _HARDBURN_FORCE_STYLE = (
     "BorderStyle=1,"
     "Outline=1.0,"
     "Shadow=0,"
-    "MarginV=30,"
+    "MarginV=45,"
     "Alignment=2"
 )
 
@@ -841,10 +840,10 @@ def _get_subtitle_script_text(script_json: dict) -> str:
 
 def _get_tts_script_text(script_json: dict) -> str:
     return (
-        script_json.get("tts_script_text")
-        or script_json.get("subtitle_script_text")
+        script_json.get("subtitle_script_text")
         or script_json.get("script_text")
         or script_json.get("script")
+        or script_json.get("tts_script_text")
         or ""
     ).strip()
 
@@ -915,6 +914,10 @@ def _resolve_selected_heygen_avatar(script_json: dict) -> tuple[str, str, int]:
     options = _parse_heygen_avatar_options_from_env()
     selected_index = _get_job_avatar_index(script_json)
     if selected_index is None:
+        avatar_override = _get_job_avatar_override(script_json)
+        if avatar_override:
+            avatar_label = _get_job_avatar_label(script_json) or f"직접입력:{avatar_override[:_HEYGEN_AVATAR_LABEL_PREFIX_LEN]}"
+            return avatar_override, avatar_label, -1
         allowed_labels = "/".join(str(option["label"]) for option in options)
         raise HTTPException(
             status_code=400,
@@ -2096,9 +2099,21 @@ def _build_tts_request_body(script_text: str, *, seed: Optional[int] = None) -> 
         "streaming_mode": False,
         "top_k": settings.tts_top_k,
         "sample_steps": settings.tts_sample_steps,
+        "guidance_scale": settings.tts_guidance_scale,
+        "t_shift": settings.tts_t_shift,
+        "position_temperature": settings.tts_position_temperature,
+        "class_temperature": settings.tts_class_temperature,
+        "preprocess_prompt": settings.tts_preprocess_prompt,
+        "postprocess_output": settings.tts_postprocess_output,
+        "audio_chunk_duration": settings.tts_audio_chunk_duration,
+        "audio_chunk_threshold": settings.tts_audio_chunk_threshold,
         "super_sampling": settings.tts_super_sampling,
         "fragment_interval": settings.tts_fragment_interval,
     }
+    if int(settings.tts_num_step or 0) > 0:
+        tts_body["num_step"] = int(settings.tts_num_step)
+    if float(settings.tts_speed or 0.0) > 0.0:
+        tts_body["speed"] = float(settings.tts_speed)
 
     ref_audio_path = settings.tts_ref_audio_path.strip()
     prompt_text = settings.tts_prompt_text.strip()
@@ -2188,6 +2203,7 @@ def _build_job_prompt_log(
     notebooklm_prompt: str,
     raw_report_text: str,
     rewrite_prompt: str,
+    rewrite_prompt_sanitized: str,
     rewrite_instruction: str,
 ) -> dict:
     return {
@@ -2203,6 +2219,7 @@ def _build_job_prompt_log(
         "rewrite": {
             "instruction_base": TTS_SCRIPT_REWRITE_PROMPT_BASE,
             "instruction_custom": rewrite_prompt,
+            "instruction_custom_sanitized": rewrite_prompt_sanitized,
             "instruction_final": rewrite_instruction,
             "report_attempts": [],
             "tts_attempts": [],
@@ -2276,18 +2293,21 @@ def _validate_subtitle_script(
     *,
     raw_report_text: str = "",
     enforce_difference: bool = False,
-) -> None:
-    subtitle_len = _script_char_count(subtitle_script_text)
-    if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
-        raise RuntimeError(
-            f"subtitle_script_text length out of range: {subtitle_len} (expected {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
-        )
+) -> str:
+    warning_message = ""
+    keywords = _extract_topic_keywords(raw_report_text)
+    if keywords:
+        subtitle_ok = any(keyword in subtitle_script_text for keyword in keywords)
+        if not subtitle_ok:
+            drift_message = f"script rewrite topic drift detected; missing keywords={keywords}"
+            if settings.script_rewrite_topic_keyword_guard_enabled:
+                raise RuntimeError(drift_message)
+            warning_message = drift_message
+            logger.warning(
+                "[script-rewrite] keyword drift ignored by config (SCRIPT_REWRITE_TOPIC_KEYWORD_GUARD_ENABLED=false): %s",
+                drift_message,
+            )
     subtitle_lines = [line.strip() for line in subtitle_script_text.splitlines() if line.strip()]
-    tts_lines = [line.strip() for line in tts_script_text.splitlines() if line.strip()]
-    if len(subtitle_lines) != len(tts_lines):
-        raise RuntimeError(
-            f"subtitle_script_text line count mismatch: tts={len(tts_lines)} subtitle={len(subtitle_lines)}"
-        )
     if not subtitle_lines:
         raise RuntimeError("subtitle_script_text is empty")
     if enforce_difference and subtitle_script_text.strip() == tts_script_text.strip():
@@ -2296,17 +2316,14 @@ def _validate_subtitle_script(
         raise RuntimeError("subtitle_script_text must not include fixed opening line")
     if SCRIPT_ENDING_LINE in subtitle_script_text:
         raise RuntimeError("subtitle_script_text must not include fixed ending line")
-    report_has_alnum = bool(re.search(r"[A-Za-z0-9]", raw_report_text or ""))
-    subtitle_has_alnum = bool(re.search(r"[A-Za-z0-9]", subtitle_script_text or ""))
-    if report_has_alnum and not subtitle_has_alnum:
-        raise RuntimeError("subtitle_script_text must preserve numeric/alphabetic notation from report")
-    spoken_sentence_count = len(_split_caption_alignment_sentences(_build_fixed_caption_text(tts_script_text)))
-    display_sentence_count = len(_split_caption_alignment_sentences(_build_fixed_caption_text(subtitle_script_text)))
-    if spoken_sentence_count != display_sentence_count:
-        raise RuntimeError(
-            "caption sentence count mismatch after fixed opening/ending: "
-            f"spoken={spoken_sentence_count} display={display_sentence_count}"
+    subtitle_len = _script_char_count(subtitle_script_text)
+    if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
+        length_warning = (
+            f"subtitle_script_text length outside guidance: "
+            f"{subtitle_len} (target {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
         )
+        warning_message = f"{warning_message}; {length_warning}" if warning_message else length_warning
+    return warning_message
 
 
 def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
@@ -2367,22 +2384,22 @@ async def _rewrite_report_to_script(
     seed_subtitle_script_text: str = "",
 ) -> tuple[str, str]:
     # NotebookLM 원문 보고서를 한 번 더 정제해
-    # 자막용/ TTS용 스크립트를 동시에 만든다.
+    # 자막과 TTS에 함께 사용할 최종 스크립트 하나만 만든다.
     api_key = _resolve_openai_api_key_for_rewrite()
 
     client = AsyncOpenAI(api_key=api_key)
     try:
         last_error: Exception | None = None
         fact_lines = "\n".join(f"- {fact}" for fact in _extract_supporting_facts(raw_report_text)) or "- 원문 보고서의 핵심 사실을 그대로 사용한다."
-        tts_script_text = _sanitize_prompt_text((seed_tts_script_text or "").strip())
+        subtitle_script_text = _sanitize_prompt_text((seed_subtitle_script_text or seed_tts_script_text or "").strip())
         for attempt in range(max(1, max_attempts)):
-            use_retry_prompt = attempt > 0 or bool(tts_script_text)
-            tts_prompt = (
+            use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
+            subtitle_prompt = (
                 build_tts_retry_prompt(
                     raw_report_text=raw_report_text,
                     rewrite_instruction=rewrite_instruction,
-                    previous_script_text=tts_script_text,
-                    char_count=_script_char_count(tts_script_text),
+                    previous_script_text=subtitle_script_text,
+                    char_count=_script_char_count(subtitle_script_text),
                     fact_lines=fact_lines,
                 )
                 if use_retry_prompt
@@ -2390,106 +2407,6 @@ async def _rewrite_report_to_script(
                     raw_report_text=raw_report_text,
                     fact_lines=fact_lines,
                     rewrite_instruction=rewrite_instruction,
-                )
-            )
-            tts_prompt = _sanitize_prompt_text(tts_prompt)
-            attempt_record = {
-                "attempt": len(prompt_log["rewrite"]["tts_attempts"]) + 1,
-                "prompt": tts_prompt,
-                "response_text": "",
-                "char_count": 0,
-                "validation_error": "",
-            }
-            request_started_at = datetime.now(timezone.utc)
-            response = await client.chat.completions.create(
-                model=settings.script_rewrite_model,
-                temperature=0,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": SCRIPT_REWRITE_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": tts_prompt,
-                    },
-                ],
-            )
-            usage_payload: dict[str, Any] = {}
-            if response.usage is not None:
-                usage_payload = {
-                    "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
-                    "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
-                    "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
-                    "model": settings.script_rewrite_model,
-                }
-            estimated_cost = _estimate_script_rewrite_cost_usd(usage_payload)
-            await _record_cost_event_safe(
-                job_id=prompt_log.get("job_id", ""),
-                topic_text=str((prompt_log.get("job") or {}).get("concept_text") or ""),
-                stage="script",
-                process="tts_script_rewrite",
-                provider="openai",
-                attempt_no=int(attempt_record["attempt"]),
-                status="success" if bool(response.choices) else "failed",
-                started_at=request_started_at,
-                ended_at=datetime.now(timezone.utc),
-                usage_json=usage_payload,
-                raw_response_json={"prompt": tts_prompt, "has_choices": bool(response.choices)},
-                cost_usd=estimated_cost,
-                pricing_kind=_estimated_pricing_kind(estimated_cost),
-                pricing_source=_estimated_pricing_source(estimated_cost),
-                api_key_family="rewrite",
-                error_type="",
-                error_message="",
-                idempotency_key=f"script:tts:{prompt_log.get('job_id','')}:{attempt_record['attempt']}",
-            )
-            if not response.choices:
-                last_error = RuntimeError("tts rewrite returned no choices")
-                attempt_record["validation_error"] = str(last_error)
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-                continue
-            tts_script_text = _sanitize_prompt_text(
-                _extract_completion_text(response.choices[0].message.content).strip()
-            )
-            attempt_record["response_text"] = tts_script_text
-            attempt_record["char_count"] = _script_char_count(tts_script_text)
-            if not tts_script_text:
-                last_error = RuntimeError("tts rewrite returned empty content")
-                attempt_record["validation_error"] = str(last_error)
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-                continue
-            try:
-                warning_message = _validate_tts_script(raw_report_text, tts_script_text)
-                if warning_message:
-                    attempt_record["validation_warning"] = warning_message
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-                prompt_log["rewrite"]["final"]["tts_script_text"] = tts_script_text
-                prompt_log["rewrite"]["final"]["tts_prompt_final"] = attempt_record["prompt"]
-                break
-            except Exception as e:
-                last_error = e
-                attempt_record["validation_error"] = str(e)
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-        else:
-            raise RuntimeError(str(last_error or "tts rewrite failed after retries"))
-
-        subtitle_script_text = _sanitize_prompt_text((seed_subtitle_script_text or "").strip())
-        subtitle_validation_error = ""
-        for attempt in range(max(1, max_attempts)):
-            use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
-            subtitle_prompt = (
-                build_subtitle_retry_prompt(
-                    raw_report_text=raw_report_text,
-                    tts_script_text=tts_script_text,
-                    previous_script_text=subtitle_script_text,
-                    char_count=_script_char_count(subtitle_script_text),
-                    validation_error=subtitle_validation_error,
-                )
-                if use_retry_prompt
-                else build_subtitle_from_tts_prompt(
-                    tts_script_text=tts_script_text,
-                    raw_report_text=raw_report_text,
                 )
             )
             subtitle_prompt = _sanitize_prompt_text(subtitle_prompt)
@@ -2546,7 +2463,6 @@ async def _rewrite_report_to_script(
             )
             if not response.choices:
                 last_error = RuntimeError("subtitle rewrite returned no choices")
-                subtitle_validation_error = str(last_error)
                 attempt_record["validation_error"] = str(last_error)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
@@ -2557,30 +2473,30 @@ async def _rewrite_report_to_script(
             attempt_record["char_count"] = _script_char_count(subtitle_script_text)
             if not subtitle_script_text:
                 last_error = RuntimeError("subtitle rewrite returned empty content")
-                subtitle_validation_error = str(last_error)
                 attempt_record["validation_error"] = str(last_error)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
             try:
-                _validate_subtitle_script(
-                    tts_script_text,
+                warning_message = _validate_subtitle_script(
+                    subtitle_script_text,
                     subtitle_script_text,
                     raw_report_text=raw_report_text,
                     enforce_difference=False,
                 )
+                if warning_message:
+                    attempt_record["validation_warning"] = warning_message
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 prompt_log["rewrite"]["final"] = {
                     "status": "success",
                     "error": "",
-                    "tts_script_text": tts_script_text,
+                    "tts_script_text": subtitle_script_text,
                     "subtitle_script_text": subtitle_script_text,
-                    "tts_prompt_final": prompt_log["rewrite"]["tts_attempts"][-1]["prompt"] if prompt_log["rewrite"]["tts_attempts"] else "",
+                    "tts_prompt_final": attempt_record["prompt"],
                     "subtitle_prompt_final": attempt_record["prompt"],
                 }
-                return subtitle_script_text, tts_script_text
+                return subtitle_script_text, subtitle_script_text
             except Exception as e:
                 last_error = e
-                subtitle_validation_error = str(e)
                 attempt_record["validation_error"] = str(e)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
     finally:
@@ -2603,13 +2519,15 @@ async def _prepare_report_delivery(
 ) -> tuple[str, bytes, str, dict]:
     raw_report_text = (raw_report_text or "").strip()
     rewrite_prompt = (rewrite_prompt or "").strip()
-    rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt)
+    rewrite_prompt_sanitized = sanitize_legacy_tts_custom_prompt(rewrite_prompt)
+    rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt_sanitized)
     prompt_log = _build_job_prompt_log(
         job_id=job_id,
         existing_job=existing_job,
         notebooklm_prompt=notebooklm_prompt,
         raw_report_text=raw_report_text,
         rewrite_prompt=rewrite_prompt,
+        rewrite_prompt_sanitized=rewrite_prompt_sanitized,
         rewrite_instruction=rewrite_instruction,
     )
     if not raw_report_text:
@@ -3253,7 +3171,7 @@ def _build_selected_tts_caption(
     avatar_line = (
         f"선택 아바타: {selected_avatar_label}"
         if selected_avatar_label
-        else "먼저 아바타 버튼을 선택하세요."
+        else "먼저 아바타 버튼을 선택하거나 아바타ID 입력을 누르세요."
     )
     if downstream_intent == "video_prepare":
         return (
@@ -4862,19 +4780,15 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             await _discord_adapter.send_text_message(channel_id, f"❌ 대본 생성 실패: {str(e)[:180]}")
             return
         try:
-            _, merged_script = _upload_tts_script_file(
+            stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
                 job_id=body.job_id,
                 filename=filename,
-                tts_script_text=tts_script_text,
-                existing_script_json=merged_script,
+                file_bytes=file_bytes,
             )
         except Exception as e:
-            logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
-        stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
-            job_id=body.job_id,
-            filename=filename,
-            file_bytes=file_bytes,
-        )
+            await job_service.update_job(body.job_id, error_message=str(e), script_json=merged_script)
+            await _discord_adapter.send_text_message(channel_id, f"❌ 보고서 파일 저장 실패: {str(e)[:180]}")
+            return
         if upload_error is not None:
             error_message = f"subtitle report upload failed: {upload_error}"
             logger.error("[report-select] %s job_id=%s", error_message, body.job_id)
@@ -4992,17 +4906,6 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     except Exception as e:
         await job_service.update_job(body.job_id, error_message=str(e))
         raise HTTPException(status_code=500, detail=str(e))
-    try:
-        # TTS용 파일 업로드 실패는 사용자 보고서 전송을 막지 않도록 분리 처리한다.
-        _, merged_script = _upload_tts_script_file(
-            job_id=body.job_id,
-            filename=filename,
-            tts_script_text=tts_script_text,
-            existing_script_json=merged_script,
-        )
-    except Exception as e:
-        logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
-
     stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
         job_id=body.job_id,
         filename=filename,
@@ -5370,6 +5273,31 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             "avatar_id": avatar_id,
             "avatar_label": avatar_label,
             "avatar_index": avatar_index,
+        }
+
+    if body.action == "select_avatar_custom":
+        selected_variant_index_raw = script_json.get("selected_tts_variant_index")
+        if selected_variant_index_raw is None:
+            raise HTTPException(status_code=409, detail="TTS 후보를 먼저 선택하세요.")
+        avatar_id = (body.avatar_id or "").strip()
+        if not avatar_id:
+            raise HTTPException(status_code=400, detail="avatar_id is required")
+        avatar_label = f"직접입력:{avatar_id[:_HEYGEN_AVATAR_LABEL_PREFIX_LEN]}"
+        updated_script = _merge_script_json_with_media_names(
+            script_json,
+            heygen_avatar_id=avatar_id,
+        )
+        updated_script["avatar_id"] = avatar_id
+        updated_script["heygen_avatar_label"] = avatar_label
+        updated_script["heygen_avatar_index"] = None
+        await job_service.update_job(body.job_id, script_json=updated_script)
+        logger.info("[discord] tts_action=select_avatar_custom job_id=%s avatar_id_prefix=%s", body.job_id, avatar_id[:8])
+        return {
+            "job_id": body.job_id,
+            "action": body.action,
+            "avatar_id": avatar_id,
+            "avatar_label": avatar_label,
+            "avatar_index": None,
         }
 
     if body.action in {"approve_standard", "approve_hd"}:
