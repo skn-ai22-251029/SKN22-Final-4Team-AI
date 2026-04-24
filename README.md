@@ -27,6 +27,11 @@
 ![YouTube](https://img.shields.io/badge/YouTube-Auto%20Upload-FF0000?style=flat-square&logo=youtube&logoColor=white)
 
 </div>
+<p align="center">
+  <a href="https://github.com/SKNETWORKS-FAMILY-AICAMP/SKN22-Final-4Team-WEB">
+    <img src="https://img.shields.io/badge/WEB_Repository-React_%7C_Django_%7C_HARI_Platform-39E09B?style=for-the-badge&logo=github&logoColor=white" alt="WEB Repository"/>
+  </a>
+</p>
 
 ## 프로젝트 개요
 
