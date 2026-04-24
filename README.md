@@ -10,7 +10,11 @@
 <p align="center">
   <img width="1920" height="800" alt="33633563980734-1" src="https://github.com/user-attachments/assets/1bfbeded-425e-4589-9dd7-eab0fce49be2" />
 </p>
-
+<p align="center">
+  <a href="https://github.com/SKNETWORKS-FAMILY-AICAMP/SKN22-Final-4Team-WEB">
+    <img src="https://img.shields.io/badge/WEB_Repository-React_%7C_Django_%7C_HARI_Platform-39E09B?style=for-the-badge&logo=github&logoColor=white" alt="WEB Repository"/>
+  </a>
+</p>
 ---
 
 ## YouTube Content Automation Pipeline
@@ -27,11 +31,7 @@
 ![YouTube](https://img.shields.io/badge/YouTube-Auto%20Upload-FF0000?style=flat-square&logo=youtube&logoColor=white)
 
 </div>
-<p align="center">
-  <a href="https://github.com/SKNETWORKS-FAMILY-AICAMP/SKN22-Final-4Team-WEB">
-    <img src="https://img.shields.io/badge/WEB_Repository-React_%7C_Django_%7C_HARI_Platform-39E09B?style=for-the-badge&logo=github&logoColor=white" alt="WEB Repository"/>
-  </a>
-</p>
+
 
 ## 프로젝트 개요
 
