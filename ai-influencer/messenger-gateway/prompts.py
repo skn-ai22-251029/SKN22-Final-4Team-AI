@@ -1,3 +1,6 @@
+import re
+
+
 TTS_SCRIPT_OPENING_LINE = "보리들 안녕? 내일, 주식 사야할 것 같은데?"
 SUBTITLE_SCRIPT_OPENING_LINE = TTS_SCRIPT_OPENING_LINE
 SCRIPT_ENDING_LINE = "그럼, 어떤 주식 사야할지 알겠지?"
@@ -9,27 +12,18 @@ TTS_SCRIPT_REWRITE_PROMPT_BASE = f"""
 규칙을 엄격하게 준수하여, [소스 내용]을 소개하는 대본을 작성해 주세요.
 반드시 280자에서 350자 사이로 맞추세요.
 1. 출력 형식 제한: 제목, 화자 이름, 지문, 메모를 절대 쓰지 말고 대사만 작성합니다.
-2. 100% 한글 표기: 알파벳과 숫자는 절대 쓰지 말고 모두 한글 발음으로 바꿉니다.
+2. 자막 표기: 숫자, 영문, 날짜, 버전, 기업명은 사람이 읽기 편한 자연스러운 자막 표기로 씁니다.
 3. 마크다운 금지: 굵게, 기울임 등 모든 마크다운 문법을 금지합니다.
-4. TTS 최적화:
-- 사전에 없는 단어는 실제 한국어 발음대로 적습니다.
-- 숫자 관련 발음은 자연스럽게 붙여 적습니다.
-- 문장이 길어지면 기호를 사용합니다.
-- 오늘, 어제 등 상대적인 날짜 표현은 쓰지 않습니다.
-5. 버전/소수 발음 규칙:
-- 점(.)이 포함된 숫자는 반드시 "쩜" 발음으로 표기합니다.
-- 예: 2.0 -> 이쩜영, 5.4 -> 오쩜사, 3.10 -> 삼쩜일공
-- "이 점 영"처럼 띄어쓰지 말고 반드시 붙여 씁니다.
-6. 고정 멘트 제외:
+4. 고정 멘트 제외:
 - 오프닝/엔딩 멘트는 별도 오디오로 붙일 예정이므로 대본에 절대 포함하지 않습니다.
 - "{TTS_SCRIPT_OPENING_LINE}" 문구는 쓰지 않습니다.
 - "{SCRIPT_ENDING_LINE}" 문구는 쓰지 않습니다.
-7. 하리 말투:
+5. 하리 말투:
 - 말투는 반드시 친구에게 소식 전해주듯 자연스러운 전달형 반말로 씁니다.
 - "~~했대", "~~한대", "~~이래", "~~거든" 같은 말투를 자연스럽게 섞습니다.
 - 존댓말/격식체(예: ~습니다, ~입니다, ~세요, ~드립니다, ~해요)는 절대 쓰지 않습니다.
 - 딱딱한 설명체(예: "이번 보고서는", "핵심은 ~이다", "~라고 볼 수 있다", "~로 평가된다")는 절대 쓰지 않습니다.
-8. 구조:
+6. 구조:
 - 첫 문장은 주제나 문제를 바로 던져서 관심을 끕니다.
 - 중간 문장들은 핵심 사실을 자연스럽게 이어서 설명합니다.
 - 마지막 문장은 왜 중요한지 한 줄로 정리합니다.
@@ -53,8 +47,33 @@ SCRIPT_REWRITE_SYSTEM_PROMPT = (
 )
 
 
+_LEGACY_TTS_CUSTOM_PROMPT_SECTION_PATTERNS = (
+    r"\[제약사항\].*?(?=\s*\[[^\]]+\]|$)",
+)
+
+_LEGACY_TTS_CUSTOM_PROMPT_SENTENCE_PATTERNS = (
+    r"[^.!?\n]*(?:반드시\s*한글만|영어\s*사용\s*금지|숫자도\s*한글|한글\s*발음|쩜\s*발음|TTS\s*최적화|에이아이)[^.!?\n]*(?:[.!?]|$)",
+    r"기호를\s*적절히\s*사용해서\s*TTS가\s*읽을\s*때.*?사용한다\.\)",
+    r"인삿말\s*\(오프닝\)\s*-\s*본문\s*-\s*마무리\s*\(엔딩\)\s*구조로\s*진행한다\.?",
+)
+
+
+def sanitize_legacy_tts_custom_prompt(custom_prompt: str) -> str:
+    """Remove stale GPT-SoVITS-only rewrite constraints from user-saved prompts."""
+    text = (custom_prompt or "").strip()
+    if not text:
+        return ""
+    for pattern in _LEGACY_TTS_CUSTOM_PROMPT_SECTION_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE | re.DOTALL)
+    for pattern in _LEGACY_TTS_CUSTOM_PROMPT_SENTENCE_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.!?])", r"\1", text)
+    return text
+
+
 def build_tts_script_rewrite_instruction(custom_prompt: str) -> str:
-    custom_prompt = (custom_prompt or "").strip()
+    custom_prompt = sanitize_legacy_tts_custom_prompt(custom_prompt)
     if not custom_prompt:
         return TTS_SCRIPT_REWRITE_PROMPT_BASE
     return f"{TTS_SCRIPT_REWRITE_PROMPT_BASE}\n\n[추가 사용자 지침]\n{custom_prompt}"
@@ -62,7 +81,7 @@ def build_tts_script_rewrite_instruction(custom_prompt: str) -> str:
 
 def build_tts_script_prompt(*, raw_report_text: str, fact_lines: str, rewrite_instruction: str) -> str:
     return (
-        "다음 NotebookLM 원문 보고서를 바탕으로 TTS용 최종 대본만 작성하라.\n"
+        "다음 NotebookLM 원문 보고서를 바탕으로 자막과 음성 생성에 함께 사용할 최종 대본만 작성하라.\n"
         "반드시 280자에서 350자 사이로 작성한다.\n"
         "목표 길이는 320자 안팎이다.\n"
         "반드시 6문장 이상으로 작성한다.\n"
@@ -76,14 +95,15 @@ def build_tts_script_prompt(*, raw_report_text: str, fact_lines: str, rewrite_in
         "오프닝/엔딩 멘트는 별도 오디오로 붙일 예정이므로 절대 포함하지 않는다.\n"
         f"\"{TTS_SCRIPT_OPENING_LINE}\" 문구를 쓰지 않는다.\n"
         f"\"{SCRIPT_ENDING_LINE}\" 문구를 쓰지 않는다.\n"
-        "버전/소수 표기는 반드시 쩜 발음으로 붙여 쓴다 (예: 2.0 -> 이쩜영).\n"
+        "숫자, 영문, 날짜, 버전, 기업명은 사람이 읽기 편한 자연스러운 자막 표기로 쓴다.\n"
+        "예: 2026년 4월 21일, AI, GPT-5.4, 애플, 존 터너스처럼 필요한 표기를 그대로 살린다.\n"
         "아래 사실 후보 중 최소 3개 이상을 본문에 자연스럽게 반영한다.\n"
         "원문 보고서의 주제와 핵심 사실을 바꾸지 않는다.\n"
         "원문에 없는 사례나 비유를 추가하지 않는다.\n"
-        "출력은 TTS용 대본 본문만 작성한다.\n\n"
+        "출력은 최종 대본 본문만 작성한다.\n\n"
         "[반드시 반영할 사실 후보]\n"
         f"{fact_lines}\n\n"
-        "[TTS용 작성 지침]\n"
+        "[최종 대본 작성 지침]\n"
         f"{rewrite_instruction}\n\n"
         "[원문 보고서]\n"
         f"{raw_report_text.strip()}\n"
@@ -117,7 +137,7 @@ def build_tts_retry_prompt(
     else:
         adjustment = "길이는 맞지만 다른 제약을 어겼으니 수정하라."
     return (
-        "이전 TTS용 대본은 길이 제한을 지키지 못했다.\n"
+        "이전 최종 대본은 길이 또는 검증 규칙을 지키지 못했다.\n"
         f"이전 결과 길이: {char_count}자\n"
         "이번에는 반드시 280자에서 350자 사이로 다시 작성하라.\n"
         "목표 길이는 320자 안팎이다.\n"
@@ -130,83 +150,19 @@ def build_tts_retry_prompt(
         "오프닝/엔딩 멘트는 별도 오디오로 붙일 예정이므로 절대 포함하지 않는다.\n"
         f"\"{TTS_SCRIPT_OPENING_LINE}\" 문구를 쓰지 않는다.\n"
         f"\"{SCRIPT_ENDING_LINE}\" 문구를 쓰지 않는다.\n"
-        "버전/소수 표기는 반드시 쩜 발음으로 붙여 쓴다 (예: 2.0 -> 이쩜영).\n"
+        "숫자, 영문, 날짜, 버전, 기업명은 사람이 읽기 편한 자연스러운 자막 표기로 쓴다.\n"
         f"{adjustment}\n"
         "반드시 280자에서 350자 사이로 맞춘다. 이 범위를 벗어나면 실패다.\n"
         "원문 보고서의 주제와 핵심 사실을 바꾸지 않는다.\n"
         "아래 사실 후보 중 최소 3개 이상을 본문에 자연스럽게 반영한다.\n"
         "원문에 없는 사례나 비유를 추가하지 않는다.\n"
-        "출력은 TTS용 대본 본문만 작성한다.\n\n"
+        "출력은 최종 대본 본문만 작성한다.\n\n"
         "[반드시 반영할 사실 후보]\n"
         f"{fact_lines}\n\n"
-        "[TTS용 작성 지침]\n"
+        "[최종 대본 작성 지침]\n"
         f"{rewrite_instruction}\n\n"
         "[원문 보고서]\n"
         f"{raw_report_text.strip()}\n\n"
-        "[이전 결과]\n"
-        f"{previous_script_text.strip()}\n"
-    )
-
-
-def build_subtitle_from_tts_prompt(*, tts_script_text: str, raw_report_text: str) -> str:
-    return (
-        "다음 TTS용 대본을 자막용 대본으로 바꿔라.\n"
-        "이 작업은 재작성이나 요약이 아니라 문법/표기 보정이다.\n"
-        "내용, 문장 순서, 줄 순서, 정보량, 호칭, 어조를 그대로 유지한다.\n"
-        "각 줄은 입력의 같은 줄을 대응해서 보정해야 한다.\n"
-        "줄 수와 문장 수를 반드시 유지한다.\n"
-        "허용되는 변경은 다음뿐이다.\n"
-        "- 띄어쓰기, 맞춤법, 문장부호 보정\n"
-        "- 숫자, 영문, 고유명사를 자막용 표기로 정리\n"
-        "- 조사와 표기만 자연스럽게 다듬기\n"
-        "- 버전/소수/연도/기간 표기를 자막용 숫자 표기로 복원\n"
-        "- 예: 일쩜영→1.0, 이쩜영→2.0, 삼쩜영→3.0, 이천이십육년 사월 육일→2026년 4월 6일, 이년→2년, 육개월→6개월\n"
-        "금지 사항은 다음과 같다.\n"
-        "- 문장 삭제, 문장 추가, 문장 합치기, 문장 분리\n"
-        "- 의미 축약, 요약, 정리, 어투 변경\n"
-        "- TTS용 대본을 한 글자도 바꾸지 않고 그대로 복사해서 반환\n"
-        "출력은 자막용 대본 본문만 작성한다.\n\n"
-        "[원문 보고서]\n"
-        f"{raw_report_text.strip()}\n\n"
-        "[TTS용 대본]\n"
-        f"{tts_script_text.strip()}\n"
-    )
-
-
-def build_subtitle_retry_prompt(
-    *,
-    raw_report_text: str,
-    tts_script_text: str,
-    previous_script_text: str,
-    char_count: int,
-    validation_error: str = "",
-) -> str:
-    if char_count < 280:
-        adjustment = f"자막 길이가 짧아졌다. 최소 {280 - char_count}자를 더 보존하라."
-    elif char_count > 350:
-        adjustment = f"자막 길이가 길어졌다. 최소 {char_count - 350}자를 줄이되 의미는 유지하라."
-    elif "caption sentence count mismatch" in validation_error:
-        adjustment = (
-            "고정 오프닝과 엔딩을 붙인 뒤에도 TTS용 대본과 자막용 대본의 문장 수가 정확히 같아야 한다. "
-            "문장을 합치거나 쪼개지 말고, TTS 문장 경계를 그대로 유지하라."
-        )
-    else:
-        adjustment = "길이는 맞지만 내용 보존 규칙을 어겼으니 수정하라."
-    return (
-        "이전 자막용 대본은 보존 규칙을 지키지 못했다.\n"
-        f"이전 결과 길이: {char_count}자\n"
-        "이번에는 반드시 TTS용 대본의 내용, 문장 순서, 줄 순서, 정보량, 호칭을 그대로 유지하라.\n"
-        "줄 수와 문장 수를 반드시 유지한다.\n"
-        "허용되는 변경은 띄어쓰기, 맞춤법, 문장부호, 숫자/영문/고유명사의 자막 표기 보정뿐이다.\n"
-        "버전/소수/연도/기간은 자막용 숫자 표기로 복원한다.\n"
-        "예: 일쩜영→1.0, 이쩜영→2.0, 삼쩜영→3.0, 이천이십육년 사월 육일→2026년 4월 6일, 이년→2년, 육개월→6개월.\n"
-        "TTS용 대본을 그대로 복사해 반환하면 실패로 간주한다.\n"
-        f"{adjustment}\n"
-        "출력은 자막용 대본 본문만 작성한다.\n\n"
-        "[원문 보고서]\n"
-        f"{raw_report_text.strip()}\n\n"
-        "[TTS용 대본]\n"
-        f"{tts_script_text.strip()}\n\n"
         "[이전 결과]\n"
         f"{previous_script_text.strip()}\n"
     )

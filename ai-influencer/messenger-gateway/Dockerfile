@@ -16,7 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # 비루트 유저 실행
-RUN useradd -m appuser
+RUN cp /app/fonts/GangwonEduModu-Bold.otf /usr/share/fonts/truetype/custom/GangwonEduModu-Bold.otf \
+    && fc-cache -fv \
+    && useradd -m appuser
 USER appuser
 
 EXPOSE 8080

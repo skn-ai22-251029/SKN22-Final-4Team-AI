@@ -1,0 +1,55 @@
+import ast
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+GATEWAY_MAIN = ROOT / "messenger-gateway" / "main.py"
+DISCORD_BOT_MAIN = ROOT / "discord-bot" / "main.py"
+SEEDLAB_MAIN = ROOT / "seed-lab-service" / "main.py"
+SEEDLAB_SCRIPT = ROOT / "scripts" / "seed_lab.py"
+
+
+def _load_source(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _function_names(path: Path) -> set[str]:
+    tree = ast.parse(_load_source(path), filename=str(path))
+    return {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+class SeedLabRegressionSmokeTests(unittest.TestCase):
+    def test_gateway_defines_clip_text_helper(self) -> None:
+        self.assertIn("_clip_text", _function_names(GATEWAY_MAIN))
+
+    def test_gateway_progress_failure_is_logged_not_raised(self) -> None:
+        source = _load_source(GATEWAY_MAIN)
+        self.assertIn("seedlab progress message update failed", source)
+        self.assertIn('return {"ok": True, "updated": should_update_message}', source)
+
+    def test_discord_bot_wraps_gateway_transport_errors(self) -> None:
+        source = _load_source(DISCORD_BOT_MAIN)
+        self.assertIn("httpx.ReadTimeout", source)
+        self.assertIn("httpx.ConnectError", source)
+        self.assertIn("httpx.TransportError", source)
+        self.assertIn("Seed Lab start timed out while waiting for gateway response", source)
+
+    def test_seedlab_runpod_sample_s3_fallback_and_validation_exist(self) -> None:
+        source = _load_source(SEEDLAB_MAIN)
+        functions = _function_names(SEEDLAB_MAIN)
+        self.assertIn("media_s3_bucket", source)
+        self.assertIn("_sample_s3_bucket", functions)
+        self.assertIn("_sample_s3_bucket_source", functions)
+        self.assertIn("_assert_runpod_records_have_s3_audio", functions)
+        self.assertIn("RunPod eval requires sample S3 upload", source)
+        self.assertIn("sample_s3_upload_failed", source)
+
+    def test_seedlab_pitch_estimator_downsamples_before_autocorrelation(self) -> None:
+        source = _load_source(SEEDLAB_SCRIPT)
+        self.assertIn("target_rate = 8000", source)
+        self.assertIn("frame = frame[::stride]", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

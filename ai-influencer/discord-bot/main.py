@@ -77,6 +77,27 @@ def _error_detail_from_response(resp: httpx.Response) -> str:
     return body or f"HTTP {resp.status_code}"
 
 
+def _gateway_transport_error_detail(path: str, exc: Exception) -> str:
+    normalized_path = (path or "").strip() or "/"
+    if normalized_path == "/internal/seedlab-start":
+        if isinstance(exc, httpx.ReadTimeout):
+            return "Seed Lab start timed out while waiting for gateway response. 게이트웨이 응답 대기 중 시간이 초과되었습니다."
+        if isinstance(exc, httpx.ConnectError):
+            return "Seed Lab start could not reach gateway. 게이트웨이에 연결하지 못했습니다."
+        if isinstance(exc, httpx.TransportError):
+            return (
+                f"Seed Lab start gateway transport error: {type(exc).__name__}. "
+                "게이트웨이 통신 중 오류가 발생했습니다."
+            )
+    if isinstance(exc, httpx.ReadTimeout):
+        return f"Gateway request timed out: {normalized_path}. 게이트웨이 응답 대기 중 시간이 초과되었습니다."
+    if isinstance(exc, httpx.ConnectError):
+        return f"Gateway connection failed: {normalized_path}. 게이트웨이에 연결하지 못했습니다."
+    if isinstance(exc, httpx.TransportError):
+        return f"Gateway transport error: {type(exc).__name__} ({normalized_path}). 게이트웨이 통신 오류가 발생했습니다."
+    return ""
+
+
 async def gateway_call(path: str, payload: dict) -> dict[str, Any]:
     # slash command / 버튼 이벤트는 모두 이 헬퍼를 통해 gateway 내부 API로 전달된다.
     try:
@@ -92,6 +113,10 @@ async def gateway_call(path: str, payload: dict) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
         return {}
+    except (httpx.ReadTimeout, httpx.ConnectError, httpx.TransportError) as e:
+        detail = _gateway_transport_error_detail(path, e) or f"Gateway request failed: {type(e).__name__}"
+        logger.error("[discord] gateway_call %s failed: %s", path, detail)
+        raise RuntimeError(detail) from e
     except Exception as e:
         logger.error("[discord] gateway_call %s failed: %s", path, e)
         raise
@@ -105,7 +130,7 @@ def _clip_text(text: str, max_len: int = 1500) -> str:
 
 
 async def _safe_reply(interaction: discord.Interaction, text: str, *, ephemeral: bool = True) -> None:
-    message = _clip_text(text)
+    message = _clip_text((text or "").strip() or "⚠️ 요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
     try:
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=ephemeral)
@@ -197,6 +222,43 @@ class _YoutubeTitleModal(discord.ui.Modal, title="유튜브 업로드 제목"):
             ephemeral=True,
             view=view,
         )
+
+
+class _TtsAvatarIdModal(discord.ui.Modal, title="HeyGen 아바타 ID 입력"):
+    avatar_id_input = discord.ui.TextInput(
+        label="avatar_id",
+        placeholder="예: b903a1fd1ec846e0ba2e89620bc0aaae",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=160,
+    )
+
+    def __init__(self, job_id: str):
+        super().__init__(timeout=300)
+        self.job_id = job_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        avatar_id = str(self.avatar_id_input.value or "").strip()
+        if not avatar_id:
+            await _safe_reply(interaction, "avatar_id를 입력해주세요.", ephemeral=True)
+            return
+        await _safe_defer(interaction, ephemeral=True)
+        try:
+            result = await gateway_call(
+                "/internal/tts-action",
+                {
+                    "job_id": self.job_id,
+                    "action": "select_avatar_custom",
+                    "avatar_id": avatar_id,
+                },
+            )
+            avatar_label = str(result.get("avatar_label") or f"직접입력:{avatar_id[:8]}")
+            await interaction.followup.send(
+                f"👤 아바타ID `{avatar_label}`을 선택했습니다. 이제 일반 승인 또는 고화질 승인을 진행하세요.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.followup.send(f"오류가 발생했습니다: {e}", ephemeral=True)
 
 
 # ─────────────────────────────────────────
@@ -609,6 +671,7 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     # tts_approve_hd_confirm:       tts_approve_hd_confirm:{job_id}
     # tts_approve_hd_cancel:        tts_approve_hd_cancel:{job_id}
     # tts_avatar_pick:              tts_avatar_pick:{job_id}:{avatar_index}
+    # tts_avatar_custom:            tts_avatar_custom:{job_id}
     # tts_select:                   tts_select:{job_id}:{batch_id}:{variant_index}
     # tts_regenerate:               tts_regenerate:{job_id}:{batch_id}
     # tts_reject:        tts_reject:{job_id}
@@ -650,6 +713,8 @@ async def on_interaction(interaction: discord.Interaction) -> None:
     elif action == "tts_avatar_pick" and len(parts) >= 3:
         job_id = parts[1]
         avatar_index = int(parts[2])
+    elif action == "tts_avatar_custom" and len(parts) >= 2:
+        job_id = parts[1]
     elif action in {"video_publish_confirm_title", "video_publish_cancel_title"} and len(parts) >= 2:
         publish_token = parts[1]
         pending = publish_title_pending.get(publish_token) or {}
@@ -726,6 +791,13 @@ async def on_interaction(interaction: discord.Interaction) -> None:
                 "publish_title": "",
             }
             await interaction.response.send_modal(_YoutubeTitleModal(token))
+        except Exception as e:
+            await interaction.channel.send(f"오류가 발생했습니다: {e}")
+        return
+
+    if action == "tts_avatar_custom":
+        try:
+            await interaction.response.send_modal(_TtsAvatarIdModal(job_id))
         except Exception as e:
             await interaction.channel.send(f"오류가 발생했습니다: {e}")
         return

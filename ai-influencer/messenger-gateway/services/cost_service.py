@@ -9,7 +9,7 @@ from services import job_service
 KST = timezone(timedelta(hours=9))
 PRICING_KINDS = {"actual", "estimated", "fixed", "missing"}
 SUBJECT_TYPES = {"job", "operation"}
-JOB_SUMMARY_SORT_FIELDS = {"updated_at", "created_at", "main_cost_usd", "estimated_cost_usd"}
+JOB_SUMMARY_SORT_FIELDS = {"updated_at", "created_at", "main_cost_usd", "estimated_cost_usd", "total_cost_usd"}
 JOB_SUMMARY_SORT_DIRECTIONS = {"asc", "desc"}
 EPOCH_UTC = datetime.fromtimestamp(0, timezone.utc)
 FIXED_INFRA_PROCESS = "daily_fixed_allocation"
@@ -71,7 +71,7 @@ def _sort_job_summary_items(items: list[dict[str, Any]], *, sort_by: str, sort_d
     sorted_items.sort(key=lambda item: _sort_datetime(item.get("created_at")), reverse=True)
     sorted_items.sort(key=lambda item: _sort_datetime(item.get("updated_at")), reverse=True)
     reverse = sort_dir == "desc"
-    if sort_by in {"main_cost_usd", "estimated_cost_usd"}:
+    if sort_by in {"main_cost_usd", "estimated_cost_usd", "total_cost_usd"}:
         sorted_items.sort(key=lambda item: _sort_number(item.get(sort_by)), reverse=reverse)
     else:
         sorted_items.sort(key=lambda item: _sort_datetime(item.get(sort_by)), reverse=reverse)
@@ -103,12 +103,10 @@ def _visible_cost_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _daily_estimate_payload(*, sample_count: int, average_variable_cost_usd: float) -> dict[str, Any]:
     target_video_count = DAILY_ESTIMATE_TARGET_VIDEO_COUNT
-    aws_daily_fixed_usd = float(settings.aws_daily_fixed_usd or 0.0)
     estimated_daily_cost_usd = (
-        round((average_variable_cost_usd * target_video_count) + aws_daily_fixed_usd, 6) if sample_count > 0 else 0.0
+        round(average_variable_cost_usd * target_video_count, 6) if sample_count > 0 else 0.0
     )
     average_variable_cost_krw = _cost_krw(average_variable_cost_usd) or 0.0
-    aws_daily_fixed_krw = _cost_krw(aws_daily_fixed_usd) or 0.0
     estimated_daily_cost_krw = _cost_krw(estimated_daily_cost_usd) or 0.0
     return {
         "sample_count": sample_count,
@@ -116,16 +114,46 @@ def _daily_estimate_payload(*, sample_count: int, average_variable_cost_usd: flo
         "target_video_count": target_video_count,
         "average_variable_cost_usd": round(average_variable_cost_usd, 6),
         "average_variable_cost_krw": round(average_variable_cost_krw, 3),
-        "aws_daily_fixed_usd": round(aws_daily_fixed_usd, 6),
-        "aws_daily_fixed_krw": round(aws_daily_fixed_krw, 3),
         "estimated_daily_cost_usd": estimated_daily_cost_usd,
         "estimated_daily_cost_krw": round(estimated_daily_cost_krw, 3),
         "basis": (
-            f"최근 {sample_count}개 평균 × {target_video_count} + AWS 고정비"
+            f"최근 {sample_count}개 평균 × {target_video_count}"
             if sample_count > 0
             else "표본 없음"
         ),
     }
+
+
+def _elapsed_seconds(started_at: Any, ended_at: Any) -> float:
+    if not isinstance(started_at, datetime) or not isinstance(ended_at, datetime):
+        return 0.0
+    start = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+    end = ended_at if ended_at.tzinfo else ended_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (end - start).total_seconds())
+
+
+def _add_detail_cost_fields(summary: dict[str, Any], subject: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(summary)
+    duration_seconds = _elapsed_seconds(subject.get("created_at"), subject.get("updated_at"))
+    detail_actual_usd = float(enriched.get("total_cost_usd") or 0.0)
+    detail_actual_krw = float(enriched.get("total_cost_krw") or (_cost_krw(detail_actual_usd) or 0.0))
+    detail_fixed_usd = 0.0
+    detail_fixed_krw = 0.0
+    detail_total_usd = round(detail_actual_usd + detail_fixed_usd, 6)
+    detail_total_krw = detail_actual_krw + detail_fixed_krw
+    enriched.update(
+        {
+            "detail_actual_cost_usd": round(detail_actual_usd, 6),
+            "detail_actual_cost_krw": round(detail_actual_krw, 3),
+            "detail_fixed_cost_usd": detail_fixed_usd,
+            "detail_fixed_cost_krw": round(detail_fixed_krw, 3),
+            "detail_total_cost_usd": detail_total_usd,
+            "detail_total_cost_krw": round(detail_total_krw, 3),
+            "detail_duration_seconds": round(duration_seconds, 3),
+            "detail_fixed_basis": "고정 비용 없음",
+        }
+    )
+    return enriched
 
 
 def _normalize_pricing_kind(
@@ -227,9 +255,9 @@ def _bucket_add(bucket: dict[str, dict[str, float | int]], key: str, cost_usd: O
     item["cost_krw"] = round(float(item.get("cost_krw") or 0.0) + float(cost_krw or 0.0), 3)
 
 
-def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
-    summary = {
-        "total_events": len(events),
+def _empty_cost_summary(*, total_events: int = 0) -> dict[str, Any]:
+    return {
+        "total_events": total_events,
         "total_cost_usd": 0.0,
         "total_cost_krw": 0.0,
         "actual_cost_usd": 0.0,
@@ -244,6 +272,20 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "by_subject_type": {},
         "by_pricing_kind": {},
     }
+
+
+def _bucket_merge(target: dict[str, dict[str, float | int]], source: dict[str, Any]) -> None:
+    for key, source_item in (source or {}).items():
+        if not isinstance(source_item, dict):
+            continue
+        item = target.setdefault(str(key or "(empty)"), {"cost_usd": 0.0, "cost_krw": 0.0, "count": 0})
+        item["count"] = int(item.get("count") or 0) + int(source_item.get("count") or 0)
+        item["cost_usd"] = round(float(item.get("cost_usd") or 0.0) + float(source_item.get("cost_usd") or 0.0), 6)
+        item["cost_krw"] = round(float(item.get("cost_krw") or 0.0) + float(source_item.get("cost_krw") or 0.0), 3)
+
+
+def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _empty_cost_summary(total_events=len(events))
     for event in events:
         cost_usd = _safe_float(event.get("cost_usd")) or 0.0
         cost_krw = _safe_float(event.get("cost_krw")) or 0.0
@@ -266,6 +308,26 @@ def _summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         _bucket_add(summary["by_subject_type"], str(event.get("subject_type") or "").strip(), cost_usd, cost_krw)
         if not ignored_missing:
             _bucket_add(summary["by_pricing_kind"], pricing_kind, cost_usd, cost_krw)
+    summary["main_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(summary["fixed_cost_usd"]), 6)
+    return summary
+
+
+def _summarize_subject_summaries(items: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _empty_cost_summary()
+    for item in items:
+        summary["total_events"] = int(summary["total_events"]) + int(item.get("total_events") or 0)
+        summary["total_cost_usd"] = round(float(summary["total_cost_usd"]) + float(item.get("total_cost_usd") or 0.0), 6)
+        summary["total_cost_krw"] = round(float(summary["total_cost_krw"]) + float(item.get("total_cost_krw") or 0.0), 3)
+        summary["actual_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(item.get("actual_cost_usd") or 0.0), 6)
+        summary["estimated_cost_usd"] = round(float(summary["estimated_cost_usd"]) + float(item.get("estimated_cost_usd") or 0.0), 6)
+        summary["fixed_cost_usd"] = round(float(summary["fixed_cost_usd"]) + float(item.get("fixed_cost_usd") or 0.0), 6)
+        summary["missing_cost_event_count"] = int(summary["missing_cost_event_count"]) + int(item.get("missing_cost_event_count") or 0)
+        _bucket_merge(summary["by_stage"], item.get("by_stage") or {})
+        _bucket_merge(summary["by_process"], item.get("by_process") or {})
+        _bucket_merge(summary["by_provider"], item.get("by_provider") or {})
+        _bucket_merge(summary["by_api_key_family"], item.get("by_api_key_family") or {})
+        _bucket_merge(summary["by_subject_type"], item.get("by_subject_type") or {})
+        _bucket_merge(summary["by_pricing_kind"], item.get("by_pricing_kind") or {})
     summary["main_cost_usd"] = round(float(summary["actual_cost_usd"]) + float(summary["fixed_cost_usd"]), 6)
     return summary
 
@@ -407,7 +469,6 @@ async def ingest_event(payload: dict[str, Any]) -> bool:
 async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
     pool = await job_service.get_db_pool()
     start_utc, end_utc = _kst_day_range(target_date)
-    aws_fixed = float(settings.aws_daily_fixed_usd)
     runpod_fixed = float(settings.runpod_daily_fixed_usd)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -426,8 +487,7 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
         )
         job_ids = [str(row["job_id"]) for row in rows]
         eligible_count = len(job_ids)
-        total_fixed = aws_fixed + runpod_fixed
-        allocated_per_job = (total_fixed / eligible_count) if eligible_count > 0 else 0.0
+        allocated_per_job = (runpod_fixed / eligible_count) if eligible_count > 0 else 0.0
         await conn.execute(
             """
             INSERT INTO daily_fixed_cost_pool (
@@ -444,28 +504,13 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
               updated_at = NOW()
             """,
             target_date,
-            aws_fixed,
+            0.0,
             runpod_fixed,
             float(settings.cost_usd_krw_rate),
             eligible_count,
             allocated_per_job,
         )
     for job_id in job_ids:
-        if aws_fixed > 0:
-            await record_event(
-                job_id=job_id,
-                stage="infra",
-                process="daily_fixed_allocation",
-                provider="aws_fixed",
-                status="success",
-                cost_usd=(aws_fixed / eligible_count) if eligible_count > 0 else 0.0,
-                pricing_kind="fixed",
-                pricing_source="fixed_allocation",
-                api_key_family="infra_fixed",
-                usage_json={"cost_date_kst": target_date.isoformat()},
-                raw_response_json={"allocation_method": "daily_even_split"},
-                idempotency_key=f"infra:aws:{target_date.isoformat()}:{job_id}",
-            )
         if runpod_fixed > 0:
             await record_event(
                 job_id=job_id,
@@ -484,7 +529,6 @@ async def allocate_daily_fixed_cost(*, target_date: date) -> dict[str, Any]:
     return {
         "cost_date_kst": target_date.isoformat(),
         "eligible_job_count": eligible_count,
-        "aws_fixed_usd": aws_fixed,
         "runpod_fixed_usd": runpod_fixed,
         "allocated_per_job_usd": allocated_per_job,
     }
@@ -761,6 +805,7 @@ async def list_jobs_summary(
                 **summary,
             }
         )
+    summary = _summarize_subject_summaries(enriched)
     sorted_items = _sort_job_summary_items(enriched, sort_by=normalized_sort_by, sort_dir=normalized_sort_dir)
     selected = sorted_items[offset_value : offset_value + limit_value]
 
@@ -771,6 +816,7 @@ async def list_jobs_summary(
         "subject_type": normalized_subject_type,
         "sort_by": normalized_sort_by,
         "sort_dir": normalized_sort_dir,
+        "summary": summary,
         "daily_estimate": daily_estimate,
         "items": selected,
     }
@@ -854,9 +900,10 @@ async def get_job_detail(subject_key: str) -> dict[str, Any]:
             subject_key,
         )
     event_dicts = _visible_cost_events([dict(event) for event in events])
+    summary = _add_detail_cost_fields(_summarize_events(event_dicts), subject_dict)
     return {
         "subject": subject_dict,
-        "summary": _summarize_events(event_dicts),
+        "summary": summary,
         "events": event_dicts,
     }
 

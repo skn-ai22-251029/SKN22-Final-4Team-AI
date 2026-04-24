@@ -9,6 +9,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from typing import Annotated, Any, Awaitable, Callable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from openai import AsyncOpenAI
@@ -29,11 +31,10 @@ from prompts import (
     SUBTITLE_SCRIPT_OPENING_LINE,
     TTS_SCRIPT_REWRITE_PROMPT_BASE,
     TTS_SCRIPT_OPENING_LINE,
-    build_subtitle_retry_prompt,
     build_tts_retry_prompt,
     build_tts_script_rewrite_instruction,
     build_tts_script_prompt,
-    build_subtitle_from_tts_prompt,
+    sanitize_legacy_tts_custom_prompt,
 )
 from utils.file_naming import build_filename
 from services.storage_service import presign_s3_uri, put_bytes_and_presign
@@ -87,7 +88,7 @@ _WF13_PUBLISH_RETRY_BACKOFF_SECONDS = (10, 30)
 _HEYGEN_AVATAR_OPTION_COUNT = 6
 _HEYGEN_AVATAR_LABEL_PREFIX_LEN = 6
 _http_basic = HTTPBasic()
-_HARDBURN_FONT_NAME = "Noto Sans CJK KR"
+_HARDBURN_FONT_NAME = "GangwonEduAll OTF Bold"
 _HARDBURN_FONT_DIRS = (
     "/usr/share/fonts/opentype/noto",
     "/usr/share/fonts/truetype/noto",
@@ -95,15 +96,15 @@ _HARDBURN_FONT_DIRS = (
     "/usr/share/fonts",
 )
 _HARDBURN_FORCE_STYLE = (
-    "FontName=Jua,"
+    "FontName=GangwonEduAll OTF Bold,"
     "FontSize=13,"
-    "PrimaryColour=&H00FFFFFF,"
+    "PrimaryColour=&H002AC4F7,"
     "OutlineColour=&H00000000,"
     "BackColour=&H00000000,"
     "BorderStyle=1,"
-    "Outline=0,"
+    "Outline=1.0,"
     "Shadow=0,"
-    "MarginV=30,"
+    "MarginV=45,"
     "Alignment=2"
 )
 
@@ -839,10 +840,10 @@ def _get_subtitle_script_text(script_json: dict) -> str:
 
 def _get_tts_script_text(script_json: dict) -> str:
     return (
-        script_json.get("tts_script_text")
-        or script_json.get("subtitle_script_text")
+        script_json.get("subtitle_script_text")
         or script_json.get("script_text")
         or script_json.get("script")
+        or script_json.get("tts_script_text")
         or ""
     ).strip()
 
@@ -913,6 +914,10 @@ def _resolve_selected_heygen_avatar(script_json: dict) -> tuple[str, str, int]:
     options = _parse_heygen_avatar_options_from_env()
     selected_index = _get_job_avatar_index(script_json)
     if selected_index is None:
+        avatar_override = _get_job_avatar_override(script_json)
+        if avatar_override:
+            avatar_label = _get_job_avatar_label(script_json) or f"직접입력:{avatar_override[:_HEYGEN_AVATAR_LABEL_PREFIX_LEN]}"
+            return avatar_override, avatar_label, -1
         allowed_labels = "/".join(str(option["label"]) for option in options)
         raise HTTPException(
             status_code=400,
@@ -2094,9 +2099,21 @@ def _build_tts_request_body(script_text: str, *, seed: Optional[int] = None) -> 
         "streaming_mode": False,
         "top_k": settings.tts_top_k,
         "sample_steps": settings.tts_sample_steps,
+        "guidance_scale": settings.tts_guidance_scale,
+        "t_shift": settings.tts_t_shift,
+        "position_temperature": settings.tts_position_temperature,
+        "class_temperature": settings.tts_class_temperature,
+        "preprocess_prompt": settings.tts_preprocess_prompt,
+        "postprocess_output": settings.tts_postprocess_output,
+        "audio_chunk_duration": settings.tts_audio_chunk_duration,
+        "audio_chunk_threshold": settings.tts_audio_chunk_threshold,
         "super_sampling": settings.tts_super_sampling,
         "fragment_interval": settings.tts_fragment_interval,
     }
+    if int(settings.tts_num_step or 0) > 0:
+        tts_body["num_step"] = int(settings.tts_num_step)
+    if float(settings.tts_speed or 0.0) > 0.0:
+        tts_body["speed"] = float(settings.tts_speed)
 
     ref_audio_path = settings.tts_ref_audio_path.strip()
     prompt_text = settings.tts_prompt_text.strip()
@@ -2186,6 +2203,7 @@ def _build_job_prompt_log(
     notebooklm_prompt: str,
     raw_report_text: str,
     rewrite_prompt: str,
+    rewrite_prompt_sanitized: str,
     rewrite_instruction: str,
 ) -> dict:
     return {
@@ -2201,6 +2219,7 @@ def _build_job_prompt_log(
         "rewrite": {
             "instruction_base": TTS_SCRIPT_REWRITE_PROMPT_BASE,
             "instruction_custom": rewrite_prompt,
+            "instruction_custom_sanitized": rewrite_prompt_sanitized,
             "instruction_final": rewrite_instruction,
             "report_attempts": [],
             "tts_attempts": [],
@@ -2274,18 +2293,21 @@ def _validate_subtitle_script(
     *,
     raw_report_text: str = "",
     enforce_difference: bool = False,
-) -> None:
-    subtitle_len = _script_char_count(subtitle_script_text)
-    if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
-        raise RuntimeError(
-            f"subtitle_script_text length out of range: {subtitle_len} (expected {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
-        )
+) -> str:
+    warning_message = ""
+    keywords = _extract_topic_keywords(raw_report_text)
+    if keywords:
+        subtitle_ok = any(keyword in subtitle_script_text for keyword in keywords)
+        if not subtitle_ok:
+            drift_message = f"script rewrite topic drift detected; missing keywords={keywords}"
+            if settings.script_rewrite_topic_keyword_guard_enabled:
+                raise RuntimeError(drift_message)
+            warning_message = drift_message
+            logger.warning(
+                "[script-rewrite] keyword drift ignored by config (SCRIPT_REWRITE_TOPIC_KEYWORD_GUARD_ENABLED=false): %s",
+                drift_message,
+            )
     subtitle_lines = [line.strip() for line in subtitle_script_text.splitlines() if line.strip()]
-    tts_lines = [line.strip() for line in tts_script_text.splitlines() if line.strip()]
-    if len(subtitle_lines) != len(tts_lines):
-        raise RuntimeError(
-            f"subtitle_script_text line count mismatch: tts={len(tts_lines)} subtitle={len(subtitle_lines)}"
-        )
     if not subtitle_lines:
         raise RuntimeError("subtitle_script_text is empty")
     if enforce_difference and subtitle_script_text.strip() == tts_script_text.strip():
@@ -2294,17 +2316,14 @@ def _validate_subtitle_script(
         raise RuntimeError("subtitle_script_text must not include fixed opening line")
     if SCRIPT_ENDING_LINE in subtitle_script_text:
         raise RuntimeError("subtitle_script_text must not include fixed ending line")
-    report_has_alnum = bool(re.search(r"[A-Za-z0-9]", raw_report_text or ""))
-    subtitle_has_alnum = bool(re.search(r"[A-Za-z0-9]", subtitle_script_text or ""))
-    if report_has_alnum and not subtitle_has_alnum:
-        raise RuntimeError("subtitle_script_text must preserve numeric/alphabetic notation from report")
-    spoken_sentence_count = len(_split_caption_alignment_sentences(_build_fixed_caption_text(tts_script_text)))
-    display_sentence_count = len(_split_caption_alignment_sentences(_build_fixed_caption_text(subtitle_script_text)))
-    if spoken_sentence_count != display_sentence_count:
-        raise RuntimeError(
-            "caption sentence count mismatch after fixed opening/ending: "
-            f"spoken={spoken_sentence_count} display={display_sentence_count}"
+    subtitle_len = _script_char_count(subtitle_script_text)
+    if not (_SCRIPT_MIN_CHARS <= subtitle_len <= _SCRIPT_MAX_CHARS):
+        length_warning = (
+            f"subtitle_script_text length outside guidance: "
+            f"{subtitle_len} (target {_SCRIPT_MIN_CHARS}-{_SCRIPT_MAX_CHARS})"
         )
+        warning_message = f"{warning_message}; {length_warning}" if warning_message else length_warning
+    return warning_message
 
 
 def _validate_tts_script(raw_report_text: str, tts_script_text: str) -> str:
@@ -2365,22 +2384,22 @@ async def _rewrite_report_to_script(
     seed_subtitle_script_text: str = "",
 ) -> tuple[str, str]:
     # NotebookLM 원문 보고서를 한 번 더 정제해
-    # 자막용/ TTS용 스크립트를 동시에 만든다.
+    # 자막과 TTS에 함께 사용할 최종 스크립트 하나만 만든다.
     api_key = _resolve_openai_api_key_for_rewrite()
 
     client = AsyncOpenAI(api_key=api_key)
     try:
         last_error: Exception | None = None
         fact_lines = "\n".join(f"- {fact}" for fact in _extract_supporting_facts(raw_report_text)) or "- 원문 보고서의 핵심 사실을 그대로 사용한다."
-        tts_script_text = _sanitize_prompt_text((seed_tts_script_text or "").strip())
+        subtitle_script_text = _sanitize_prompt_text((seed_subtitle_script_text or seed_tts_script_text or "").strip())
         for attempt in range(max(1, max_attempts)):
-            use_retry_prompt = attempt > 0 or bool(tts_script_text)
-            tts_prompt = (
+            use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
+            subtitle_prompt = (
                 build_tts_retry_prompt(
                     raw_report_text=raw_report_text,
                     rewrite_instruction=rewrite_instruction,
-                    previous_script_text=tts_script_text,
-                    char_count=_script_char_count(tts_script_text),
+                    previous_script_text=subtitle_script_text,
+                    char_count=_script_char_count(subtitle_script_text),
                     fact_lines=fact_lines,
                 )
                 if use_retry_prompt
@@ -2388,106 +2407,6 @@ async def _rewrite_report_to_script(
                     raw_report_text=raw_report_text,
                     fact_lines=fact_lines,
                     rewrite_instruction=rewrite_instruction,
-                )
-            )
-            tts_prompt = _sanitize_prompt_text(tts_prompt)
-            attempt_record = {
-                "attempt": len(prompt_log["rewrite"]["tts_attempts"]) + 1,
-                "prompt": tts_prompt,
-                "response_text": "",
-                "char_count": 0,
-                "validation_error": "",
-            }
-            request_started_at = datetime.now(timezone.utc)
-            response = await client.chat.completions.create(
-                model=settings.script_rewrite_model,
-                temperature=0,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": SCRIPT_REWRITE_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": tts_prompt,
-                    },
-                ],
-            )
-            usage_payload: dict[str, Any] = {}
-            if response.usage is not None:
-                usage_payload = {
-                    "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
-                    "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
-                    "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
-                    "model": settings.script_rewrite_model,
-                }
-            estimated_cost = _estimate_script_rewrite_cost_usd(usage_payload)
-            await _record_cost_event_safe(
-                job_id=prompt_log.get("job_id", ""),
-                topic_text=str((prompt_log.get("job") or {}).get("concept_text") or ""),
-                stage="script",
-                process="tts_script_rewrite",
-                provider="openai",
-                attempt_no=int(attempt_record["attempt"]),
-                status="success" if bool(response.choices) else "failed",
-                started_at=request_started_at,
-                ended_at=datetime.now(timezone.utc),
-                usage_json=usage_payload,
-                raw_response_json={"prompt": tts_prompt, "has_choices": bool(response.choices)},
-                cost_usd=estimated_cost,
-                pricing_kind=_estimated_pricing_kind(estimated_cost),
-                pricing_source=_estimated_pricing_source(estimated_cost),
-                api_key_family="rewrite",
-                error_type="",
-                error_message="",
-                idempotency_key=f"script:tts:{prompt_log.get('job_id','')}:{attempt_record['attempt']}",
-            )
-            if not response.choices:
-                last_error = RuntimeError("tts rewrite returned no choices")
-                attempt_record["validation_error"] = str(last_error)
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-                continue
-            tts_script_text = _sanitize_prompt_text(
-                _extract_completion_text(response.choices[0].message.content).strip()
-            )
-            attempt_record["response_text"] = tts_script_text
-            attempt_record["char_count"] = _script_char_count(tts_script_text)
-            if not tts_script_text:
-                last_error = RuntimeError("tts rewrite returned empty content")
-                attempt_record["validation_error"] = str(last_error)
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-                continue
-            try:
-                warning_message = _validate_tts_script(raw_report_text, tts_script_text)
-                if warning_message:
-                    attempt_record["validation_warning"] = warning_message
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-                prompt_log["rewrite"]["final"]["tts_script_text"] = tts_script_text
-                prompt_log["rewrite"]["final"]["tts_prompt_final"] = attempt_record["prompt"]
-                break
-            except Exception as e:
-                last_error = e
-                attempt_record["validation_error"] = str(e)
-                prompt_log["rewrite"]["tts_attempts"].append(attempt_record)
-        else:
-            raise RuntimeError(str(last_error or "tts rewrite failed after retries"))
-
-        subtitle_script_text = _sanitize_prompt_text((seed_subtitle_script_text or "").strip())
-        subtitle_validation_error = ""
-        for attempt in range(max(1, max_attempts)):
-            use_retry_prompt = attempt > 0 or bool(subtitle_script_text)
-            subtitle_prompt = (
-                build_subtitle_retry_prompt(
-                    raw_report_text=raw_report_text,
-                    tts_script_text=tts_script_text,
-                    previous_script_text=subtitle_script_text,
-                    char_count=_script_char_count(subtitle_script_text),
-                    validation_error=subtitle_validation_error,
-                )
-                if use_retry_prompt
-                else build_subtitle_from_tts_prompt(
-                    tts_script_text=tts_script_text,
-                    raw_report_text=raw_report_text,
                 )
             )
             subtitle_prompt = _sanitize_prompt_text(subtitle_prompt)
@@ -2544,7 +2463,6 @@ async def _rewrite_report_to_script(
             )
             if not response.choices:
                 last_error = RuntimeError("subtitle rewrite returned no choices")
-                subtitle_validation_error = str(last_error)
                 attempt_record["validation_error"] = str(last_error)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
@@ -2555,30 +2473,30 @@ async def _rewrite_report_to_script(
             attempt_record["char_count"] = _script_char_count(subtitle_script_text)
             if not subtitle_script_text:
                 last_error = RuntimeError("subtitle rewrite returned empty content")
-                subtitle_validation_error = str(last_error)
                 attempt_record["validation_error"] = str(last_error)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 continue
             try:
-                _validate_subtitle_script(
-                    tts_script_text,
+                warning_message = _validate_subtitle_script(
+                    subtitle_script_text,
                     subtitle_script_text,
                     raw_report_text=raw_report_text,
                     enforce_difference=False,
                 )
+                if warning_message:
+                    attempt_record["validation_warning"] = warning_message
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
                 prompt_log["rewrite"]["final"] = {
                     "status": "success",
                     "error": "",
-                    "tts_script_text": tts_script_text,
+                    "tts_script_text": subtitle_script_text,
                     "subtitle_script_text": subtitle_script_text,
-                    "tts_prompt_final": prompt_log["rewrite"]["tts_attempts"][-1]["prompt"] if prompt_log["rewrite"]["tts_attempts"] else "",
+                    "tts_prompt_final": attempt_record["prompt"],
                     "subtitle_prompt_final": attempt_record["prompt"],
                 }
-                return subtitle_script_text, tts_script_text
+                return subtitle_script_text, subtitle_script_text
             except Exception as e:
                 last_error = e
-                subtitle_validation_error = str(e)
                 attempt_record["validation_error"] = str(e)
                 prompt_log["rewrite"]["subtitle_attempts"].append(attempt_record)
     finally:
@@ -2601,13 +2519,15 @@ async def _prepare_report_delivery(
 ) -> tuple[str, bytes, str, dict]:
     raw_report_text = (raw_report_text or "").strip()
     rewrite_prompt = (rewrite_prompt or "").strip()
-    rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt)
+    rewrite_prompt_sanitized = sanitize_legacy_tts_custom_prompt(rewrite_prompt)
+    rewrite_instruction = build_tts_script_rewrite_instruction(rewrite_prompt_sanitized)
     prompt_log = _build_job_prompt_log(
         job_id=job_id,
         existing_job=existing_job,
         notebooklm_prompt=notebooklm_prompt,
         raw_report_text=raw_report_text,
         rewrite_prompt=rewrite_prompt,
+        rewrite_prompt_sanitized=rewrite_prompt_sanitized,
         rewrite_instruction=rewrite_instruction,
     )
     if not raw_report_text:
@@ -3251,7 +3171,7 @@ def _build_selected_tts_caption(
     avatar_line = (
         f"선택 아바타: {selected_avatar_label}"
         if selected_avatar_label
-        else "먼저 아바타 버튼을 선택하세요."
+        else "먼저 아바타 버튼을 선택하거나 아바타ID 입력을 누르세요."
     )
     if downstream_intent == "video_prepare":
         return (
@@ -4156,6 +4076,13 @@ def _build_cost_viewer_link(*, user_id: str, expires_at: datetime) -> str:
     return f"{_resolve_cost_viewer_base_url()}/cost/r/{token}/"
 
 
+def _clip_text(text: str, max_len: int = 1500) -> str:
+    normalized = (text or "").strip()
+    if len(normalized) <= max_len:
+        return normalized
+    return normalized[: max_len - 3] + "..."
+
+
 def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequest) -> str:
     run_id = str(run.get("run_id") or body.run_id)
     stage = (body.stage or body.status or "queued").strip().lower()
@@ -4169,6 +4096,8 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
     runpod_job_count = max(0, int(body.runpod_job_count or 0))
     gpu_active_sample_count = max(0, int(body.gpu_active_sample_count or 0))
     remote_eval_failed_count = max(0, int(body.remote_eval_failed_count or 0))
+    eval_preflight_status = str(body.eval_preflight_status or "").strip().lower()
+    eval_preflight_detail = str(body.eval_preflight_detail or "").strip()
     avg_stage_timings = body.avg_stage_timings_ms if isinstance(body.avg_stage_timings_ms, dict) else {}
     executor_counts = body.eval_executor_counts if isinstance(body.eval_executor_counts, dict) else {}
     if stage == "queued":
@@ -4212,6 +4141,16 @@ def _format_seedlab_progress_text(run: dict[str, Any], body: SeedLabProgressRequ
             f"RunPod {runpod_job_count} / GPU {gpu_active_sample_count} / "
             f"AI 실패 {eval_failed_count} / 원격 실패 {remote_eval_failed_count}"
         )
+    if eval_preflight_status or eval_preflight_detail:
+        preflight_label = {
+            "pending": "대기",
+            "ready": "정상",
+            "failed": "실패",
+        }.get(eval_preflight_status, eval_preflight_status or "미확인")
+        line = f"원격 준비: {preflight_label}"
+        if eval_preflight_detail:
+            line = f"{line} / {_clip_text(eval_preflight_detail, 220)}"
+        lines.append(line)
     if executor_counts:
         executor_chunks = [f"{str(key)}={int(value or 0)}" for key, value in executor_counts.items()]
         if executor_chunks:
@@ -4841,19 +4780,15 @@ async def _handle_report_select_bg(body: ReportSelectRequest, job: dict) -> None
             await _discord_adapter.send_text_message(channel_id, f"❌ 대본 생성 실패: {str(e)[:180]}")
             return
         try:
-            _, merged_script = _upload_tts_script_file(
+            stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
                 job_id=body.job_id,
                 filename=filename,
-                tts_script_text=tts_script_text,
-                existing_script_json=merged_script,
+                file_bytes=file_bytes,
             )
         except Exception as e:
-            logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
-        stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
-            job_id=body.job_id,
-            filename=filename,
-            file_bytes=file_bytes,
-        )
+            await job_service.update_job(body.job_id, error_message=str(e), script_json=merged_script)
+            await _discord_adapter.send_text_message(channel_id, f"❌ 보고서 파일 저장 실패: {str(e)[:180]}")
+            return
         if upload_error is not None:
             error_message = f"subtitle report upload failed: {upload_error}"
             logger.error("[report-select] %s job_id=%s", error_message, body.job_id)
@@ -4971,17 +4906,6 @@ async def send_report(_: AuthDep, body: SendReportRequest) -> dict:
     except Exception as e:
         await job_service.update_job(body.job_id, error_message=str(e))
         raise HTTPException(status_code=500, detail=str(e))
-    try:
-        # TTS용 파일 업로드 실패는 사용자 보고서 전송을 막지 않도록 분리 처리한다.
-        _, merged_script = _upload_tts_script_file(
-            job_id=body.job_id,
-            filename=filename,
-            tts_script_text=tts_script_text,
-            existing_script_json=merged_script,
-        )
-    except Exception as e:
-        logger.error("[storage] tts script upload failed job_id=%s: %s", body.job_id, e)
-
     stored, upload_error, is_link_only_report = _upload_subtitle_report_file(
         job_id=body.job_id,
         filename=filename,
@@ -5349,6 +5273,31 @@ async def tts_action(_: AuthDep, body: TtsActionRequest) -> dict:
             "avatar_id": avatar_id,
             "avatar_label": avatar_label,
             "avatar_index": avatar_index,
+        }
+
+    if body.action == "select_avatar_custom":
+        selected_variant_index_raw = script_json.get("selected_tts_variant_index")
+        if selected_variant_index_raw is None:
+            raise HTTPException(status_code=409, detail="TTS 후보를 먼저 선택하세요.")
+        avatar_id = (body.avatar_id or "").strip()
+        if not avatar_id:
+            raise HTTPException(status_code=400, detail="avatar_id is required")
+        avatar_label = f"직접입력:{avatar_id[:_HEYGEN_AVATAR_LABEL_PREFIX_LEN]}"
+        updated_script = _merge_script_json_with_media_names(
+            script_json,
+            heygen_avatar_id=avatar_id,
+        )
+        updated_script["avatar_id"] = avatar_id
+        updated_script["heygen_avatar_label"] = avatar_label
+        updated_script["heygen_avatar_index"] = None
+        await job_service.update_job(body.job_id, script_json=updated_script)
+        logger.info("[discord] tts_action=select_avatar_custom job_id=%s avatar_id_prefix=%s", body.job_id, avatar_id[:8])
+        return {
+            "job_id": body.job_id,
+            "action": body.action,
+            "avatar_id": avatar_id,
+            "avatar_label": avatar_label,
+            "avatar_index": None,
         }
 
     if body.action in {"approve_standard", "approve_hd"}:
@@ -6475,10 +6424,20 @@ async def heygen_generate(_: AuthDep, body: ManualGenerateRequest) -> dict:
 
 @app.post("/internal/seedlab-start")
 async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
+    started_at = time.perf_counter()
     run_id = f"seedlab-{uuid.uuid4().hex[:12]}"
     samples = _SEEDLAB_DUP_SAMPLES if body.dup else _SEEDLAB_DEFAULT_SAMPLES
     takes_per_seed = _SEEDLAB_DUP_TAKES if body.dup else _SEEDLAB_DEFAULT_TAKES
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, int(settings.seedlab_link_ttl_seconds)))
+    logger.info(
+        "seedlab_start begin run_id=%s user=%s channel=%s dup=%s seeds=%s",
+        run_id,
+        body.messenger_user_id,
+        body.messenger_channel_id,
+        bool(body.dup),
+        bool((body.seeds or "").strip()),
+    )
+    db_started_at = time.perf_counter()
     created = await job_service.create_seed_lab_run(
         run_id=run_id,
         discord_user_id=body.messenger_user_id,
@@ -6492,14 +6451,47 @@ async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
         run_dir=f"/app/runtime/seed-lab/runs/{run_id}",
         signed_link_expires_at=expires_at,
     )
-    response = await _seedlab_service_request(
-        "POST",
+    logger.info(
+        "seedlab_start db_create_done run_id=%s elapsed_ms=%.1f total_ms=%.1f",
+        run_id,
+        (time.perf_counter() - db_started_at) * 1000.0,
+        (time.perf_counter() - started_at) * 1000.0,
+    )
+    logger.info(
+        "seedlab_start upstream_request_begin run_id=%s path=%s total_ms=%.1f",
+        run_id,
         "/internal/runs",
-        json_body={
-            "run_id": run_id,
-            "seeds": (body.seeds or "").strip(),
-            "dup": bool(body.dup),
-        },
+        (time.perf_counter() - started_at) * 1000.0,
+    )
+    upstream_started_at = time.perf_counter()
+    try:
+        response = await _seedlab_service_request(
+            "POST",
+            "/internal/runs",
+            json_body={
+                "run_id": run_id,
+                "seeds": (body.seeds or "").strip(),
+                "dup": bool(body.dup),
+            },
+        )
+    except HTTPException as e:
+        logger.warning(
+            "seedlab_start upstream_request_error run_id=%s path=%s status=%s elapsed_ms=%.1f total_ms=%.1f detail=%s",
+            run_id,
+            "/internal/runs",
+            e.status_code,
+            (time.perf_counter() - upstream_started_at) * 1000.0,
+            (time.perf_counter() - started_at) * 1000.0,
+            _clip_text(str(e.detail), 300),
+        )
+        raise
+    logger.info(
+        "seedlab_start upstream_request_done run_id=%s path=%s status=%s elapsed_ms=%.1f total_ms=%.1f",
+        run_id,
+        "/internal/runs",
+        response.status_code,
+        (time.perf_counter() - upstream_started_at) * 1000.0,
+        (time.perf_counter() - started_at) * 1000.0,
     )
     if response.status_code >= 400:
         response_detail = response.text
@@ -6510,11 +6502,27 @@ async def seedlab_start(_: AuthDep, body: SeedLabStartRequest) -> dict:
         except Exception:
             pass
         await job_service.update_seed_lab_run(run_id, status="failed", last_error=response_detail[:800])
-        raise HTTPException(status_code=502, detail=f"seedlab create failed: {response_detail[:300]}")
+        upstream_status = 503 if response.status_code == 503 else 502
+        logger.warning(
+            "seedlab_start failed run_id=%s status=%s total_ms=%.1f detail=%s",
+            run_id,
+            upstream_status,
+            (time.perf_counter() - started_at) * 1000.0,
+            _clip_text(response_detail, 300),
+        )
+        raise HTTPException(
+            status_code=upstream_status,
+            detail=f"seedlab create failed: {response_detail[:500]}",
+        )
     token = _build_seedlab_signed_token(run_id=run_id, user_id=body.messenger_user_id, expires_at=expires_at)
     base_url = (settings.seedlab_public_base_url or "").strip().rstrip("/")
     link = f"{base_url}/seedlab/r/{token}/" if base_url else f"/seedlab/r/{token}/"
     created = await job_service.update_seed_lab_run(run_id, status="queued")
+    logger.info(
+        "seedlab_start success run_id=%s total_ms=%.1f",
+        run_id,
+        (time.perf_counter() - started_at) * 1000.0,
+    )
     return {
         "run_id": run_id,
         "status": str((created or {}).get("status") or "queued"),
@@ -6565,12 +6573,26 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
     incoming_evaluated = int(body.evaluated_count or 0)
     incoming_failed = int(body.failed_count or 0)
     incoming_total = int(body.total_count or 0)
+    incoming_runpod_jobs = int(body.runpod_job_count or 0)
+    incoming_gpu_active = int(body.gpu_active_sample_count or 0)
+    incoming_remote_failed = int(body.remote_eval_failed_count or 0)
+    incoming_remote_error = str(body.remote_eval_last_error or "")
+    incoming_preflight_status = str(body.eval_preflight_status or "")
+    incoming_preflight_detail = str(body.eval_preflight_detail or "")
+    incoming_last_error = str(body.last_error or "")
 
     current_stage = str(run.get("progress_last_stage") or "")
     current_generated = int(run.get("progress_last_generated_count") or 0)
     current_evaluated = int(run.get("progress_last_evaluated_count") or 0)
     current_failed = int(run.get("progress_last_failed_count") or 0)
     current_total = int(run.get("progress_last_total_count") or 0)
+    current_runpod_jobs = int(run.get("progress_last_runpod_job_count") or 0)
+    current_gpu_active = int(run.get("progress_last_gpu_active_sample_count") or 0)
+    current_remote_failed = int(run.get("progress_last_remote_eval_failed_count") or 0)
+    current_remote_error = str(run.get("progress_last_remote_eval_last_error") or "")
+    current_preflight_status = str(run.get("progress_last_eval_preflight_status") or "")
+    current_preflight_detail = str(run.get("progress_last_eval_preflight_detail") or "")
+    current_last_error = str(run.get("progress_last_last_error") or run.get("last_error") or "")
 
     should_update_message = (
         incoming_stage != current_stage
@@ -6578,6 +6600,13 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
         or incoming_evaluated != current_evaluated
         or incoming_failed != current_failed
         or incoming_total != current_total
+        or incoming_runpod_jobs != current_runpod_jobs
+        or incoming_gpu_active != current_gpu_active
+        or incoming_remote_failed != current_remote_failed
+        or incoming_remote_error != current_remote_error
+        or incoming_preflight_status != current_preflight_status
+        or incoming_preflight_detail != current_preflight_detail
+        or incoming_last_error != current_last_error
         or str(run.get("progress_message_id") or "").strip() == ""
     )
 
@@ -6590,11 +6619,28 @@ async def seedlab_progress(_: AuthDep, body: SeedLabProgressRequest) -> dict:
         progress_last_evaluated_count=incoming_evaluated,
         progress_last_failed_count=incoming_failed,
         progress_last_total_count=incoming_total,
+        progress_last_runpod_job_count=incoming_runpod_jobs,
+        progress_last_gpu_active_sample_count=incoming_gpu_active,
+        progress_last_remote_eval_failed_count=incoming_remote_failed,
+        progress_last_remote_eval_last_error=incoming_remote_error,
+        progress_last_eval_preflight_status=incoming_preflight_status,
+        progress_last_eval_preflight_detail=incoming_preflight_detail,
+        progress_last_last_error=incoming_last_error,
     )
     run_for_message = updated_run or run
     if should_update_message and _discord_adapter is not None:
-        progress_text = _format_seedlab_progress_text(run_for_message, body)
-        await _ensure_seedlab_progress_message(run_for_message, progress_text)
+        try:
+            progress_text = _format_seedlab_progress_text(run_for_message, body)
+            await _ensure_seedlab_progress_message(run_for_message, progress_text)
+        except Exception as e:
+            logger.warning(
+                "seedlab progress message update failed run_id=%s stage=%s preflight=%s err_type=%s err=%s",
+                body.run_id,
+                incoming_stage or str(body.status or ""),
+                incoming_preflight_status or "unknown",
+                type(e).__name__,
+                str(e),
+            )
     return {"ok": True, "updated": should_update_message}
 
 
@@ -6736,7 +6782,7 @@ async def _costs_export_payload(
     )
     filename = f"cost-export-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
     return JSONResponse(
-        content=payload,
+        content=jsonable_encoder(payload),
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -6860,8 +6906,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
       <select id="sortBySelect">
         <option value="updated_at" selected>&#xC218;&#xC815; &#xC2DC;&#xAC01;</option>
         <option value="created_at">&#xC0DD;&#xC131; &#xC2DC;&#xAC01;</option>
-        <option value="main_cost_usd">&#xCD1D; &#xBE44;&#xC6A9;</option>
-        <option value="estimated_cost_usd">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</option>
+        <option value="total_cost_usd">&#xCD1D; &#xBE44;&#xC6A9;</option>
       </select>
       <select id="sortDirSelect">
         <option value="desc" selected>&#xB0B4;&#xB9BC;&#xCC28;&#xC21C;</option>
@@ -6879,19 +6924,15 @@ def _cost_viewer_html(api_base_path: str) -> str:
     <div class="summary-row">
       <div class="card">
         <div class="clabel">&#xCD1D; &#xBE44;&#xC6A9;</div>
-        <div class="cusd" id="mainCostUsd">$0.000000</div>
+        <div class="cusd" id="mainCostUsd">$0.00</div>
         <div class="ckrw" id="mainCostKrw">&#x20A9;0</div>
+        <div class="ckrw" id="mainCostAverage">&#xC870;&#xD68C;&#xB41C; &#xD56D;&#xBAA9; &#xC5C6;&#xC74C;</div>
       </div>
       <div class="card">
         <div class="clabel">&#xC77C;&#xC77C; &#xBE44;&#xC6A9; &#xC608;&#xC0C1; (3&#xAC1C; &#xC601;&#xC0C1; &#xAE30;&#xC900;)</div>
-        <div class="cusd" id="estimatedCostUsd">$0.000000</div>
+        <div class="cusd" id="estimatedCostUsd">$0.00</div>
         <div class="ckrw" id="estimatedCostKrw">&#x20A9;0</div>
         <div class="ckrw" id="estimatedCostBasis">&#xD45C;&#xBCF8; &#xC5C6;&#xC74C;</div>
-      </div>
-      <div class="card">
-        <div class="clabel">&#xBE44;&#xC6A9; &#xC815;&#xBCF4; &#xC5C6;&#xC74C;</div>
-        <div class="cusd" id="missingCount" style="color:var(--danger);">0</div>
-        <div class="ckrw">&#xC9D1;&#xACC4; &#xC548; &#xB41C; &#xD56D;&#xBAA9; &#xC218;</div>
       </div>
       <div class="card">
         <div class="clabel">&#xC870;&#xD68C;&#xB41C; &#xD56D;&#xBAA9;</div>
@@ -6912,7 +6953,6 @@ def _cost_viewer_html(api_base_path: str) -> str:
             <th style="width:120px;">&#xB2E8;&#xACC4;</th>
             <th style="width:110px;">&#xC0C1;&#xD0DC;</th>
             <th style="width:130px;">&#xCD1D; &#xBE44;&#xC6A9;</th>
-            <th style="width:130px;">&#xC608;&#xC0C1; &#xBE44;&#xC6A9;</th>
             <th style="width:108px;">&#xC0DD;&#xC131; &#xC2DC;&#xAC01; (KST)</th>
             <th style="width:108px;">&#xC218;&#xC815; &#xC2DC;&#xAC01; (KST)</th>
             <th style="width:88px;">&#xBCF4;&#xAE30;</th>
@@ -6994,7 +7034,6 @@ def _cost_viewer_html(api_base_path: str) -> str:
   };
   var PROVIDER_LABELS = {
     heygen: "HeyGen",
-    aws_fixed: "AWS",
     openai: "OpenAI",
     runpod_tts: "Runpod",
     runpod_fixed: "Runpod",
@@ -7040,7 +7079,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
   function pageSize() { return parseInt(document.getElementById("pageSizeSelect").value) || 50; }
   function q(id) { return document.getElementById(id); }
   function num(v) { var n = Number(v); return isNaN(n) ? 0 : n; }
-  function fmtUsd(v) { return "$" + num(v).toFixed(6); }
+  function fmtUsd(v) { return "$" + num(v).toFixed(2); }
   function fmtKrw(v) { return "\u20A9" + Math.round(num(v)).toLocaleString("ko-KR"); }
   function shortText(v, max) { var s = String(v || ""); return s.length <= max ? s : s.slice(0, max - 1) + "\u2026"; }
   function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
@@ -7177,19 +7216,14 @@ def _cost_viewer_html(api_base_path: str) -> str:
 
   async function loadRows(offset) {
     q("statusBar").textContent = "\uC870\uD68C \uC911\u2026";
-    q("rows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
+    q("rows").innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:24px;">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</td></tr>';
     try {
       var data = await fetchJson(buildListUrl(offset));
       currentOffset = offset; currentTotal = num(data.total);
       var items = Array.isArray(data.items) ? data.items : [];
-      var mu = 0, mk = 0, ms = 0;
       q("rows").innerHTML = "";
       for (var i = 0; i < items.length; i++) {
-        var rec = items[i]; var byP = rec.by_pricing_kind || {};
-        var mainKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
-        var estKrw  = num((byP.estimated||{}).cost_krw);
-        mu += num(rec.main_cost_usd); mk += mainKrw;
-        ms += num(rec.missing_cost_event_count);
+        var rec = items[i];
         var shortKey = String(rec.subject_key || rec.job_id || "").slice(0, 8);
         var tr = document.createElement("tr");
         tr.innerHTML =
@@ -7198,13 +7232,12 @@ def _cost_viewer_html(api_base_path: str) -> str:
           + '<td>' + shortText(displaySubjectLabel(rec), 60) + '</td>'
           + '<td>' + stageIcons(rec) + '</td>'
           + '<td>' + statusBadge(rec.status) + '</td>'
-          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.main_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(mainKrw) + '</div></td>'
-          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.estimated_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(estKrw) + '</div></td>'
+          + '<td class="cost-cell"><div class="cusd2">' + fmtUsd(rec.total_cost_usd) + '</div><div class="ckrw2">' + fmtKrw(rec.total_cost_krw) + '</div></td>'
           + '<td style="color:var(--muted);">' + toKST(rec.created_at) + '</td>'
           + '<td style="color:var(--muted);">' + toKST(rec.updated_at) + '</td>'
           + '<td></td>';
         (function(r, row) {
-          var td = row.cells[9];
+          var td = row.cells[8];
           var db = document.createElement("button"); db.className = "sm primary"; db.textContent = "\uC0C1\uC138";
           db.onclick = function() { loadDetail(String(r.subject_key || r.job_id || "")); };
           var eb = document.createElement("button"); eb.className = "sm"; eb.textContent = "\uC6D0\uBCF8"; eb.style.marginLeft = "4px";
@@ -7213,7 +7246,14 @@ def _cost_viewer_html(api_base_path: str) -> str:
         })(rec, tr);
         q("rows").appendChild(tr);
       }
-      q("mainCostUsd").textContent = fmtUsd(mu); q("mainCostKrw").textContent = fmtKrw(mk);
+      var listSummary = data.summary || {};
+      var totalCostUsd = num(listSummary.total_cost_usd);
+      var totalCostKrw = num(listSummary.total_cost_krw);
+      q("mainCostUsd").textContent = fmtUsd(totalCostUsd);
+      q("mainCostKrw").textContent = fmtKrw(totalCostKrw);
+      q("mainCostAverage").textContent = currentTotal > 0
+        ? "\uC870\uD68C \uD56D\uBAA9 " + currentTotal + "\uAC74 \uAE30\uC900 \u00B7 1\uAC74\uB2F9 " + fmtUsd(totalCostUsd / currentTotal) + " / " + fmtKrw(totalCostKrw / currentTotal)
+        : "\uC870\uD68C\uB41C \uD56D\uBAA9 \uC5C6\uC74C";
       var dailyEstimate = data.daily_estimate || {};
       if (num(dailyEstimate.sample_count) > 0) {
         q("estimatedCostUsd").textContent = fmtUsd(dailyEstimate.estimated_daily_cost_usd);
@@ -7223,7 +7263,6 @@ def _cost_viewer_html(api_base_path: str) -> str:
         q("estimatedCostKrw").textContent = "\uD45C\uBCF8 \uC5C6\uC74C";
       }
       q("estimatedCostBasis").textContent = dailyEstimate.basis || "\uD45C\uBCF8 \uC5C6\uC74C";
-      q("missingCount").textContent = String(ms);
       q("rowCount").textContent = items.length + "\uAC74";
       q("totalCount").textContent = "\uC804\uCCB4 " + currentTotal + "\uAC74";
       var ps = pageSize(), fr = currentOffset + 1, to2 = Math.min(currentOffset + items.length, currentTotal);
@@ -7233,7 +7272,7 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("statusBar").textContent = "\uB9C8\uC9C0\uB9C9 \uC870\uD68C: " + new Date().toLocaleTimeString("ko-KR");
     } catch(e) {
       q("statusBar").textContent = "\uC624\uB958: " + e.message;
-      q("rows").innerHTML = '<tr><td colspan="10" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
+      q("rows").innerHTML = '<tr><td colspan="9" style="color:var(--danger);text-align:center;padding:16px;">' + e.message + '</td></tr>';
     }
   }
 
@@ -7270,20 +7309,12 @@ def _cost_viewer_html(api_base_path: str) -> str:
       q("detailId").textContent    = subjectKey;
       q("detailStatus").innerHTML  = statusBadge(sub.status);
       q("detailDate").textContent  = toKST(sub.created_at);
-      var byP = sum.by_pricing_kind || {};
-      var mKrw = num((byP.actual||{}).cost_krw) + num((byP.fixed||{}).cost_krw);
       q("detailCostSummary").innerHTML =
-          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.main_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(mKrw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.actual||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uACE0\uC815 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.fixed_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.fixed||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uC608\uC0C1 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.estimated_cost_usd) + '</div><div class="cs-krw">' + fmtKrw((byP.estimated||{}).cost_krw) + '</div></div>'
-        + '<div class="cs-card"><div class="cs-label">\uBE44\uC6A9 \uC815\uBCF4 \uC5C6\uC74C</div><div class="cs-val" style="color:var(--danger);">' + (sum.missing_cost_event_count||0) + '\uAC74</div><div class="cs-krw">&nbsp;</div></div>';
+          '<div class="cs-card"><div class="cs-label">\uCD1D \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_total_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_total_cost_krw) + '</div></div>'
+        + '<div class="cs-card"><div class="cs-label">\uC2E4\uCE21 \uBE44\uC6A9</div><div class="cs-val">' + fmtUsd(sum.detail_actual_cost_usd) + '</div><div class="cs-krw">' + fmtKrw(sum.detail_actual_cost_krw) + '</div></div>';
       q("detailBreakdown").innerHTML =
           renderBreakdown("\uB2E8\uACC4\uBCC4 \uBE44\uC6A9", sum.by_stage, "stage")
-        + renderBreakdown("\uC791\uC5C5\uBCC4 \uBE44\uC6A9", sum.by_process, "process")
-        + renderBreakdown("\uC11C\uBE44\uC2A4\uBCC4 \uBE44\uC6A9", sum.by_provider, "provider")
-        + renderBreakdown("\uBE44\uC6A9 \uBD84\uB958\uBCC4", sum.by_api_key_family, "api_key_family")
-        + renderBreakdown("\uBE44\uC6A9 \uACC4\uC0B0 \uBC29\uC2DD", sum.by_pricing_kind, "pricing_kind");
+        + renderBreakdown("\uC791\uC5C5\uBCC4 \uBE44\uC6A9", sum.by_process, "process");
       if (!events.length) {
         q("eventRows").innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:12px;">\uC774\uBCA4\uD2B8 \uC5C6\uC74C</td></tr>';
       } else {

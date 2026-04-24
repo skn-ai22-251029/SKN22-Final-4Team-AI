@@ -29,14 +29,45 @@ TTS_PID_FILE="$RUN_DIR/tts-api.pid"
 SEEDLAB_PID_FILE="$RUN_DIR/seedlab-eval.pid"
 AWS_TUNNEL_PID_FILE="$RUN_DIR/aws-reverse-tunnel.pid"
 
+process_matches_name() {
+  local name="$1"
+  local pid="$2"
+  local args
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  case "$name" in
+    aws-reverse-tunnel)
+      [[ "$args" == *"aws-reverse-tunnel.sh"* ]] || [[ "$args" == *"19880:127.0.0.1:9880"* ]]
+      ;;
+    tts-api)
+      [[ "$args" == *"api_v2.py"* ]] || [[ "$args" == *"omnivoice_compat_api.py"* ]]
+      ;;
+    seedlab-eval)
+      [[ "$args" == *"runpod-seedlab-eval-service/main.py"* ]]
+      ;;
+    *)
+      [[ -n "$args" ]]
+      ;;
+  esac
+}
+
 is_running() {
   local pid_file="$1"
+  local name="${2:-}"
   if [[ ! -f "$pid_file" ]]; then
     return 1
   fi
   local pid
   pid="$(cat "$pid_file" 2>/dev/null || true)"
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pid_file"
+    return 1
+  fi
+  if [[ -n "$name" ]] && ! process_matches_name "$name" "$pid"; then
+    echo "[runpod-stack] removing stale $name pid file (pid=$pid)"
+    rm -f "$pid_file"
+    return 1
+  fi
+  return 0
 }
 
 start_bg() {
@@ -44,7 +75,7 @@ start_bg() {
   local pid_file="$2"
   local log_file="$3"
   shift 3
-  if is_running "$pid_file"; then
+  if is_running "$pid_file" "$name"; then
     echo "[runpod-stack] $name already running (pid=$(cat "$pid_file"))"
     return 0
   fi

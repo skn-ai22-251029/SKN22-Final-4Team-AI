@@ -1338,10 +1338,19 @@ Discord 명령:
 | `SEEDLAB_ASR_MODEL` | seed-lab-service | 자동평가 전사 모델 |
 | `SEEDLAB_JUDGE_MODEL` | seed-lab-service | 자동평가 note 생성 모델 |
 | `SEEDLAB_EVALUATION_PROFILE` | seed-lab-service | 현재 `hybrid` |
+| `SEEDLAB_EVAL_RUNPOD_URL` | seed-lab-service | RunPod 평가 API base URL. `SEEDLAB_EVAL_MODE=runpod_pod`면 필수 |
+| `SEEDLAB_EVAL_RUNPOD_SHARED_SECRET` | seed-lab-service | RunPod 평가 API `X-Seedlab-Secret`. `SEEDLAB_EVAL_MODE=runpod_pod`면 필수 |
+| `SEEDLAB_SAMPLE_S3_BUCKET` | seed-lab-service | RunPod 평가용 샘플 wav 업로드 버킷. 비우면 `MEDIA_S3_BUCKET`을 fallback으로 사용 |
+| `SEEDLAB_SAMPLE_S3_PREFIX` | seed-lab-service | RunPod 평가용 샘플 wav 업로드 prefix. 기본 `seed-lab-samples` |
 | `SEEDLAB_REFERENCE_AUDIO_LOCAL_PATH` | seed-lab-service | 톤 비교용 기준 음성 로컬 경로 |
 | `SEEDLAB_REFERENCE_AUDIO_S3_URI` | seed-lab-service | 톤 비교용 기준 음성 S3 URI |
 | `SEEDLAB_REFERENCE_AUDIO_CACHE_DIR` | seed-lab-service | 기준 음성 캐시 경로 |
 | `SEEDLAB_DISABLE_LLM_NOTE` | seed-lab-service | LLM note 생성 비활성 |
+
+`SEEDLAB_EVAL_MODE=runpod_pod`인데 `SEEDLAB_EVAL_RUNPOD_URL` 또는 `SEEDLAB_EVAL_RUNPOD_SHARED_SECRET`가 비어 있으면,
+`seed-lab-service`는 startup warning을 남기고 `/seedlab` 생성 시 `preflight_unhealthy`로 즉시 실패합니다.
+RunPod 평가 모드에서는 샘플 wav를 원격 평가 서비스가 읽을 수 있는 S3에 업로드해야 하므로,
+`SEEDLAB_SAMPLE_S3_BUCKET` 또는 fallback용 `MEDIA_S3_BUCKET`도 필수입니다.
 
 #### 서버 기준 TTS 생성 구조
 

@@ -114,11 +114,12 @@ class SendAudioRequest(BaseModel):
 
 class TtsActionRequest(BaseModel):
     job_id: str
-    action: str  # "select_variant" | "regenerate_batch" | "select_avatar" | "approve_standard" | "approve_hd" | "reject"
+    action: str  # "select_variant" | "regenerate_batch" | "select_avatar" | "select_avatar_custom" | "approve_standard" | "approve_hd" | "reject"
     use_avatar_iv_model: bool = False
     batch_id: str = ""
     variant_index: Optional[int] = None
     avatar_index: Optional[int] = None
+    avatar_id: str = ""
 
 
 class VideoActionRequest(BaseModel):
@@ -231,6 +232,9 @@ class SeedLabProgressRequest(BaseModel):
     remote_eval_last_error: str = ""
     eval_executor_counts: dict = {}
     avg_stage_timings_ms: dict = {}
+    eval_preflight_status: str = ""
+    eval_preflight_detail: str = ""
+    eval_preflight_checked_at: str = ""
     last_error: str = ""
     finished_at: str = ""
 

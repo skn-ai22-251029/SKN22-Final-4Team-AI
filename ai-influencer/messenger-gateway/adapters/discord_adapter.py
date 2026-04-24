@@ -715,6 +715,12 @@ class DiscordAdapter(MessengerAdapter):
                     },
                     {
                         "type": 2,
+                        "label": "✍️ 아바타ID 입력",
+                        "style": 2,
+                        "custom_id": f"tts_avatar_custom:{job_id}",
+                    },
+                    {
+                        "type": 2,
                         "label": "❌ 반려",
                         "style": 4,
                         "custom_id": f"tts_reject:{job_id}",
