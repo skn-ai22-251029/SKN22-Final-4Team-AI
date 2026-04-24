@@ -13,24 +13,7 @@
 
 ---
 
-## 0. Project Overview
-**하리(HARI)**는 단순한 정보 전달용 챗봇을 넘어, 그녀만의 '페르소나'를 가진 테크 전문 가상 인플루언서 플랫폼입니다. AI 에이전트 시대를 맞아, SNS 콘텐츠 자동 생성, 1:1 대화, 실시간 음성 스트리밍, 몰입형 롤플레잉 게임을 통해 사용자에게 실존하는 셀럽과의 교감(Parasocial Interaction)을 제공합니다.
-
-* **진행 기간:** 2026.03.04 ~ 2026.04.24 (SK네트웍스 Family AI 22기)
-* **공식 링크:** [하리 링크트리 바로가기](https://linktr.ee/chatting_hari)
-* **핵심 가치:** 단방향 콘텐츠 소비에서 벗어난 일상 속 '과몰입' 상호작용 구현
-
----
-
-## 1. Key Features
-* **💬 1:1 Private Chat:** 유저별 맥락을 기억(Memory)하고 실시간 음성(TTS)으로 대답하는 개인화 채팅.
-* **🎬 Auto-Content Pipeline:** 최신 테크 트렌드를 분석하여 숏폼 영상과 SNS 피드를 자동으로 생성 및 업로드.
-* **👤 Consistent Persona:** LoRA 학습을 통한 외형 일관성 유지 및 고유의 말투/취향(Preference) 반영.
-* **📖 Roleplaying Game:** 몰입형 롤플레잉 게임을 통한 재미와 교감.
-
----
-
-## 2. YouTube Content Automation Pipeline
+## YouTube Content Automation Pipeline
 
 <div align="center">
 
@@ -71,66 +54,6 @@
 ## 3. System Architecture
 
 <img width="1876" height="910" alt="Image" src="https://github.com/user-attachments/assets/1a14e05e-f954-4eaa-a1a5-71b2209e9b71" />
-
----
-
-## YouTube 자동화 아키텍처
-
-```mermaid
-flowchart LR
-    subgraph Operator["Operator Layer"]
-        Discord["Discord Commands<br/>/report /tts /jobs /seedlab /cost"]
-    end
-
-    subgraph AWS["AWS EC2 Control Plane"]
-        Bot["discord-bot"]
-        Gateway["messenger-gateway<br/>FastAPI orchestration hub"]
-        N8N["n8n<br/>scheduled and webhook workflows"]
-        NotebookSvc["notebooklm-service<br/>browser automation"]
-        TTSRouter["tts-router-service"]
-        Publisher["sns-publisher-service<br/>captions, hardburn, upload"]
-        SeedLab["seed-lab-service<br/>run queue and review UI"]
-        DB[("PostgreSQL<br/>jobs, posts, costs, runs")]
-        Proxy["edge-proxy<br/>RunPod upstream bridge"]
-    end
-
-    subgraph GPU["RunPod GPU Plane"]
-        Voice["OmniVoice TTS API"]
-        Eval["SeedLab Eval API<br/>DistillMOS, SpeechBrain, DSP"]
-        Tunnel["Reverse SSH Tunnel"]
-    end
-
-    subgraph External["External Services"]
-        RSS["YouTube Sources"]
-        NotebookLM["NotebookLM"]
-        OpenAI["OpenAI<br/>rewrite, ASR, judge"]
-        HeyGen["HeyGen"]
-        YouTube["YouTube Data API"]
-        S3[("Amazon S3<br/>audio, video, srt, logs")]
-    end
-
-    Discord --> Bot
-    Bot --> Gateway
-    Gateway <--> DB
-    Gateway --> N8N
-    N8N --> NotebookSvc
-    N8N --> TTSRouter
-    N8N --> Publisher
-    Gateway --> SeedLab
-    NotebookSvc --> RSS
-    NotebookSvc --> NotebookLM
-    Gateway --> OpenAI
-    Publisher --> OpenAI
-    Publisher --> HeyGen
-    Publisher --> YouTube
-    Gateway --> S3
-    Publisher --> S3
-    SeedLab --> S3
-    TTSRouter --> Proxy
-    Proxy --> Tunnel
-    Tunnel --> Voice
-    Tunnel --> Eval
-```
 
 ## 운영 환경 스냅샷
 
