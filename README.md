@@ -123,6 +123,23 @@ flowchart TD
     I --> J["게시 결과와 비용 기록"]
 ```
 
+## 워크플로우별 기능
+
+n8n은 전체 파이프라인의 스케줄링과 webhook orchestration을 담당하고, job 상태 제어와 복잡한 비즈니스 로직은 `messenger-gateway`와 각 마이크로서비스가 처리합니다.
+
+| Workflow | 트리거 | 주요 기능 | 다음 단계 |
+|---|---|---|---|
+| `WF-01` Input Receive | Webhook | 직접 입력된 콘텐츠 요청을 job으로 등록하고 대본 생성 흐름으로 연결 | 확인 요청 전송 |
+| `WF-04` Confirm Request | Webhook | 기존 job의 대본과 상태를 다시 조회해 Discord 확인 메시지 재전송 | 운영자 승인/수정 대기 |
+| `WF-05` Confirm Handler | Webhook | 승인/수정 버튼 이벤트 처리, 승인 시 TTS 생성으로 연결 | `WF-11` 또는 대본 재작성 |
+| `WF-06` NotebookLM Report | Webhook | NotebookLM 보고서 생성, 하리식 숏폼 대본 재작성, Discord 전달 | TTS 또는 영상 제작 선택 |
+| `WF-08` SNS Upload | Webhook | 승인된 최종 영상의 YouTube 업로드, 게시 결과와 비용 기록 | `PUBLISHED` 상태 전환 |
+| `WF-09` YouTube Source | Schedule, 매시간 | 지정 채널 RSS를 주기적으로 확인하고 새 영상 소스를 감지 | 자동 보고서 job 생성 |
+| `WF-10` Daily Notebook | Schedule, 매일 07:30 KST | 채널별 NotebookLM 노트북을 매일 준비하고 리서치 기반을 갱신 | `WF-09`/`WF-06` 입력 기반 |
+| `WF-11` TTS Generate | Webhook | TTS 후보 생성, WAV 업로드, Discord 공유, 선택된 오디오 저장 | 승인 대기 또는 `WF-12` 자동 진행 |
+| `WF-12` HeyGen Generate | Webhook | HeyGen 영상 생성/폴링, 자막 아티팩트 생성, 미리보기 전달 | 영상 승인 대기 |
+| `WF-13` Auto TTS to YouTube | Schedule, 매일 09:30 KST | 자동 보고서 job을 대상으로 TTS부터 YouTube 업로드까지 무검증 순차 실행 | 게시 완료 또는 실패 피드백 |
+
 ## Discord 운영 콘솔
 
 | 명령어 | 역할 |
