@@ -70,7 +70,7 @@
 | 계층 | 확인된 역할 |
 |---|---|
 | 로컬 워크스페이스 | 서비스 코드, n8n workflow, 문서, 테스트가 있는 기준 저장소 |
-| AWS EC2 | Docker Compose 기반 제어 서버, 10개 컨테이너 실행 |
+| AWS EC2 | Docker Compose 기반 제어 서버, 여러 컨테이너로 분리 운영 |
 | n8n | 보고서, TTS, 영상, 업로드, 소스 수집, 일일 배치 workflow 운용 |
 | PostgreSQL | job 상태, 업로드 결과, 비용 이벤트, SeedLab run 상태 저장 |
 | S3 | 대본, 로그, TTS wav, raw video, hardburn video, SRT, SeedLab 샘플 저장 |
@@ -198,7 +198,7 @@ Cost Viewer는 자동화 결과를 비용 관점에서 다시 볼 수 있게 만
 
 기록 대상은 rewrite, TTS, ASR, HeyGen, 인프라 배부, 업로드 관련 이벤트입니다. 이를 통해 “어떤 job이 얼마를 썼는지”, “실패한 job도 비용이 발생했는지”, “한 번의 자동 배치가 어느 단계에서 비용을 많이 쓰는지”를 추적할 수 있습니다.
 
-## 기술적으로 강조할 만한 지점
+## 핵심 기술 포인트
 
 | 지점 | 설명 |
 |---|---|
@@ -278,6 +278,21 @@ flowchart LR
 | S3 artifact plane | generated assets and logs |
 | Discord operator plane | human approvals, manual triggers, progress feedback |
 
+AWS control plane은 Docker Compose 기반으로 배포했습니다. Discord bot, n8n, PostgreSQL, gateway, publisher, SeedLab, TTS router 같은 실행 단위를 각각 독립 컨테이너로 분리해, 서비스별 재시작과 로그 확인, 환경 변수 주입, 내부 네트워크 통신을 일관된 방식으로 관리합니다.
+
+| Docker 구성 | 역할 |
+|---|---|
+| `edge-proxy` | 외부 요청을 내부 서비스로 라우팅하는 진입 계층 |
+| `postgres` | job 상태, 비용 이벤트, SeedLab 실행 정보 저장 |
+| `n8n` | 스케줄링, webhook, 단계별 workflow orchestration |
+| `messenger-gateway` | Discord와 n8n 사이의 중앙 API 및 job 상태 제어 |
+| `notebooklm-service` | NotebookLM 기반 리서치 자동화 |
+| `sns-publisher-service` | 자막 생성, 하드번 렌더링, YouTube 업로드 |
+| `heygen-pipeline-service` | HeyGen 영상 생성과 콘텐츠 메타데이터 처리 |
+| `seed-lab-service` | SeedLab 실행 관리와 리뷰 UI |
+| `seed-lab-init` | SeedLab 런타임 디렉터리 초기화 |
+| `tts-router-service` | RunPod TTS API로 요청을 전달하는 라우팅 계층 |
+| `discord-bot` | slash command, 버튼, 진행 상황 피드백 처리 |
 
 ## 설계 핵심
 
@@ -290,7 +305,7 @@ flowchart LR
 - GPU 추론과 평가를 RunPod로 분리해 비용과 성능을 조절할 수 있게 했습니다.
 - Discord를 운영 콘솔로 사용해 팀원이 같은 채널에서 생성과 승인 흐름을 함께 처리할 수 있게 했습니다.
 
-결과적으로 하리는 YouTube Shorts 제작을 “수동 반복 작업”이 아니라, 관측 가능하고 복구 가능하며 팀 단위로 운영할 수 있게 자동화 합니다.
+결과적으로 하리는 YouTube Shorts 제작을 “수동 반복 작업”이 아니라, 관측 가능하고 복구 가능하며 팀 단위로 운영할 수 있게 자동화합니다.
 
 ---
 
@@ -298,11 +313,11 @@ flowchart LR
 
 | 사진 | 이름 | 역할 | 주요 업무 |
 | :---: | :--- | :--- | :--- |
-| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/17c43ef6-fbc6-484e-9fe2-09b365c283d1" /> | **최민호** | **PM** | PM, BM 개발, 시장 조사, QA |
-| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/28447344-fbb5-4f26-90bb-11ad3a8fd477" /> | **박준석** | **Frontend** | 기초 페르소나 구축, UI/UX 설계, 관리자 페이지 설계 |
-| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/71c56c29-1306-4cd4-9fe3-78c1b7942096" /> | **안민제** | **AI Lead** | TTS(GPT-SoVITS) 파인튜닝 및 추론 엔진, 롤플레잉 서비스 개발 |
-| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/c9470eb1-95db-43b0-b8f0-0d953a559891" /> | **한승혁** | **Backend** | 서버 관리, 이미지/영상 학습 및 생성, DB 총괄, 1:1 채팅 개발 |
-| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/05847c89-5f59-4184-81b3-355e85a85fa5" /> | **엄형은** | **Contents** | 대본 생성, 콘텐츠 생성-업로드 자동화 파이프라인 구축 |
+| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/17c43ef6-fbc6-484e-9fe2-09b365c283d1" /> | [**최민호**](https://github.com/minho8234) | **PM** | PM, BM 개발, 시장 조사, QA |
+| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/28447344-fbb5-4f26-90bb-11ad3a8fd477" /> | [**박준석**](https://github.com/junseok-dev) | **Frontend** | 기초 페르소나 구축, UI/UX 설계, 관리자 페이지 설계 |
+| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/71c56c29-1306-4cd4-9fe3-78c1b7942096" /> | [**안민제**](https://github.com/minje0209-ux) | **AI Lead** | TTS(GPT-SoVITS) 파인튜닝 및 추론 엔진, 롤플레잉 서비스 개발 |
+| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/c9470eb1-95db-43b0-b8f0-0d953a559891" /> | [**한승혁**](https://github.com/gksshing) | **Backend** | 서버 관리, 이미지/영상 학습 및 생성, DB 총괄, 1:1 채팅 개발 |
+| <img width="60" alt="Image" src="https://github.com/user-attachments/assets/05847c89-5f59-4184-81b3-355e85a85fa5" /> | [**엄형은**](https://github.com/DJAeun) | **Contents** | 콘텐츠 생성-업로드, 비용, 평가 자동화 파이프라인 구축 |
 
 ---
 
