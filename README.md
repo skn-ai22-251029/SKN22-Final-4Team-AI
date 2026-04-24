@@ -38,7 +38,11 @@
 
 이 레포지토리는 YouTube 채널을 꾸준히 운영하기 위해 필요한 반복 작업을 자동화한 제작 시스템입니다.
 
-지정한 YouTube 채널에서 최신 소스를 찾고, NotebookLM으로 보고서를 만들고, 그 보고서를 하리 캐릭터의 짧은 숏폼 대본으로 다시 씁니다. 이후 TTS 음성을 생성하고, HeyGen 아바타 영상과 결합한 뒤, ASR 기반 타이밍으로 자막을 만들고, 최종 영상을 YouTube에 업로드합니다. 특히 WF-13 자동 배치는 준비된 보고서 job을 사람의 추가 검증 없이 TTS 생성부터 YouTube 업로드까지 이어서 처리하도록 설계했습니다.
+지정한 YouTube 채널에서 최신 소스를 찾고, NotebookLM으로 보고서를 만들고, 그 보고서를 하리 캐릭터의 짧은 숏폼 대본으로 다시 씁니다. 
+
+이후 TTS 음성을 생성하고, HeyGen 아바타 영상과 결합한 뒤, ASR 기반 타이밍으로 자막을 만들고, 최종 영상을 YouTube에 업로드합니다. 
+
+특히 WF-13 자동 배치는 앞 단계에서 **자동 생성된 보고서 job을 사람의 추가 검증 없이 TTS 생성부터 YouTube 업로드까지 이어서 처리하도록 설계했습니다.**
 
 단순히 영상을 하나 생성하는 스크립트가 아니라, Discord 운영 콘솔, n8n 스케줄러, FastAPI 마이크로서비스, PostgreSQL 상태 저장소, S3 아티팩트 저장소, AWS 제어 서버, RunPod GPU 추론 계층을 함께 구성한 실제 운영형 파이프라인입니다.
 
@@ -61,9 +65,7 @@
 
 <img width="1876" height="910" alt="Image" src="https://github.com/user-attachments/assets/1a14e05e-f954-4eaa-a1a5-71b2209e9b71" />
 
-## 운영 환경 스냅샷
-
-2026년 4월 24일 KST 기준으로 로컬, AWS, RunPod를 직접 확인했습니다.
+## 운영 환경
 
 | 계층 | 확인된 역할 |
 |---|---|
@@ -72,7 +74,7 @@
 | n8n | 보고서, TTS, 영상, 업로드, 소스 수집, 일일 배치 workflow 운용 |
 | PostgreSQL | job 상태, 업로드 결과, 비용 이벤트, SeedLab run 상태 저장 |
 | S3 | 대본, 로그, TTS wav, raw video, hardburn video, SRT, SeedLab 샘플 저장 |
-| RunPod | RTX 6000 Ada GPU, OmniVoice, SeedLab 평가기, 모델 캐시, startup stack 구성 |
+| RunPod | VRAM 4GB 이상의 GPU, OmniVoice, SeedLab 평가기, 모델 캐시, startup stack 구성 |
 | Discord | 팀원이 함께 조작하는 명령어, 승인 버튼, 진행률 피드백 채널 |
 
 ## 주요 사용자 흐름
@@ -276,19 +278,6 @@ flowchart LR
 | S3 artifact plane | generated assets and logs |
 | Discord operator plane | human approvals, manual triggers, progress feedback |
 
-RunPod stack은 persistent workspace에서 시작합니다.
-
-```bash
-bash /workspace/runpod-stack/bin/start-all.sh
-```
-
-AWS stack은 `ai-influencer` 디렉터리에서 Docker Compose로 관리합니다.
-
-```bash
-docker-compose up -d --build
-```
-
-접속 정보, provider key, OAuth token, public hostname, SSH endpoint는 README에 포함하지 않습니다.
 
 ## 설계 핵심
 
@@ -301,7 +290,7 @@ docker-compose up -d --build
 - GPU 추론과 평가를 RunPod로 분리해 비용과 성능을 조절할 수 있게 했습니다.
 - Discord를 운영 콘솔로 사용해 팀원이 같은 채널에서 생성과 승인 흐름을 함께 처리할 수 있게 했습니다.
 
-결과적으로 하리는 YouTube Shorts 제작을 “수동 반복 작업”이 아니라, 관측 가능하고 복구 가능하며 팀 단위로 운영할 수 있는 AI 자동화 파이프라인으로 바꿉니다.
+결과적으로 하리는 YouTube Shorts 제작을 “수동 반복 작업”이 아니라, 관측 가능하고 복구 가능하며 팀 단위로 운영할 수 있게 자동화 합니다.
 
 ---
 
