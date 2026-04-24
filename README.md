@@ -11,7 +11,7 @@
   <img width="1920" height="800" alt="33633563980734-1" src="https://github.com/user-attachments/assets/1bfbeded-425e-4589-9dd7-eab0fce49be2" />
 </p>
 <p align="center">
-  <a href="https://github.com/SKNETWORKS-FAMILY-AICAMP/SKN22-Final-4Team-WEB">
+  <a href="https://github.com/skn-ai22-251029/SKN22-Final-4Team-WEB">
     <img src="https://img.shields.io/badge/WEB_Repository-React_%7C_Django_%7C_HARI_Platform-39E09B?style=for-the-badge&logo=github&logoColor=white" alt="WEB Repository"/>
   </a>
 </p>
